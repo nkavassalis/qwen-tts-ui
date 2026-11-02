@@ -19,6 +19,7 @@ import os
 import sys
 
 import numpy as np
+import soundfile as sf
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui"))
 import app as webui  # noqa: E402
@@ -320,6 +321,237 @@ def test_exclusive_owner_lock() -> None:
                 pass
         finally:
             webui.LOCK_PATH = original
+
+
+def test_media_helpers() -> None:
+    import tempfile
+    import types
+
+    # --- load_media input validation -------------------------------------------------
+    for bad in ("", None, "/nope/missing.mp4"):
+        try:
+            webui.load_media(bad)
+            raise AssertionError(f"expected MediaError for {bad!r}")
+        except webui.MediaError:
+            pass
+    with tempfile.NamedTemporaryFile(suffix=".txt") as fh:
+        fh.write(b"not media")
+        fh.flush()
+        try:
+            webui.load_media(fh.name)
+            raise AssertionError("expected MediaError for a .txt upload")
+        except webui.MediaError as e:
+            check("Unsupported file type" in str(e), "unsupported type names the extension")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- ffmpeg command construction + failure reporting -------------------------
+        calls = {}
+        real_run, real_which = webui.subprocess.run, webui.shutil.which
+
+        def fake_run(cmd, **kw):
+            calls["cmd"] = list(cmd)
+            return types.SimpleNamespace(returncode=0, stderr="")
+
+        try:
+            webui.subprocess.run = fake_run
+            webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav", sr=24000)
+            cmd = calls["cmd"]
+            check(cmd[0] == webui.FFMPEG_BIN, "uses the configured ffmpeg")
+            check("-vn" in cmd and "-map" in cmd, "drops the video stream and maps the first audio stream")
+            check(cmd[cmd.index("-ac") + 1] == "1" and cmd[cmd.index("-ar") + 1] == "24000",
+                  "downmixes to mono at the requested rate")
+            check(cmd[-1] == "/out/a.wav" and "pcm_s16le" in cmd, "writes PCM wav")
+
+            webui.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+                returncode=1, stderr="x\nStream map '0:a:0' matches no streams.")
+            try:
+                webui.ffmpeg_extract_audio("/in/silent.mp4", "/out/a.wav")
+                raise AssertionError("expected MediaError")
+            except webui.MediaError as e:
+                check("matches no streams" in str(e), f"ffmpeg stderr reaches the user: {e}")
+
+            webui.subprocess.run = real_run
+            webui.shutil.which = lambda name: None
+            try:
+                webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav")
+                raise AssertionError("expected MediaError when ffmpeg is missing")
+            except webui.MediaError as e:
+                check("ffmpeg" in str(e), "missing ffmpeg says so")
+        finally:
+            webui.subprocess.run, webui.shutil.which = real_run, real_which
+
+        # --- a video upload goes through ffmpeg, an audio upload does not ------------
+        sr = 24000
+        wav = (np.sin(np.linspace(0, 300, sr)) * 0.4).astype(np.float32)
+        real_extract = webui.ffmpeg_extract_audio
+        used_ffmpeg = {"called": False}
+
+        def fake_extract(src, dst, sr=24000):
+            used_ffmpeg["called"] = True
+            sf.write(dst, wav, sr)
+            return dst
+
+        try:
+            webui.ffmpeg_extract_audio = fake_extract
+            video = os.path.join(tmp, "clip.mp4")
+            open(video, "wb").write(b"fake mp4 bytes")
+            got, got_sr = webui.load_media(video)
+            check(used_ffmpeg["called"] and got_sr == 24000 and len(got) == sr,
+                  "video is decoded via ffmpeg to mono float32")
+
+            used_ffmpeg["called"] = False
+            audio = os.path.join(tmp, "clip.wav")
+            sf.write(audio, wav, sr)
+            got, got_sr = webui.load_media(audio)
+            check(not used_ffmpeg["called"] and len(got) == sr, "wav is read natively, no ffmpeg")
+
+            # stereo + wrong sample rate -> mono at the target rate
+            stereo_path = os.path.join(tmp, "stereo44.wav")
+            sf.write(stereo_path, np.stack([wav, wav], axis=-1), 44100)
+            got, got_sr = webui.load_media(stereo_path)
+            expected_seconds = len(wav) / 44100.0
+            check(got_sr == 24000 and got.ndim == 1 and abs(len(got) / 24000 - expected_seconds) < 0.02,
+                  f"stereo 44.1k is downmixed and resampled (got {got_sr}Hz, {len(got) / 24000:.2f}s "
+                  f"vs {expected_seconds:.2f}s)")
+        finally:
+            webui.ffmpeg_extract_audio = real_extract
+
+
+def test_trim_window() -> None:
+    # empty / inverted selections become a sensible default window from the top
+    check(webui.trim_window(30.0, None, None) == (0.0, 6.0), "empty selection takes the target window")
+    check(webui.trim_window(30.0, 5.0, 5.0) == (5.0, 11.0), "zero-length selection grows to target")
+    check(webui.trim_window(30.0, 10.0, 4.0) == (10.0, 16.0), "inverted selection grows forward")
+
+    # out-of-range is clamped inside the file
+    start, end = webui.trim_window(10.0, -5.0, 99.0)
+    check(start == 0.0 and end == 10.0, f"clamped to the file: {start}-{end}")
+
+    # too long shrinks around the centre, too short grows around the centre
+    start, end = webui.trim_window(60.0, 20.0, 50.0)
+    check(abs((end - start) - webui.REF_MAX_SECONDS) < 1e-6 and abs((start + end) / 2 - 35) < 1e-6,
+          f"long selection shrunk to max around its centre: {start}-{end}")
+    start, end = webui.trim_window(60.0, 20.0, 20.5)
+    check(abs((end - start) - webui.REF_MIN_SECONDS) < 1e-6, f"short selection grown to min: {start}-{end}")
+
+    # near the end of the file the window slides back instead of overflowing
+    start, end = webui.trim_window(8.0, 7.9, 8.0)
+    check(end == 8.0 and abs((end - start) - webui.REF_MIN_SECONDS) < 1e-6, f"stays inside the file: {start}-{end}")
+
+    # a file shorter than the minimum is used whole
+    check(webui.trim_window(1.2, 0.0, 1.2) == (0.0, 1.2), "short clips are not trimmed away")
+    try:
+        webui.trim_window(0.0, 0, 0)
+        raise AssertionError("expected MediaError for empty media")
+    except webui.MediaError:
+        pass
+
+
+def test_auto_pick_window() -> None:
+    sr = 1000
+    silence = np.zeros(sr * 20, dtype=np.float32)
+    loud = (np.sin(np.linspace(0, 4000, sr * 5)) * 0.9).astype(np.float32)
+    wav = np.concatenate([silence, loud, silence])           # loud from 20s..25s
+    start, end = webui.auto_pick_window(wav, sr, target=5.0)
+    check(abs(start - 20.0) <= 0.3 and abs(end - start - 5.0) < 1e-6,
+          f"should land on the loud stretch, got {start}-{end}")
+
+    short = np.ones(sr, dtype=np.float32) * 0.5
+    check(webui.auto_pick_window(short, sr, target=5.0) == (0.0, 1.0), "shorter than target -> whole clip")
+
+
+def test_render_waveform() -> None:
+    sr = 8000
+    wav = (np.sin(np.linspace(0, 800, sr * 4)) * 0.6).astype(np.float32)
+    img = webui.render_waveform(wav, sr, 1.0, 2.5)
+    check(img.size == (980, 180), f"expected canvas, got {img.size}")
+    check(img.mode == "RGB", "RGB for gradio")
+
+    plain = np.asarray(webui.render_waveform(wav, sr), dtype=np.uint8)
+    shaded = np.asarray(img, dtype=np.uint8)
+    check(plain.shape == shaded.shape, "same canvas with or without a selection")
+    check(np.abs(plain.astype(int) - shaded.astype(int)).sum() > 0,
+          "the shaded selection actually changes the drawing")
+
+    empty = webui.render_waveform(np.zeros(0, dtype=np.float32), sr)
+    check(empty.size == (980, 180), "empty waveform must not crash the UI")
+
+    # long files still get tick labels rather than one per second
+    long_img = webui.render_waveform(np.zeros(sr * 300, dtype=np.float32), sr)
+    check(long_img.size == (980, 180), "10-minute clip renders")
+
+
+def test_clip_guidance() -> None:
+    check("too short" in webui.clip_guidance(1.0), "flags a 1s clip")
+    check("good length" in webui.clip_guidance(6.0), "endorses the target length")
+    check("long" in webui.clip_guidance(30.0), "flags a 30s clip")
+
+
+def test_transcriber() -> None:
+    check(set(webui.ASR_LANGUAGE_CODES) == {v.lower() for v in webui.LANGUAGE_VALUES} - {"auto"},
+          "every UI language has a whisper code")
+
+    disabled = webui.Transcriber(model_id="none")
+    check(not disabled.enabled, "'none' disables ASR")
+    try:
+        disabled.transcribe(np.ones(1000, dtype=np.float32), 24000)
+        raise AssertionError("expected MediaError when disabled")
+    except webui.MediaError as e:
+        check("disabled" in str(e), "disabled ASR explains itself")
+
+    empty = webui.Transcriber(model_id="openai/whisper-large-v3", enabled=False)
+    try:
+        empty.transcribe(np.zeros(0, dtype=np.float32), 24000)
+        raise AssertionError("expected MediaError for an empty clip")
+    except webui.MediaError as e:
+        check("empty clip" in str(e), "empty clip is rejected before loading the model")
+
+
+def test_media_state_is_json_serialisable() -> None:
+    """gr.State round-trips through the browser as JSON — no numpy, no torch objects."""
+    import json
+    import tempfile
+
+    sr = 24000
+    with tempfile.TemporaryDirectory() as tmp:
+        original, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
+        try:
+            wav = (np.sin(np.linspace(0, 400, sr * 3)) * 0.5).astype(np.float32)
+            upload = os.path.join(tmp, "take.wav")
+            sf.write(upload, wav, sr)
+            state, status, wave, start, end, audio, info = webui.import_media(upload)
+            check("Loaded" in status, f"import reported: {status}")
+            json.dumps(state)  # must not raise
+            check(state["duration"] == 3.0 and state["sample_rate"] == 24000, "duration/rate recorded")
+            check(os.path.exists(state["path"]), "clip persisted for later requests")
+            check(isinstance(audio, tuple) and audio[1].shape[0] > 0, "trimmed clip returned for the Audio box")
+
+            # later requests arrive with the JSON-decoded state, exactly as the browser sends it
+            from_browser = json.loads(json.dumps(state))
+            wave2, audio2, info2, start_update, end_update = webui.update_clip(from_browser, 1.0, 3.0)
+            s2, e2 = start_update["value"], end_update["value"]   # slider updates, clamped by the server
+            check(abs(s2 - 1.0) < 1e-6 and abs(e2 - 3.0) < 1e-6, f"re-slice works from decoded state: {s2}-{e2}")
+            check(audio2[1].shape[0] == 48000, f"two seconds of audio returned, got {audio2[1].shape}")
+
+            # a selection shorter than the clone minimum is grown, not rejected
+            _, _, _, grown_start, grown_end = webui.update_clip(from_browser, 1.0, 1.5)
+            check(abs(grown_end["value"] - grown_start["value"] - webui.REF_MIN_SECONDS) < 1e-6,
+                  f"sub-minimum selection grown to the floor: {grown_start['value']}-{grown_end['value']}")
+        finally:
+            webui.MEDIA_DIR = original
+
+
+def test_import_media_reports_errors() -> None:
+    # A broken upload must come back as a status message, not an exception that kills the request
+    state, status, wave, start, end, audio, info = webui.import_media("/definitely/not/here.mp4")
+    check(state is None and "Error" in status, "missing file reported in the status box")
+    check(wave is None and audio is None, "nothing half-loaded")
+
+    _, _, info_out, *_ = webui.update_clip(None, 0, 5)
+    check("Upload a clip first" in info_out, "trimming before uploading is explained")
+
+    result = webui.auto_pick_clip(None)
+    check("Error" in result[2], "auto-pick without media explains itself")
 
 
 if __name__ == "__main__":

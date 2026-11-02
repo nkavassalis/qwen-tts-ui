@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -63,6 +65,13 @@ CASES = {
         instruct="A dry, unhurried documentary narrator in his sixties, slightly amused.",
         language="Auto",
         clone_text="Same voice, second line, still unmistakably the same person.",
+    ),
+    # Video upload path: spoken by Ryan, wrapped into an mp4, then imported / trimmed /
+    # transcribed / cloned — the whole new pipeline in one case.
+    "media_pipeline": dict(
+        spoken="The quick brown fox jumps over the lazy dog near the river bank.",
+        keywords=["quick", "brown", "fox", "jumps", "lazy", "dog", "river"],
+        clone_text="Cloning from a video file should sound exactly the same as from a wav.",
     ),
 }
 
@@ -126,7 +135,96 @@ def run_voice_library(hub: webui.ModelHub, keep_gpu: bool) -> None:
             pass  # both models get evicted by the caller below
 
 
-def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool) -> None:
+def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True) -> None:
+    """video upload -> ffmpeg -> waveform/trim helpers -> Whisper -> clone."""
+    cfg = CASES["media_pipeline"]
+    if not shutil.which(webui.FFMPEG_BIN):
+        print("  [media_pipeline] SKIPPED: ffmpeg not on PATH")
+        return
+
+    # 1. synthesize the source speech with a known speaker and known words
+    with hub.lock:
+        cv = hub.acquire("custom_voice")
+        wavs, sr = cv.generate_custom_voice(text=cfg["spoken"], language="English", speaker="ryan",
+                                            non_streaming_mode=True, max_new_tokens=192)
+    source_wav = os.path.join(OUT_DIR, "media_pipeline_source.wav")
+    sf.write(source_wav, wavs[0], sr)
+    seconds = len(wavs[0]) / sr
+
+    # 2. wrap it in a real mp4 (video stream + aac audio), like a phone export
+    mp4 = os.path.join(OUT_DIR, "media_pipeline.mp4")
+    proc = subprocess.run(
+        [webui.FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "lavfi", "-i", f"color=c=navy:s=320x240:d={seconds + 0.5:.2f}",
+         "-i", source_wav, "-shortest",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", mp4],
+        capture_output=True, text=True)
+    assert proc.returncode == 0, f"ffmpeg could not build the test mp4: {proc.stderr[-300:]}"
+    assert os.path.getsize(mp4) > 10_000, "test mp4 suspiciously small"
+
+    # 3. the app's own import path must see only the audio, through the same callbacks
+    #    the browser hits (gr.State is JSON-decoded on the way back, so we round-trip it)
+    webui.MEDIA_DIR = os.path.join(OUT_DIR, "media")
+    os.makedirs(webui.MEDIA_DIR, exist_ok=True)
+    imported = webui.import_media(mp4)
+    state, status = imported[0], imported[1]
+    assert "Loaded" in status, f"import failed: {status}"
+    assert "video" in status, f"mp4 should be reported as video: {status}"
+    import json as _json
+    state = _json.loads(_json.dumps(state))          # exactly what the browser sends back
+    assert state["duration"] > 0 and state["sample_rate"] == webui.REF_SAMPLE_RATE
+
+    # 4. the visual selection helpers, as the sliders would drive them
+    _, clip_audio, info, start_upd, end_upd = webui.update_clip(state, 0.3, 999.0)
+    start, end = start_upd["value"], end_upd["value"]
+    assert end - start <= webui.REF_MAX_SECONDS + 1e-6, f"selection not clamped: {start}-{end}"
+    assert "selected" in info, f"clip guidance missing: {info}"
+    _, clip_audio, info, start_upd, end_upd = webui.auto_pick_clip(state)
+    start, end = start_upd["value"], end_upd["value"]
+    assert end > start, f"auto-pick produced an empty window: {start}-{end}"
+
+    # 5. transcription of exactly what will be cloned
+    transcript = cfg["spoken"]
+    if use_asr:
+        webui.ASR = webui.Transcriber()
+        t0 = time.time()
+        text_upd, asr_status = webui.transcribe_reference(state, start, end, "English")
+        took = time.time() - t0
+        assert "Error" not in asr_status, f"transcription failed: {asr_status}"
+        transcript = text_upd["value"]
+        found = [w for w in cfg["keywords"] if w in transcript.lower()]
+        print(f"  [media_pipeline] whisper ({took:.1f}s): {transcript!r}")
+        assert len(found) >= len(cfg["keywords"]) * 0.6, \
+            f"transcript missed too many words ({found} of {cfg['keywords']}): {transcript!r}"
+        webui.ASR.unload()
+        webui.ASR = None
+    else:
+        print("  [media_pipeline] whisper skipped (--no-asr), using the known transcript")
+
+    # 6. clone from the trimmed video-derived clip, again via the UI callback
+    with hub.lock:
+        base = hub.acquire("voice_clone")
+        prompt = base.create_voice_clone_prompt(ref_audio=(clip_audio[1], clip_audio[0]),
+                                                ref_text=transcript, x_vector_only_mode=False)
+        outs, out_sr = base.generate_voice_clone(text=cfg["clone_text"], language="English",
+                                                 voice_clone_prompt=prompt, max_new_tokens=192)
+    clone_path = os.path.join(OUT_DIR, "media_pipeline_clone.wav")
+    sf.write(clone_path, outs[0], out_sr)
+    print(f"  [media_pipeline] mp4 {seconds:.1f}s -> clip {end - start:.1f}s -> clone {len(outs[0]) / out_sr:.1f}s")
+    check_audio(clone_path, outs[0], out_sr)
+
+
+def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
+    if capability == "media_pipeline":
+        run_media_pipeline(hub, keep_gpu, use_asr)
+        if not keep_gpu:
+            with hub.lock:
+                while hub.on_gpu:
+                    _, resident = hub.on_gpu.popitem(last=False)
+                    hub._move(resident, torch.device("cpu"))
+                    torch.cuda.empty_cache()
+        return
+
     if capability == "voice_library":
         run_voice_library(hub, keep_gpu)
         if not keep_gpu:
@@ -176,6 +274,8 @@ def main() -> int:
     parser.add_argument("--max-resident", type=int, default=1)
     parser.add_argument("--force", action="store_true",
                         help="Run even if the webui is up (unsafe: two copies of the weights).")
+    parser.add_argument("--no-asr", action="store_true",
+                        help="Skip the Whisper step of the media pipeline case.")
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -191,7 +291,7 @@ def main() -> int:
         webui.HUB = hub
         for capability in (args.only or list(CASES)):
             print(f"* {capability}")
-            run_case(hub, capability, args.keep_gpu)
+            run_case(hub, capability, args.keep_gpu, use_asr=not args.no_asr)
         print("\nAll smoke tests passed.")
         return 0
 

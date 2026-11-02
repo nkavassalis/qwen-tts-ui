@@ -19,6 +19,18 @@ reference. That makes a designed voice persistent across requests and restarts �
 hosted demo cannot, since it keeps nothing between sessions. Under the hood the saved
 clip + transcript feed `create_voice_clone_prompt`, so it clones with full ICL quality.
 
+**Reference-clip workshop** (Voice Clone tab) — the three things the hosted box makes you
+do in a text editor:
+
+- **Video uploads work.** Drop in an `.mp4`/`.mov`/`.mkv`/`.webm`/… and ffmpeg strips the
+  audio track; audio files (`.wav`/`.mp3`/`.flac`/`.m4a`/…) load natively.
+- **Visual trimming.** A hand-drawn waveform with a second grid shows the whole clip; two
+  sliders move the selection, the shaded region is exactly what gets cloned, and
+  *Auto-pick best clip* jumps to the loudest 6s (drops silence and room tone).
+- **Transcription you can edit.** *Transcribe selected clip* runs **Whisper large-v3** on
+  the selected window only and drops the text into an editable box — because ICL cloning
+  needs the transcript to match the clip, not the whole upload.
+
 ## Quick start
 
 ```bash
@@ -27,7 +39,9 @@ clip + transcript feed `create_voice_clone_prompt`, so it clones with full ICL q
 ./run.sh --preload            # warm checkpoints into RAM at startup (bounded by --max-cpu-resident)
 ./run.sh --max-cpu-resident 1 # safest: pin only one 4.3GB copy at a time
 ./run.sh --ssl-self-signed --ip 0.0.0.0   # HTTPS; needed for browser mic on non-localhost
-./run.sh --help               # all flags
+./run.sh --no-asr                # drop Whisper (frees ~3GB VRAM, disables the transcribe button)
+./run.sh --asr-model openai/whisper-large-v3-turbo   # swap the transcription model
+./run.sh --help                  # all flags
 ```
 
 First request after a model switch pays ~2s of GPU upload; after that generation runs
@@ -47,9 +61,30 @@ repo/               upstream QwenLM/Qwen3-TTS checkout (installed editable)
 models/             1.7B checkpoints + Qwen3-TTS-Tokenizer-12Hz (~14GB, gitignored)
 voices/             saved designed voices: <slug>.wav + <slug>.json (gitignored)
 .qwen-tts.lock      single-owner advisory lock (gitignored)
-tests/test_app_logic.py   CPU-only unit tests for the UI helpers and memory guards
-tests/smoke_test.py       GPU end-to-end: loads each model, generates, validates the wav
+tests/test_app_logic.py   CPU-only unit tests (20 cases) for UI helpers and guards
+tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 ```
+
+Beyond Python: **ffmpeg** on PATH (video ingest; checked and reported at startup) and
+~2.9GB for Whisper large-v3 in the Hugging Face cache, fetched on first use.
+
+**Reference clips want to be short and clean.** The model card advertises a "3-second rapid
+voice clone"; in practice 3–10s clones best, so the UI defaults the selection to the loudest
+6s (`REF_TARGET_SECONDS`) and clamps any selection into 2–15s (`trim_window`). Longer
+references mostly cost time and raise the chance of a rambling ICL run.
+
+**Whisper large-v3 via transformers, not faster-whisper.** It reuses the torch/CUDA stack
+already installed (no ctranslate2, whose kernels may not cover sm_120), transcribes a 6s
+clip in ~3s on this GPU, and only loads when the user presses the button. It is fetched
+with `--exclude "*fp32*" "*.bin" "*.msgpack"` — the repo otherwise carries 24GB of flax/fp32
+duplicates of the one 2.9GB file needed. `--asr-model` swaps it (e.g. turbo), `--no-asr`
+skips it. The raw padding mask is passed explicitly, which both silences the
+pad-token-equals-eos warning and stops Whisper hallucinating over the 30s of zero padding a
+short clip gets.
+
+**The waveform is drawn with PIL, not a plotting library.** No matplotlib dependency, pixel
+geometry is deterministic, and `test_render_waveform` can assert the shaded selection
+actually changes the image.
 
 ## Memory safety (read this first)
 
@@ -76,14 +111,16 @@ caps. If Windows itself feels tight, lower `--max-cpu-resident` to 1 or set a ha
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~1s, no weights needed, 12 cases
-.venv/bin/python tests/smoke_test.py       # ~60s, needs the GPU + downloaded weights
-.venv/bin/python tests/smoke_test.py --only voice_clone
+.venv/bin/python tests/test_app_logic.py   # ~2s, no weights needed, 20 cases
+.venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
+.venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-The smoke test covers five flows: CustomVoice, VoiceDesign, Base clone, a dialect speaker
-(Dylan → Beijing dialect), and the design→save→load→clone voice-library flow. It refuses to
-run while the web server holds the lock — stop the server first rather than using `--force`.
+The smoke test covers six flows: CustomVoice, VoiceDesign, Base clone, a dialect speaker
+(Dylan → Beijing dialect), the design→save→load→clone voice-library flow, and the media
+pipeline (synth speech → wrap in a real mp4 → ffmpeg import → auto-trim → Whisper → clone).
+It refuses to run while the web server holds the lock — stop the server first rather than
+using `--force`. Pass `--no-asr` to skip the Whisper step.
 
 `smoke_test.py` writes the audio it produces to `tests/output/` and asserts each clip is
 non-silent, non-clipping and of plausible length, so a silently-broken pipeline (e.g. a
@@ -137,6 +174,9 @@ reference doesn't re-encode it.
 
 | Symptom | Cause / fix |
 |---|---|
+| `ffmpeg could not read audio from …` | The upload has no audio stream (or is not really a video). Check with `ffmpeg -i yourfile`, or pass `--ffmpeg-bin` |
+| `Transcription came back empty` | The selected window is music or silence — move the sliders onto speech, or type the transcript yourself |
+| Transcription wrong on names/accents | Expected; the transcript box is editable on purpose — fix it before cloning, ICL quality depends on it |
 | `Another Qwen3-TTS process is already holding the weights` | The server and the smoke test cannot run together (two copies of ~13GB of weights risk locking WSL2). Stop the server, or pass `--force` if you know what you are doing |
 | `MemoryError: ... would leave less than the ...MB floor` | RAM is genuinely tight: close GPU/LLM processes, lower `--max-cpu-resident`, or cap WSL in `.wslconfig` |
 | Whole machine hard-locks under load | WSL2 ballooning into host RAM — see *Memory safety* above |

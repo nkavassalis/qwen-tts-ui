@@ -23,7 +23,12 @@ import gc
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
+import time
+import uuid
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -33,6 +38,8 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
+
+from PIL import Image, ImageDraw
 
 from qwen_tts import Qwen3TTSModel
 
@@ -181,6 +188,28 @@ DEVICE = torch.device("cuda")
 
 # Checkpoint defaults from generation_config.json, surfaced in the UI so they can be tuned.
 SAMPLING_DEFAULTS = dict(temperature=0.9, top_p=1.0, top_k=50, repetition_penalty=1.05)
+
+
+# Reference-clip guidance for the Base (clone) model. The model card advertises a
+# "3-second rapid voice clone"; in practice a clean 3-10s window clones best, and very
+# long references waste time and make ICL runs more likely to ramble.
+REF_TARGET_SECONDS = 6.0
+REF_MIN_SECONDS = 2.0
+REF_MAX_SECONDS = 15.0
+REF_SAMPLE_RATE = 24000
+
+# Media ingest: ffmpeg is used to strip the audio track out of video uploads.
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
+VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".wmv", ".mpeg", ".mpg", ".3gp"}
+AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".aiff", ".aif", ".wma", ".amr"}
+MEDIA_SUFFIXES = sorted(VIDEO_SUFFIXES | AUDIO_SUFFIXES)
+
+# Transcription of the reference transcript (the ICL clone needs it to match the clip).
+ASR_MODEL_ID = "openai/whisper-large-v3"
+ASR_LANGUAGE_CODES = {
+    "chinese": "zh", "english": "en", "japanese": "ja", "korean": "ko", "french": "fr",
+    "german": "de", "spanish": "es", "portuguese": "pt", "russian": "ru", "italian": "it",
+}
 
 
 def _budget(text: str, cap: int = MAX_NEW_TOKENS_CAP) -> int:
@@ -414,6 +443,266 @@ def _audio_to_tuple(audio) -> Optional[Tuple[np.ndarray, int]]:
 
 
 # ============================================================================
+# Media ingest: video / audio upload -> mono reference waveform
+# ============================================================================
+class MediaError(RuntimeError):
+    """Anything the user can fix: bad file, no audio track, missing ffmpeg."""
+
+
+def ffmpeg_extract_audio(src: str, dst: str, sr: int = REF_SAMPLE_RATE) -> str:
+    """Strip the audio track out of `src` (video or audio) into a mono PCM wav."""
+    if not shutil.which(FFMPEG_BIN):
+        raise MediaError(
+            f"`{FFMPEG_BIN}` not found on PATH — video uploads need ffmpeg "
+            f"(apt install ffmpeg, or pass --ffmpeg-bin)."
+        )
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+           "-vn", "-map", "0:a:0", "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(dst)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else f"exit code {proc.returncode}"
+        raise MediaError(f"Could not read audio from {os.path.basename(str(src))}: {tail}")
+    return dst
+
+
+def load_media(path: str, sr: int = REF_SAMPLE_RATE) -> Tuple[np.ndarray, int]:
+    """Load any supported upload as a float32 mono waveform at `sr`.
+
+    Video containers go straight through ffmpeg; audio files are read natively and only
+    fall back to ffmpeg when libsndfile cannot handle the codec (aac, some mp3/opus).
+    """
+    if not path or not os.path.exists(path):
+        raise MediaError(f"File not found: {path!r}")
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix not in MEDIA_SUFFIXES:
+        raise MediaError(f"Unsupported file type {suffix or '(none)'}. Supported: {', '.join(MEDIA_SUFFIXES)}")
+
+    if suffix not in AUDIO_SUFFIXES:
+        with tempfile.TemporaryDirectory(prefix="qwen-tts-media-") as tmp:
+            return load_media(ffmpeg_extract_audio(path, os.path.join(tmp, "audio.wav"), sr), sr)
+
+    try:
+        wav, in_sr = sf.read(path, dtype="float32", always_2d=False)
+    except Exception:  # noqa: BLE001 - unsupported codec: let ffmpeg decode it
+        with tempfile.TemporaryDirectory(prefix="qwen-tts-media-") as tmp:
+            return load_media(ffmpeg_extract_audio(path, os.path.join(tmp, "audio.wav"), sr), sr)
+
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=-1).astype(np.float32)
+    if int(in_sr) != int(sr):
+        import librosa
+        wav = librosa.resample(y=wav, orig_sr=int(in_sr), target_sr=int(sr))
+    return wav, int(sr)
+
+
+def trim_window(duration: float, start: Optional[float], end: Optional[float],
+                target: float = REF_TARGET_SECONDS, minimum: float = REF_MIN_SECONDS,
+                maximum: float = REF_MAX_SECONDS) -> Tuple[float, float]:
+    """Clamp a user selection into a usable clone window.
+
+    Empty selections become a `target`-second window; too-short selections grow around
+    their centre, too-long ones shrink, and everything stays inside [0, duration].
+    """
+    duration = max(0.0, float(duration))
+    if duration == 0.0:
+        raise MediaError("The selected media has no audio to trim.")
+    maximum = min(maximum, duration)
+    minimum = min(minimum, maximum)
+
+    start = min(max(0.0, float(start or 0.0)), duration)
+    end = min(max(float(end if end is not None else 0.0), 0.0), duration)
+    if end <= start:
+        start = min(start, max(0.0, duration - target))
+        end = min(duration, start + target)
+
+    if end - start < minimum:
+        centre = (start + end) / 2.0
+        start, end = centre - minimum / 2.0, centre + minimum / 2.0
+        start = max(0.0, min(start, duration - minimum))
+        end = start + minimum
+
+    if end - start > maximum:
+        centre = (start + end) / 2.0
+        start, end = centre - maximum / 2.0, centre + maximum / 2.0
+        start = max(0.0, min(start, duration - maximum))
+        end = start + maximum
+
+    return round(start, 3), round(end, 3)
+
+
+def slice_audio(wav: np.ndarray, sr: int, start: float, end: float) -> np.ndarray:
+    a = max(0, int(round(start * sr)))
+    b = min(len(wav), int(round(end * sr)))
+    return wav[a:max(b, a + 1)]
+
+
+def auto_pick_window(wav: np.ndarray, sr: int, target: float = REF_TARGET_SECONDS,
+                     step: float = 0.25) -> Tuple[float, float]:
+    """Pick the loudest contiguous `target`-second window (skips silence / room tone)."""
+    duration = len(wav) / float(sr)
+    if duration <= target:
+        return 0.0, round(duration, 3)
+    squared = wav.astype(np.float64) ** 2
+    cumulative = np.concatenate([[0.0], np.cumsum(squared)])
+    best_energy, best_start = -1.0, 0.0
+    window = int(target * sr)
+    position = 0.0
+    while position + target <= duration + 1e-6:
+        i0 = int(position * sr)
+        i1 = min(len(wav), i0 + window)
+        energy = (cumulative[i1] - cumulative[i0]) / max(1, i1 - i0)
+        if energy > best_energy:
+            best_energy, best_start = energy, position
+        position += step
+    return round(float(best_start), 3), round(float(best_start + target), 3)
+
+
+def render_waveform(wav: np.ndarray, sr: int, start: Optional[float] = None,
+                    end: Optional[float] = None, width: int = 980, height: int = 180) -> Image.Image:
+    """Draw a waveform with a second grid and the selected window shaded.
+
+    Hand-drawn with PIL rather than a plotting library so the UI needs no extra
+    dependency and the pixel geometry stays testable.
+    """
+    bg, fg, sel, grid, accent = "#101418", "#5eead4", "#1f6f5c", "#2b323c", "#f0abfc"
+    pad_l, pad_r, pad_t, pad_b = 10, 10, 12, 26
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+    mid = pad_t + plot_h / 2.0
+
+    image = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(image)
+    duration = max(len(wav) / float(sr), 1e-6)
+    x_of = lambda t: pad_l + (t / duration) * plot_w
+
+    if start is not None and end is not None and end > start:
+        draw.rectangle([x_of(start), pad_t, x_of(end), pad_t + plot_h], fill=sel)
+
+    # per-pixel peak envelope
+    pixels = max(1, min(plot_w, len(wav)))
+    if len(wav):
+        per = max(1, len(wav) // pixels)
+        usable = (len(wav) // per) * per
+        envelope = np.abs(wav[:usable].reshape(-1, per)).max(axis=1)[:pixels]
+    else:
+        envelope = np.zeros(1)
+    scale = (plot_h / 2.0) / max(float(envelope.max()), 1e-6)
+    for index, peak in enumerate(envelope):
+        x = pad_l + index
+        half = max(1.0, float(peak) * scale)
+        draw.line([(x, mid - half), (x, mid + half)], fill=fg)
+
+    draw.line([(pad_l, mid), (pad_l + plot_w, mid)], fill=grid)
+    tick = 1.0 if duration <= 30 else (5.0 if duration <= 150 else 30.0)
+    position = 0.0
+    while position <= duration + 1e-6:
+        x = x_of(position)
+        draw.line([(x, pad_t), (x, pad_t + plot_h)], fill=grid)
+        draw.text((x + 2, height - pad_b + 6), f"{position:.0f}s", fill="#9ca3af")
+        position += tick
+
+    for value, colour in ((start, accent), (end, accent)):
+        if value is not None:
+            x = x_of(min(max(float(value), 0.0), duration))
+            draw.line([(x, pad_t - 4), (x, pad_t + plot_h + 4)], fill=colour, width=2)
+            draw.text((min(x + 3, width - 60), pad_t - 10), f"{value:.1f}s", fill=colour)
+    return image
+
+
+# ============================================================================
+# Transcription of the reference clip (the ICL clone needs a matching transcript)
+# ============================================================================
+class Transcriber:
+    """Lazy Whisper wrapper, loaded only when the user actually asks for a transcript.
+
+    Kept on the GPU once loaded (~3.1GB bf16 for large-v3) — that fits next to one
+    resident 1.7B TTS model, and re-loading costs far more than keeping it.
+    """
+
+    def __init__(self, model_id: str = ASR_MODEL_ID, dtype: torch.dtype = torch.bfloat16,
+                 enabled: bool = True, device: Optional[torch.device] = None):
+        self.model_id = model_id
+        self.dtype = dtype
+        self.enabled = enabled and bool(model_id) and model_id.lower() not in ("none", "off", "")
+        self.device = device or DEVICE
+        self.model = None
+        self.feature_extractor = None
+        self.tokenizer = None
+        self.lock = threading.RLock()
+
+    @property
+    def loaded(self) -> bool:
+        return self.model is not None
+
+    def load(self) -> None:
+        if self.model is not None:
+            return
+        if not self.enabled:
+            raise MediaError("Transcription is disabled (start with --asr-model to enable it).")
+        from transformers import WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
+
+        print(f"[asr] loading {self.model_id} -> CPU RAM ...", flush=True)
+        self.feature_extractor = WhisperFeatureExtractor.from_pretrained(self.model_id)
+        self.tokenizer = WhisperTokenizer.from_pretrained(self.model_id)
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            self.model_id, dtype=self.dtype, attn_implementation="sdpa")
+        self.model.to(self.device)
+        self.model.eval()
+        print(f"[asr] {self.model_id} ready on {self.device}", flush=True)
+
+    def unload(self) -> None:
+        self.model = None
+        self.feature_extractor = None
+        self.tokenizer = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def transcribe(self, wav: np.ndarray, sr: int, language: Optional[str] = None) -> str:
+        if not wav.size:
+            raise MediaError("Nothing to transcribe — pick a non-empty clip.")
+        code = ASR_LANGUAGE_CODES.get((language or "").strip().lower())
+        with self.lock:
+            self.load()
+            import librosa
+            if int(sr) != 16000:
+                wav = librosa.resample(y=np.asarray(wav, dtype=np.float32), orig_sr=int(sr), target_sr=16000)
+                sr = 16000
+            features = self.feature_extractor(
+                np.asarray(wav, dtype=np.float32), sampling_rate=int(sr), return_tensors="pt"
+            ).input_features.to(self.device, self.dtype)
+            # Whisper pads every clip to 30s; without an explicit padding mask it cannot
+            # tell silence from audio (and warns, since pad == eos for this checkpoint).
+            max_samples = self.feature_extractor.nb_max_frames * 160  # 30s at 16kHz
+            raw_length = min(len(wav), max_samples)
+            padding_mask = np.zeros(max_samples, dtype=np.int64)
+            padding_mask[:raw_length] = 1
+            with torch.inference_mode():
+                ids = self.model.generate(
+                    features,
+                    attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
+                    language=code, task="transcribe",
+                    num_beams=4, no_repeat_ngram_size=4)
+            text = self.tokenizer.decode(ids[0], skip_special_tokens=True).strip()
+        if not text:
+            raise MediaError("Transcription came back empty — the clip may be music or silence.")
+        return text
+
+
+ASR: Optional[Transcriber] = None
+
+# gr.State travels to the browser as JSON, so the loaded clip is kept on disk and only
+# its path/duration live in state (a numpy array there would not survive the round-trip).
+MEDIA_DIR = os.path.join(ROOT, "tmp", "media")
+
+
+def media_dir() -> str:
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    return MEDIA_DIR
+
+
+# ============================================================================
 # Gradio callbacks
 # ============================================================================
 def generate_custom_voice(text, language, speaker, instruct, temperature, top_p, top_k, rep_penalty,
@@ -634,6 +923,93 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         return None, f"Error: {type(e).__name__}: {e}"
 
 
+def clip_guidance(seconds: float, minimum: float = REF_MIN_SECONDS,
+                  maximum: float = REF_MAX_SECONDS, target: float = REF_TARGET_SECONDS) -> str:
+    """Tell the user whether the selected stretch is a good clone reference."""
+    if seconds < minimum:
+        verdict = f"too short — use at least {minimum:g}s"
+    elif seconds > maximum:
+        verdict = f"long — clones best under {maximum:g}s and runs faster"
+    elif abs(seconds - target) <= 2.0:
+        verdict = "good length"
+    else:
+        verdict = "usable"
+    return f"{seconds:.2f}s selected — {verdict}. Sweet spot {minimum:g}-{maximum:g}s, target {target:g}s."
+
+
+def _state_audio(state: Any) -> Tuple[np.ndarray, int]:
+    if not isinstance(state, dict) or not state.get("path"):
+        raise MediaError("Upload a clip first — nothing is loaded.")
+    return load_media(state["path"])
+
+
+def _clip_outputs(state: Any, start: Any, end: Any) -> Tuple[Any, Any, str, float, float]:
+    """Clamp the selection and produce (waveform, audio, info, start, end)."""
+    wav, sr = _state_audio(state)
+    start, end = trim_window(len(wav) / sr, start, end)
+    clip = slice_audio(wav, sr, start, end)
+    return render_waveform(wav, sr, start, end), (sr, clip), clip_guidance(end - start), start, end
+
+
+def import_media(file_value: Any) -> Tuple[Any, str, Any, Any, Any, Any, str]:
+    """Take a video/audio upload, extract its audio, and pre-select the best window."""
+    path = file_value[0] if isinstance(file_value, (list, tuple)) and file_value else file_value
+    try:
+        wav, sr = load_media(path)
+        suffix = os.path.splitext(str(path))[1].lower()
+        kind = "video — audio track extracted" if suffix in VIDEO_SUFFIXES else "audio"
+        stored = os.path.join(media_dir(), f"{uuid.uuid4().hex}.wav")
+        sf.write(stored, wav, sr)
+        state = {"path": stored, "name": os.path.basename(str(path)), "kind": kind,
+                 "duration": round(len(wav) / sr, 3), "sample_rate": int(sr)}
+        wave, audio, info, start, end = _clip_outputs(state, None, None)
+        status = f"Loaded {state['name']} ({kind}): {len(wav) / sr:.1f}s @ {sr}Hz"
+        duration = round(len(wav) / sr, 2)
+        return (state, status, wave,
+                gr.update(maximum=duration, value=start),
+                gr.update(maximum=duration, value=end),
+                audio, info)
+    except (MediaError, OSError, ValueError) as e:
+        return None, f"Error: {type(e).__name__}: {e}", None, gr.update(), gr.update(), None, ""
+
+
+def update_clip(state: Any, start: Any, end: Any) -> Tuple[Any, Any, str, Any, Any]:
+    """Re-slice after the user drags the selection sliders."""
+    try:
+        wave, audio, info, start, end = _clip_outputs(state, start, end)
+        return wave, audio, info, gr.update(value=start), gr.update(value=end)
+    except (MediaError, OSError, ValueError) as e:
+        return None, None, f"Error: {type(e).__name__}: {e}", gr.update(), gr.update()
+
+
+def auto_pick_clip(state: Any) -> Tuple[Any, Any, Any, Any, str]:
+    """Jump the selection to the loudest window (drops silence / room tone)."""
+    try:
+        wav, sr = _state_audio(state)
+        start, end = auto_pick_window(wav, sr)
+        wave, audio, info, start, end = _clip_outputs(state, start, end)
+        return wave, audio, info, gr.update(value=start), gr.update(value=end)
+    except (MediaError, OSError, ValueError) as e:
+        return None, None, f"Error: {type(e).__name__}: {e}", gr.update(), gr.update()
+
+
+def transcribe_reference(state: Any, start: Any, end: Any, language: Any) -> Tuple[Any, str]:
+    """Whisper the *selected* window into the editable transcript box."""
+    if ASR is None:
+        return gr.update(), "Error: transcription is disabled on this server (--asr-model)."
+    try:
+        wav, sr = _state_audio(state)
+        start, end = trim_window(len(wav) / sr, start, end)
+        clip = slice_audio(wav, sr, start, end)
+        t0 = time.time()
+        text = ASR.transcribe(clip, sr, None if not language or language == "Auto" else str(language))
+        return gr.update(value=text), (
+            f"Transcribed {end - start:.1f}s in {time.time() - t0:.1f}s — "
+            f"check and edit the text before cloning.")
+    except (MediaError, OSError, ValueError, RuntimeError) as e:
+        return gr.update(), f"Error: {type(e).__name__}: {e}"
+
+
 def refresh_status():
     return HUB.status()
 
@@ -723,15 +1099,41 @@ after a model switch pays a few seconds of load time.
                              outputs=[vd_audio, vd_status])
 
             with gr.Tab("Voice Clone (Base)"):
-                gr.Markdown("Upload (or record) a short clean reference clip, give its transcript, then synthesize new text.")
+                gr.Markdown(
+                    "Upload a clip — **video works**, only the audio track is used — drag the "
+                    "selection to the best stretch, transcribe it, then synthesize new text. "
+                    "A clean 3–10s window clones best.")
+                cl_media_state = gr.State(value=None)
+                cl_upload = gr.File(label="Upload video or audio", file_types=MEDIA_SUFFIXES,
+                                    type="filepath")
+                with gr.Row():
+                    cl_import_btn = gr.Button("Extract audio & show waveform", variant="primary")
+                    cl_auto_btn = gr.Button("Auto-pick best clip")
+                cl_media_status = gr.Textbox(label="Media", lines=1, interactive=False)
+                cl_wave = gr.Image(label="Reference waveform — shaded region is what gets cloned",
+                                   type="pil", height=180, interactive=False)
+                with gr.Row():
+                    cl_start = gr.Slider(0, 60, value=0, step=0.05, label="Start (s)")
+                    cl_end = gr.Slider(0, 60, value=0, step=0.05, label="End (s)")
+                cl_clip_info = gr.Textbox(label="Selected clip", lines=1, interactive=False)
+
                 with gr.Row():
                     with gr.Column(scale=2):
-                        cl_ref_audio = gr.Audio(label="Reference audio", type="numpy",
-                                                sources=["upload", "microphone"])
-                        cl_ref_text = gr.Textbox(label="Reference transcript", lines=2,
-                                                 placeholder="Exact text spoken in the reference audio...")
-                        cl_xvector = gr.Checkbox(
-                            label="x-vector only (no transcript needed, lower similarity)", value=False)
+                        cl_ref_audio = gr.Audio(label="Reference clip (trimmed selection lands here)",
+                                                type="numpy", sources=["upload", "microphone"])
+                    with gr.Column(scale=2):
+                        cl_asr_language = gr.Dropdown(
+                            label="Transcript language",
+                            choices=[("Auto-detect", "Auto")] + [(k.title(), k) for k in ASR_LANGUAGE_CODES],
+                            value="Auto")
+                        cl_transcribe_btn = gr.Button("Transcribe selected clip", variant="primary")
+                cl_ref_text = gr.Textbox(
+                    label="Reference transcript (editable — must match the clip)", lines=3,
+                    placeholder="Exact text spoken in the selected clip. Transcribe it above, then fix anything Whisper got wrong.")
+                cl_xvector = gr.Checkbox(
+                    label="x-vector only (no transcript needed, lower similarity)", value=False)
+
+                with gr.Row():
                     with gr.Column(scale=2):
                         cl_text = gr.Textbox(label="Target text", lines=4,
                                              placeholder="What the cloned voice should say...")
@@ -752,6 +1154,19 @@ after a model switch pays a few seconds of load time.
                 cl_btn.click(generate_voice_clone,
                              inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling,
                              outputs=[cl_audio, cl_status])
+
+                cl_import_btn.click(import_media, inputs=[cl_upload],
+                                    outputs=[cl_media_state, cl_media_status, cl_wave,
+                                             cl_start, cl_end, cl_ref_audio, cl_clip_info])
+                cl_start.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
+                                 outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
+                cl_end.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
+                               outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
+                cl_auto_btn.click(auto_pick_clip, inputs=[cl_media_state],
+                                  outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
+                cl_transcribe_btn.click(transcribe_reference,
+                                        inputs=[cl_media_state, cl_start, cl_end, cl_asr_language],
+                                        outputs=[cl_ref_text, cl_media_status])
 
                 vd_save_btn.click(save_designed_voice, inputs=[vd_voice_name],
                                   outputs=[vd_voice_name, vd_save_status, cl_voice])
@@ -796,9 +1211,21 @@ def main() -> int:
     parser.add_argument("--ssl-certfile", default=None)
     parser.add_argument("--ssl-keyfile", default=None)
     parser.add_argument("--share", action="store_true", help="Create a public gradio.app link.")
+    parser.add_argument("--asr-model", default=ASR_MODEL_ID,
+                        help=f"Whisper model for reference transcription (default {ASR_MODEL_ID}); "
+                             f"'none' disables the button.")
+    parser.add_argument("--no-asr", action="store_true", help="Same as --asr-model none.")
+    parser.add_argument("--ffmpeg-bin", default=FFMPEG_BIN, help="ffmpeg executable for video ingest.")
     args = parser.parse_args()
 
+    globals()["FFMPEG_BIN"] = args.ffmpeg_bin
+
     DEVICE = torch.device(args.device)
+    globals()["ASR"] = Transcriber(model_id="none" if args.no_asr else args.asr_model, device=DEVICE)
+    print(f"[webui] transcription: {'disabled' if not ASR.enabled else ASR.model_id} | "
+          f"ffmpeg: {args.ffmpeg_bin if shutil.which(args.ffmpeg_bin) else 'NOT FOUND (video uploads disabled)'}",
+          flush=True)
+
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     if args.max_cpu_resident * 4.3 * 1024 > mem_available_mb() - args.ram_floor_mb:

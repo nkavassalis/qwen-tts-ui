@@ -16,9 +16,19 @@ Read `README.md` for user-facing docs and design notes.
   each load ~4.3GB per checkpoint; two copies pinned the VM into Windows' own memory and
   hard-locked the machine once. The `flock` single-owner lock in `webui.exclusive_owner()`
   enforces this — do not weaken it, and never use `--force` in a script or CI.
-- **Never load a checkpoint without going through `ModelHub._get_cpu()` / `acquire()`.**
-  They enforce `max_cpu_resident` and the RAM/VRAM floors. Ad-hoc
-  `Qwen3TTSModel.from_pretrained(...)` in a script bypasses every guard.
+- **Never load a model outside its manager.** TTS checkpoints go through
+  `ModelHub._get_cpu()` / `acquire()`; Whisper goes through `Transcriber.load()`. They
+  enforce `max_cpu_resident` and the RAM/VRAM floors. Ad-hoc `from_pretrained(...)` in a
+  script bypasses every guard.
+- **Keep Whisper out of the import path.** `ASR` is constructed lazily and the model only
+  loads on the first *Transcribe* click, so `import webui.app` and the CPU tests never
+  touch 2.9GB of weights. Do not import transformers' Whisper classes at module scope.
+- **Always pass the Whisper padding mask.** Whisper pads every clip to 30s and its pad
+  token equals eos; without an explicit `attention_mask` you get warnings plus hallucinated
+  text over the silence. See `Transcriber.transcribe`.
+- **Video ingest stays ffmpeg-only.** `load_media` maps any container to mono float32 via
+  `-vn -map 0:a:0 -ac 1 -ar 24000`; audio-only files are read by libsndfile and fall back
+  to ffmpeg. Do not add `av`/`imageio-ffmpeg` dependencies — ffmpeg is on PATH here.
 - **Keep the WSL2 ceiling in mind when raising any cap.** `free -m` before you bump
   `--max-cpu-resident`; `MemAvailable` here is not headroom, it is the host's RAM.
 
@@ -48,9 +58,9 @@ Read `README.md` for user-facing docs and design notes.
 ## Verifying a change
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # fast, CPU-only, runs on every change
-.venv/bin/python tests/smoke_test.py       # GPU end-to-end, ~60s; required before "done"
-.venv/bin/python tests/smoke_test.py --only voice_clone
+.venv/bin/python tests/test_app_logic.py   # fast, CPU-only, runs on every change (20 cases)
+.venv/bin/python tests/smoke_test.py       # GPU end-to-end, ~90s; required before "done"
+.venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
 The smoke test must run with the web server **stopped** (the lock enforces this).
@@ -61,6 +71,8 @@ on public functions).
 ## Things that are deliberately NOT here
 
 - No flash-attn, no vLLM/vLLM-Omni (upstream supports it; unnecessary at 1.7B on this GPU).
+- No faster-whisper / ctranslate2 / matplotlib. Whisper runs on the existing torch stack;
+  the waveform is drawn with PIL.
 - No 0.6B checkpoints (1.7B is the quality target and RAM/VRAM budget).
 - No auth / public exposure. `--ip 0.0.0.0` plus `--share` exist for convenience; both
   expose an unauthenticated model endpoint — keep them off by default.
