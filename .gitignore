@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 tests/output/
 repo/
+voices/

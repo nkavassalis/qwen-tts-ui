@@ -63,7 +63,6 @@ def test_audio_normalisation() -> None:
     check((b_sr, b_wav.shape) == (sr, (1000,)), "dict form matches tuple form")
 
     check(webui._audio_to_tuple(None) is None, "missing audio stays None so the caller can error out")
-
     # Stereo input is mixed down; integer PCM is rescaled; over-range float is normalised.
     stereo = np.stack([mono, mono], axis=-1)
     mixed, _ = webui._audio_to_tuple((sr, stereo))
@@ -132,6 +131,195 @@ def test_move_reaches_the_speech_tokenizer() -> None:
     check(tts.model.speech_tokenizer.model.seen == "cuda", "speech tokenizer vocoder moved too")
     check(tts.model.speech_tokenizer.device == "cuda", "speech tokenizer .device cache updated")
     check(tts.device == "cuda", "wrapper .device updated")
+
+
+def test_language_choices_match_checkpoint() -> None:
+    """Dropdown values must match what the model actually accepts.
+
+    Upstream builds `supported_languages` from codec_language_id but *skips* the
+    dialect entries (modeling_qwen3_tts.py:1832) — dialect is a speaker attribute
+    (`spk_is_dialect`), so offering 'beijing_dialect' would raise at generate time.
+    Skipped when the weights are not downloaded.
+    """
+    import json
+
+    cfg_path = os.path.join(webui.ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice", "config.json")
+    if not os.path.exists(cfg_path):
+        print(f"     (skipped: {cfg_path} not present)")
+        return
+    talker = json.load(open(cfg_path))["talker_config"]
+    accepted = {"auto"} | {k for k in talker["codec_language_id"] if "dialect" not in k}
+    # The model lowercases whatever it is given, so compare case-insensitively.
+    unknown = {v.lower() for v in webui.LANGUAGE_VALUES} - {"auto"} - accepted
+    check(not unknown, f"dropdown offers languages the model rejects: {sorted(unknown)}")
+    for dialect in ("beijing_dialect", "sichuan_dialect"):
+        check(dialect not in {v.lower() for v in webui.LANGUAGE_VALUES},
+              f"{dialect} is a speaker trait, not a language option")
+    check("italian" in {v.lower() for v in webui.LANGUAGE_VALUES}, "italian is supported and must stay selectable")
+
+
+def test_speaker_choices_come_from_the_checkpoint() -> None:
+    import json
+
+    choices = webui.speaker_choices(os.path.join(webui.ROOT, "models"))
+    values = [value for _, value in choices]
+    check("" not in [label for label, _ in choices], "every speaker has a description label")
+
+    by_name = dict((label.split(" — ")[0].lower().replace(" ", "_"), label) for label, _ in choices)
+    cfg_path = os.path.join(webui.ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice", "config.json")
+    if os.path.exists(cfg_path):
+        talker = json.load(open(cfg_path))["talker_config"]
+        check(set(values) == set(talker["spk_id"]), "dropdown speakers == checkpoint spk_id table")
+        for speaker, dialect in talker["spk_is_dialect"].items():
+            if dialect:
+                label = by_name[speaker]
+                check(dialect.replace("_", " ").lower() in label.lower(),
+                      f"{speaker} should advertise its dialect in the label: {label!r}")
+    else:
+        check(len(choices) == 9, "fallback list covers the 9 released speakers")
+
+    # A missing checkpoint must still yield a usable dropdown.
+    empty = webui.speaker_choices(os.path.join(webui.ROOT, "does-not-exist"))
+    check(len(empty) == 9 and empty[0][1] in webui.SPEAKER_INFO, "falls back to the static speaker list")
+
+
+def test_voice_library(tmp_dir=None) -> None:
+    import tempfile
+
+    wav = (np.sin(np.linspace(0, 200, 24000)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
+        try:
+            check(webui.list_voices() == [], "empty library lists nothing")
+            check(webui.voice_choices() == [], "empty library offers no choices")
+
+            rec = webui.save_voice("Sleepy Sea Captain!", wav, 24000, "Ahoy me hearties", "gruff old man", "english")
+            check(rec["slug"] == "sleepy_sea_captain", "name is slugified for the filename")
+            check(os.path.exists(os.path.join(tmp, "sleepy_sea_captain.wav")), "wav written")
+            check(rec["seconds"] == 1.0, "duration recorded from the waveform")
+
+            voices = webui.list_voices()
+            check([v["slug"] for v in voices] == ["sleepy_sea_captain"], "listed after save")
+            check(voices[0]["text"] == "Ahoy me hearties", "transcript persisted (needed for ICL cloning)")
+            check(webui.voice_choices()[0][1] == "sleepy_sea_captain", "dropdown exposes the slug as its value")
+
+            audio, text, msg = webui.load_saved_voice("sleepy_sea_captain")
+            check(audio[0] == 24000 and audio[1].shape == (24000,), "load returns (sr, wav) for the Audio component")
+            check(text == "Ahoy me hearties", "load returns the stored transcript")
+            check("Loaded" in msg, "load reports success")
+
+            # Overwriting the same name replaces rather than accumulating.
+            webui.save_voice("sleepy sea captain", wav[:12000], 24000, "shorter", "x", "english")
+            check(len(webui.list_voices()) == 1, "same name overwrites instead of duplicating")
+            check(webui.list_voices()[0]["seconds"] == 0.5, "overwrite updates the clip")
+
+            _, _, msg = webui.load_saved_voice("does_not_exist")
+            check("missing" in msg, "loading an unknown voice errors instead of returning silence")
+
+            _, msg, _ = webui.delete_saved_voice("sleepy_sea_captain")
+            check("Deleted" in msg and webui.list_voices() == [], "delete removes both files")
+
+            # A half-written entry must not break the list.
+            open(os.path.join(tmp, "broken.json"), "w").write("{not json")
+            webui.save_voice("good", wav, 24000, "t", "i", "english")
+            check([v["slug"] for v in webui.list_voices()] == ["good"], "corrupt metadata is skipped, not fatal")
+        finally:
+            webui.VOICES_DIR = original
+
+
+def test_save_designed_voice_requires_generation() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
+        try:
+            webui._LAST_DESIGN.clear()
+            _, msg, _ = webui.save_designed_voice("nobody")
+            check("Nothing to save yet" in msg, "cannot save before generating")
+
+            webui._LAST_DESIGN.update(wav=np.zeros(24000, dtype=np.float32), sr=24000,
+                                      text="hello", instruct="warm", language="english")
+            _, msg, update = webui.save_designed_voice("   ")
+            check("name" in msg.lower(), "blank name rejected")
+            check(webui.list_voices() == [], "rejected save writes nothing")
+
+            _, msg, update = webui.save_designed_voice("Warm Narrator")
+            check("Saved" in msg, "saving the last design works")
+            check(update["choices"][0][1] == "warm_narrator", "clone tab dropdown is refreshed with the new voice")
+        finally:
+            webui.VOICES_DIR = original
+            webui._LAST_DESIGN.clear()
+
+
+def test_slug_rejects_junk() -> None:
+    check(webui._slug("  Two  Words!! ") == "two_words", "punctuation and spacing collapse to underscores")
+    for bad in ("", "   ", "!!!", "///"):
+        try:
+            webui._slug(bad)
+            raise AssertionError(f"expected ValueError for {bad!r}")
+        except ValueError:
+            pass
+
+
+def test_memory_guards() -> None:
+    """The hub must refuse to over-commit rather than swap/ballooning the VM.
+
+    Regression guard for the WSL2 hard-lock: two processes each pinning all three
+    checkpoints exhausted the host. Nothing here loads real weights.
+    """
+    import tempfile
+
+    check(webui.mem_available_mb() > 0, "MemAvailable is readable")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A fake checkpoint: only the file sizes matter for the budget math.
+        cap_dir = os.path.join(tmp, "Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        os.makedirs(cap_dir)
+        with open(os.path.join(cap_dir, "model.safetensors"), "wb") as fh:
+            fh.truncate(2 * 1024 ** 3)  # 2GB sparse
+        for name in ("config.json", "generation_config.json"):
+            open(os.path.join(cap_dir, name), "w").write("{}")
+
+        hub = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=2)
+        check(1900 < hub.weight_mb("custom_voice") < 2100, f"size estimated from safetensors: {hub.weight_mb('custom_voice')}")
+
+        # Floor above what is available -> MemoryError before any weights are touched.
+        guarded = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=2,
+                                 ram_floor_mb=int(webui.mem_available_mb() + 100_000))
+        try:
+            guarded._get_cpu("custom_voice")
+            raise AssertionError("expected MemoryError, got a load")
+        except MemoryError as e:
+            check("floor" in str(e), f"refusal explains the floor: {e}")
+        check(guarded.cpu_cache == {}, "refused load leaves nothing pinned")
+
+    # _free_cpu must never drop the model we are about to need, nor one on the GPU.
+    hub = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=5, ram_floor_mb=0)
+    hub.cpu_cache["a"] = object()
+    hub.cpu_cache["b"] = object()
+    hub.on_gpu["b"] = hub.cpu_cache["b"]
+    hub._free_cpu(10 ** 9, protect="a")
+    check("b" in hub.cpu_cache, "a model resident on the GPU is not dropped from the CPU cache")
+
+
+def test_exclusive_owner_lock() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        lock_path = os.path.join(tmp, "test.lock")
+        original, webui.LOCK_PATH = webui.LOCK_PATH, lock_path
+        try:
+            with webui.exclusive_owner("first"):
+                try:
+                    with webui.exclusive_owner("second"):
+                        raise AssertionError("second holder should have been refused")
+                except RuntimeError as e:
+                    check("first pid=" in str(e), f"refusal names the holder: {e}")
+            # released -> reacquirable
+            with webui.exclusive_owner("third"):
+                pass
+        finally:
+            webui.LOCK_PATH = original
 
 
 if __name__ == "__main__":

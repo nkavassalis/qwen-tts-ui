@@ -7,9 +7,20 @@ change, and never leave finished work uncommitted.
 ## What this is
 
 A local install of QwenLM/Qwen3-TTS (1.7B checkpoints) with a Gradio UI, tuned for one
-RTX 5070 Ti (16GB) + 32GB RAM. Read `README.md` for user-facing docs and design notes.
+RTX 5070 Ti (16GB) inside **WSL2** with dynamic memory (VM ceiling = host RAM, 32GB).
+Read `README.md` for user-facing docs and design notes.
 
 ## Ground rules for changes
+
+- **Never run two model-owning processes at once.** The server and `tests/smoke_test.py`
+  each load ~4.3GB per checkpoint; two copies pinned the VM into Windows' own memory and
+  hard-locked the machine once. The `flock` single-owner lock in `webui.exclusive_owner()`
+  enforces this — do not weaken it, and never use `--force` in a script or CI.
+- **Never load a checkpoint without going through `ModelHub._get_cpu()` / `acquire()`.**
+  They enforce `max_cpu_resident` and the RAM/VRAM floors. Ad-hoc
+  `Qwen3TTSModel.from_pretrained(...)` in a script bypasses every guard.
+- **Keep the WSL2 ceiling in mind when raising any cap.** `free -m` before you bump
+  `--max-cpu-resident`; `MemAvailable` here is not headroom, it is the host's RAM.
 
 - **Never move model-loading logic out of `ModelHub._move()`.** It is the single place
   that knows `model.speech_tokenizer` is a non-Module wrapper that must be moved to CUDA
@@ -18,6 +29,10 @@ RTX 5070 Ti (16GB) + 32GB RAM. Read `README.md` for user-facing docs and design 
   honest.
 - **Keep `sdpa` as the default attention implementation.** flash-attn 2 has no sm_120
   wheels; do not add it as a dependency.
+- **Do not add dialect values to the language dropdown.** `beijing_dialect` /
+  `sichuan_dialect` exist in `codec_language_id` but upstream excludes them from
+  `get_supported_languages()`; dialect comes from the *speaker* (`spk_is_dialect`).
+  `tests/test_app_logic.py::test_language_choices_match_checkpoint` enforces this.
 - **Pin the CUDA story.** This box is Blackwell (sm_120): torch must be >= 2.7 built with
   cu128. `setup.sh` pins `torch==2.8.0` / `torchaudio==2.8.0`. Don't let a plain
   `pip install -U torch` drift the venv into a non-CUDA or older-CUDA wheel.
@@ -34,9 +49,11 @@ RTX 5070 Ti (16GB) + 32GB RAM. Read `README.md` for user-facing docs and design 
 
 ```bash
 .venv/bin/python tests/test_app_logic.py   # fast, CPU-only, runs on every change
-.venv/bin/python tests/smoke_test.py       # GPU end-to-end, ~40s; required before "done"
+.venv/bin/python tests/smoke_test.py       # GPU end-to-end, ~60s; required before "done"
 .venv/bin/python tests/smoke_test.py --only voice_clone
 ```
+
+The smoke test must run with the web server **stopped** (the lock enforces this).
 
 There is no linter/formatter configured; match the existing style (4 spaces, type hints
 on public functions).

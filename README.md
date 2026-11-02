@@ -9,16 +9,23 @@ the 0.6B variants score noticeably worse on WER/speaker-similarity and VoiceDesi
 
 | Tab | Checkpoint | What it does |
 |---|---|---|
-| TTS (CustomVoice) | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 preset speakers, any of 10 languages, natural-language style instructions ("用愤怒的语气说", "very happy") |
+| TTS (CustomVoice) | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 preset speakers (labels show each one's native language/dialect), 10 languages, natural-language style instructions ("用愤怒的语气说", "very happy") |
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Invent a brand-new voice from a text description of timbre/age/emotion/accent |
 | Voice Clone (Base) | `Qwen3-TTS-12Hz-1.7B-Base` | Clone a voice from a ~3s reference clip (upload or microphone) |
+
+**Voice library**: the Voice Design tab can *save* a designed voice (`voices/*.wav` + a
+sidecar with its transcript), and the Voice Clone tab can load it back as a reusable
+reference. That makes a designed voice persistent across requests and restarts — the
+hosted demo cannot, since it keeps nothing between sessions. Under the hood the saved
+clip + transcript feed `create_voice_clone_prompt`, so it clones with full ICL quality.
 
 ## Quick start
 
 ```bash
 ./run.sh                      # -> http://127.0.0.1:7860
 ./run.sh --ip 0.0.0.0         # expose on the LAN
-./run.sh --preload            # load all three checkpoints into RAM at startup (~13GB)
+./run.sh --preload            # warm checkpoints into RAM at startup (bounded by --max-cpu-resident)
+./run.sh --max-cpu-resident 1 # safest: pin only one 4.3GB copy at a time
 ./run.sh --ssl-self-signed --ip 0.0.0.0   # HTTPS; needed for browser mic on non-localhost
 ./run.sh --help               # all flags
 ```
@@ -35,19 +42,48 @@ downloads the checkpoints into `./models/`).
 ```
 setup.sh            reproducible env + weight download
 run.sh              launcher (handles self-signed certs for HTTPS)
-webui/app.py        the Gradio UI + VRAM-aware model manager
+webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
 repo/               upstream QwenLM/Qwen3-TTS checkout (installed editable)
 models/             1.7B checkpoints + Qwen3-TTS-Tokenizer-12Hz (~14GB, gitignored)
-tests/test_app_logic.py   CPU-only unit tests for the UI helpers
-tests/smoke_test.py       GPU end-to-end test: loads each model, generates, validates the wav
+voices/             saved designed voices: <slug>.wav + <slug>.json (gitignored)
+.qwen-tts.lock      single-owner advisory lock (gitignored)
+tests/test_app_logic.py   CPU-only unit tests for the UI helpers and memory guards
+tests/smoke_test.py       GPU end-to-end: loads each model, generates, validates the wav
 ```
+
+## Memory safety (read this first)
+
+This box is **WSL2 with dynamic memory** (`hv_balloon` is set to essentially the host's whole RAM).
+The VM is allowed to balloon to essentially your whole 32GB of host RAM, so over-committing
+inside WSL does not just OOM the distro — it can starve Windows and hard-lock the machine.
+That happened once: the server was started with `--preload` (three checkpoints, ~13GB) while
+`smoke_test.py` was running with its own three copies, ~26GB plus page cache.
+
+Three guardrails now make that impossible to repeat:
+
+1. **Single-owner lock** (`.qwen-tts.lock`, `flock`). The server and the smoke test compete
+   for it and the loser refuses to start, naming the holder. `--force` overrides, deliberately.
+2. **Bounded CPU residency**: at most `--max-cpu-resident` (default **2**) checkpoints are
+   pinned in host RAM; beyond that the LRU one is dropped and re-read from disk (~1.5s).
+3. **Explicit floors**: a checkpoint is only loaded if `MemAvailable` stays above
+   `--ram-floor-mb` (default 4096), and only promoted to the GPU if VRAM free exceeds its
+   size plus a margin. Otherwise you get a `MemoryError` with a diagnosis, not a swap spiral.
+
+Rule of thumb: **one Qwen3-TTS process at a time**, and check `free -m` before raising the
+caps. If Windows itself feels tight, lower `--max-cpu-resident` to 1 or set a hard cap in
+`C:\\Users\\<you>\\.wslconfig` (`memory=20GB`).
 
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # <1s, no weights needed
-.venv/bin/python tests/smoke_test.py       # ~40s, needs the GPU + downloaded weights
+.venv/bin/python tests/test_app_logic.py   # ~1s, no weights needed, 12 cases
+.venv/bin/python tests/smoke_test.py       # ~60s, needs the GPU + downloaded weights
+.venv/bin/python tests/smoke_test.py --only voice_clone
 ```
+
+The smoke test covers five flows: CustomVoice, VoiceDesign, Base clone, a dialect speaker
+(Dylan → Beijing dialect), and the design→save→load→clone voice-library flow. It refuses to
+run while the web server holds the lock — stop the server first rather than using `--force`.
 
 `smoke_test.py` writes the audio it produces to `tests/output/` and asserts each clip is
 non-silent, non-clipping and of plausible length, so a silently-broken pipeline (e.g. a
@@ -77,6 +113,14 @@ is a `Qwen3TTSTokenizer` *wrapper*, not an `nn.Module`, so `model.to("cuda")` le
 `nn.Module`, and `tests/test_app_logic.py::test_move_reaches_the_speech_tokenizer`
 guards the regression.
 
+**Dialects are a speaker trait, not a language.** The checkpoint carries
+`talker_config.spk_is_dialect` (`dylan → beijing_dialect`, `eric → sichuan_dialect`) and
+upstream deliberately filters the dialect entries out of `get_supported_languages()`
+(modeling_qwen3_tts.py:1832), so passing `language="beijing_dialect"` raises
+`ValueError: Unsupported languages`. You get an accent by picking the speaker; the UI labels
+the speaker dropdown accordingly and keeps dialects out of the language dropdown. Italian *is*
+selectable — the hosted Space omits it by oversight.
+
 **Output length is bounded by prompt length.** The checkpoint ships
 `max_new_tokens=8192` and sampling defaults of `temperature=0.9, top_k=50,
 repetition_penalty=1.05`. ICL voice cloning occasionally fails to emit EOS; one such run
@@ -93,6 +137,9 @@ reference doesn't re-encode it.
 
 | Symptom | Cause / fix |
 |---|---|
+| `Another Qwen3-TTS process is already holding the weights` | The server and the smoke test cannot run together (two copies of ~13GB of weights risk locking WSL2). Stop the server, or pass `--force` if you know what you are doing |
+| `MemoryError: ... would leave less than the ...MB floor` | RAM is genuinely tight: close GPU/LLM processes, lower `--max-cpu-resident`, or cap WSL in `.wslconfig` |
+| Whole machine hard-locks under load | WSL2 ballooning into host RAM — see *Memory safety* above |
 | Generation takes minutes, GPU ~35% | Speech tokenizer stuck on CPU — you bypassed `ModelHub._move()` (see design note above) |
 | `Torch has no CUDA` / `no kernel image available` | torch wheel predates sm_120; need `torch>=2.7` built with cu128 (`setup.sh` pins 2.8.0+cu128) |
 | Mic record button does nothing on a LAN URL | Browsers only allow mic on localhost or HTTPS — use `./run.sh --ssl-self-signed --ip 0.0.0.0` |
