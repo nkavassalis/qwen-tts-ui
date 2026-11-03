@@ -80,9 +80,10 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03, UI/clone-quality review): **CPU tier 84/84 passing**, Python 3.12,
+Current state (2026-11-03, after the UI/clone-quality rework): **CPU tier 84/84**, Python 3.12,
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3, `qwen-tts` from PyPI. **GPU tier
-NOT run** — the box had no GPU, and `smoke_test.py` was edited; see *Testing limitations*.
+8/8 on the 5070 Ti** — it was pushed unrun from a CPU-only box and was executed here; see
+*Testing limitations* for what that run confirmed.
 
 The CPU tier imports `torch`, `gradio`, `qwen_tts`, `soundfile`, `librosa` and `PIL`, so
 it needs the venv — it just needs no weights and no CUDA. The GPU tier refuses to start
@@ -362,9 +363,10 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   resident 1.7B model on 16GB, but it does eat into the VRAM margin.
 - `default_concurrency_limit=1` serialises everything: a Whisper load blocks a queued
   generation behind it. Deliberate (one GPU), but surprising if two people share it.
-- **`CONF_GOOD` needs re-calibrating** on the GPU box after the scorer fix (see *Design
-  decisions*). Until then best-of-N leans on WER and defects; the confidence term may be
-  too strict or too lax.
+- **`CONF_GOOD` is calibrated, but thinly.** Measured on the GPU box after the scorer fix:
+  clean takes `−0.02` to `−0.06`, a real Japanese take `−0.51`, so `−1.00` is a sane disaster
+  line. That is a handful of takes, not a sweep — if best-of-N ever ranks two clearly-different
+  takes wrongly, this is the first constant to re-measure.
 - **`generate_voice_clone` gained a `clean_reference` input** at the end of its argument
   list. The UI is wired for it; a script calling `/generate_voice_clone` positionally with
   the old 12 arguments needs updating (`/speak` is unchanged).
@@ -487,15 +489,34 @@ Run on 2026-11-03 (UI and clone-quality review) on a **CPU-only box, no GPU, no 
   `scripts/say.py --list` works against it; `/speak` reaches the model loader and fails only
   on the missing weights, as expected. Found and fixed there: a described voice listed as
   `Nones` in `/voices_available`.
-- **GPU tier: NOT run, and `smoke_test.py` was edited** (`transcribe_reference` now returns 3
-  values; the best-of-N picker assertions follow the one-Save semantics; it prints per-take
-  confidences). Run it before pushing.
-- **Not verified, needs the GPU box:** that reference cleanup, the speech-coverage auto-pick
-  and pause snapping improve (or at least do not hurt) SIM/WER — they are designed to be
-  neutral-or-better, not measured; the corrected confidence scale and `CONF_GOOD`; that
-  `transcribe_detailed` reports the detected language on real audio; microphone recording
-  into the new Record sub-tab; the Voices-tab row-click (`gr.SelectData.row_value`) in a real
-  browser; the two-step delete; `make_voice.py` under the lock.
+- **GPU tier: RUN on the 5070 Ti after the rework — 8/8 passing** (`voice_design`,
+  `voice_clone`, `voice_library`, `speak_api`, `chat_stream`, `long_text`, `best_of_n`,
+  `media_pipeline`). Loads 1.5–3.0s, generation 7–11s, chat first audio 11.7s, `long_text`
+  2.97 words/s at WER 0.19, every clip inside the RMS/peak/duration bounds.
+- **The corrected confidence scale is confirmed on real audio**: clean English takes read
+  `conf −0.02`/`−0.06` (the buggy scale read ~−1.9), a saved Japanese take `−0.51`, fox's
+  shipped clip `−0.03`. `CONF_GOOD = −1.00` sits clear of every real measurement and is no
+  longer provisional — see `docs/quality.md`.
+- **Reference cleanup measured** (`tmp/clean_reference_ab.py`, three seeds per arm, identity
+  vs the raw reference): SIM 0.9870 → 0.9886, WER 0.000 both arms, energy above 9kHz 0.0472 →
+  0.0470, the reference's own embedding 0.9991. Neutral-to-marginally-better, and specifically
+  no top-end cost — the claim in `docs/quality.md`, which now carries the table.
+- **`transcribe_detailed` detects language on real audio**: the Japanese clip → `ja`/Japanese,
+  fox → `en`/English.
+- **`make_voice.py` under the lock verified live**: with the web server running it exits 2 and
+  names the holder (`webui pid=… started=…`) and suggests `--no-clip`; `--no-clip` itself
+  succeeds without the lock, as intended.
+- **Deployed and checked over HTTP**: page serves (226KB, five tab labels present),
+  `scripts/say.py --list` lists described voices with the new `described` column, `/speak`
+  returns audio for `fox`, and forged paths to `/gradio_api/call/import_media` are refused.
+  Only the five documented endpoints now carry an `api_name` (`generate_voice_clone`,
+  `generate_voice_design`, `speak`, `chat_say`, `voices_available`); the internal UI handlers
+  are no longer in the public API at all — a tightening, but it means `curl` probes of
+  `/gradio_api/call/<handler>` are no longer a way to exercise them.
+- **Still not verified, needs a browser:** microphone recording into the new Record sub-tab,
+  the Voices-tab row-click (`gr.SelectData.row_value`), the two-step delete, and the
+  speech-coverage auto-pick / pause snapping on a real messy upload (cleanup is measured; the
+  *window choice* is not — it needs a long upload with several candidate stretches).
 
 ## Do-not-touch list
 

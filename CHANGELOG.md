@@ -49,10 +49,37 @@ All notable changes to this project are documented here. Newest first.
   `/voices_available` and `scripts/say.py` are unchanged.
 - `delete_saved_voice` returns 2 values; `voice_library_updates` returns 6.
 
-### Not verified
+### Verified on the GPU box (RTX 5070 Ti)
 
-No GPU in this session. The CPU tier passes (84/84); the GPU tier was not run, and its
-`smoke_test.py` was edited. Audio-quality effects of cleanup and snapping are unmeasured.
+The tier that was pushed unrun has been run here, and the claims that needed real audio now
+have it.
+
+- **GPU tier 8/8.** Loads 1.5–3.0s, generation 7–11s, chat first audio 11.7s, `long_text` 2.97
+  words/s at WER 0.19, every clip inside the RMS/peak/duration bounds.
+- **The confidence fix is confirmed**: clean takes read `−0.02`/`−0.06` where the double-prefix
+  scorer read ~−1.9; a real Japanese take reads `−0.51`. `CONF_GOOD = −1.00` is no longer
+  provisional, and `docs/quality.md` carries the new table.
+- **Reference cleanup measured** — same reference, same line, same seeds, identity scored
+  against the raw clip: SIM 0.9870 → 0.9886, WER 0.000 in both arms, energy above 9kHz 0.0472 →
+  0.0470, the reference's own embedding 0.9991. Neutral-to-marginally-better with no top-end
+  cost, which is the claim; the "not yet measured" note is replaced by the table.
+- **Language detection works on real audio** (`ja` on the Japanese clip, `en` on fox's clip),
+  and **`make_voice.py` refuses to start while the server holds the lock** — exit 2, names the
+  holder, suggests `--no-clip` — while `--no-clip` runs unlocked as intended.
+- **Deployed and probed over HTTP**: page serves with all five tabs, `say.py --list` shows the
+  `described` column, `/speak` returns audio for `fox`, forged paths to `/import_media` refused.
+
+Still needing a browser, not a GPU: microphone recording into the Record sub-tab, the
+Voices-tab row-click, the two-step delete, and the speech-coverage auto-pick on a genuinely
+messy long upload (cleanup is measured; *which window* gets picked is not).
+
+### Fixed (review pass)
+
+- `scipy` is now a direct requirement. `prepare_reference` imports it for the 60Hz high-pass and
+  falls back silently when it is missing — so without this, a venv that lost librosa would drop
+  the filter with no message.
+- The single-owner lock's error still said "two copies of ~13GB" from the three-checkpoint era;
+  it now says what a second copy actually costs (~4.3GB).
 
 ## [Unreleased] — CustomVoice removed; voices can ship as descriptions
 

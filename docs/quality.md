@@ -70,9 +70,22 @@ It is conservative on purpose, because nothing in it may change the voice:
 If cleanup would leave less than the clone minimum, or fails for any reason, the original
 clip is used.
 
-**Not yet measured:** whether cleanup moves SIM or WER on real references. It is designed to
-be neutral or better, but the A/B against the table above has not been run. See AGENTS.md,
-*Testing limitations*.
+**Measured on the GPU box, 2026-11-03** (`tmp/clean_reference_ab.py`: same reference, same
+target line, same three seeds per arm, identity scored by the model's own speaker encoder
+against the *raw* reference so both arms face the same target):
+
+| reference | SIM of clones vs raw | WER | energy >9kHz | clone length |
+|---|---|---|---|---|
+| raw | 0.9870 ± 0.0008 | 0.000 | 0.0472 | 4.69s |
+| cleaned | 0.9886 ± 0.0007 | 0.000 | 0.0470 | 4.80s |
+
+Neutral to marginally better, and specifically **not** a cost: the top end is unchanged
+(0.0472 → 0.0470), so the 60Hz high-pass takes nothing away where the thinness problem lives,
+and the reference's own embedding barely moves (0.9991 against 1.0) — it is not changing the
+voice. The SIM gain is +0.0016, which is about two standard deviations of the spread within an
+arm: real, but small enough that you should keep the switch on for the edge trim and the rumble
+removal rather than expecting a leap. On this reference the edge trim was a no-op (no silence
+longer than 0.2s at either end), so the clip is the same length in both arms.
 
 ## Choosing the reference stretch
 
@@ -105,14 +118,28 @@ transcript. Measured on a noise-degraded take, grading Whisper's own answer miss
 while grading the intended text caught it. Whisper is confident about whatever it decided to
 hear.
 
-**The confidence scale changed in this release.** The old scorer tokenised the text *with*
-Whisper's special tokens and then prepended the decoder prefix again. Every take was charged
-for two impossible tokens and scored in a corrupted context. That is why the old docs said
-"a clean take measures about −1.9" and set the threshold at −2.6. With the fix, clean speech
-should score near zero, and `CONF_GOOD` is set to −1.0 **provisionally**.
-`tests/smoke_test.py --only best_of_n` prints every take's confidence; re-calibrate from
-those lines on the GPU box. The old measurements below are kept for their shape, not their
-absolute values:
+**The confidence scale changed in this release, and the new scale is now measured.** The old
+scorer tokenised the text *with* Whisper's special tokens and then prepended the decoder prefix
+again. Every take was charged for two impossible tokens and scored in a corrupted context. That
+is why the old docs said "a clean take measures about −1.9" and set the threshold at −2.6. With
+the fix, on the GPU box:
+
+| take | WER | conf | SIM | defect flags |
+|---|---|---|---|---|
+| best_of_n #1 | 0.00 | **−0.02** | 0.984 | — |
+| best_of_n #2 | 0.00 | **−0.06** | 0.987 | 0.9s silence |
+| best_of_n #3 | 0.00 | **−0.02** | 0.984 | — |
+| fox's shipped clip (English) | — | −0.03 | — | — |
+| a saved Japanese take | — | −0.51 | — | — |
+
+Clean speech sits at −0.02 to −0.06, exactly the "near zero" the fix predicted, and a real
+Japanese take sits at −0.51 — below clean English, nowhere near a disaster. `CONF_GOOD = −1.00`
+sits clear of every real measurement while staying far above what silence reads, so it is kept;
+it is no longer provisional, though it is calibrated from a handful of takes rather than a
+sweep. The confidence term is still a disaster detector, not a quality meter: #1 and #3 were
+identical to two decimal places and the ranking still came from defects and SIM.
+
+The old measurements below are kept for their shape, not their absolute values:
 
 | take (old scorer, seed 7, 4 candidates) | WER | conf | SIM | defect flags | penalty |
 |---|---|---|---|---|---|

@@ -17,6 +17,8 @@ gradio_client>=2.0      # scripts/say.py and the smoke tests talk to the server 
 numpy>=1.26
 soundfile>=0.12         # wav read/write (libsndfile is bundled in the wheel)
 librosa>=0.10           # resampling only; setup.sh keeps ffmpeg for decoding
+scipy>=1.10             # prepare_reference's 60Hz high-pass (it degrades to no-filter without
+                        # it, so it must not depend on librosa dragging it in)
 pillow>=10              # the waveform is drawn by hand, no matplotlib
 # Imported by upstream's 25Hz tokenizer path at module import time, so the CPU tests need
 # them even though none of the 12Hz models we ship touch that code.
