@@ -214,7 +214,7 @@ def run_media_pipeline(hub: webui.ModelHub, use_asr: bool = True) -> None:
     if use_asr:
         webui.ASR = webui.Transcriber()
         t0 = time.time()
-        text_upd, asr_status = webui.transcribe_reference(state, start, end, "English")
+        text_upd, asr_status, _lang_upd = webui.transcribe_reference(state, start, end, "English")
         took = time.time() - t0
         assert "Error" not in asr_status, f"transcription failed: {asr_status}"
         transcript = text_upd["value"]
@@ -301,12 +301,20 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
             f"every take must be on disk to be kept later: {state['takes']}"
         assert sum(1 for t in state["takes"] if t["kept"]) == 1, "exactly one auto-pick"
         assert state["text"] == cfg["text"], "the transcript is the requested line"
-        assert pick.get("visible") is True and len(pick["choices"]) == 3, \
-            f"the picker offers every take: {pick}"
-        assert pick["value"] == str(next(t["index"] for t in state["takes"] if t["kept"])), \
-            f"the picker defaults to the auto-pick: {pick['value']}"
-        assert "auto-pick" in (pick.get("label") or "").lower(), \
+        # One save control: the reference first, then every take; it defaults to the
+        # reference and its label names the auto-pick.
+        values = [value for _, value in pick["choices"]]
+        assert values == [webui.SAVE_REFERENCE] + [str(t["index"]) for t in state["takes"]], \
+            f"the save picker offers the reference and every take: {pick}"
+        assert pick["value"] == webui.SAVE_REFERENCE, \
+            f"the save picker defaults to the reference: {pick['value']}"
+        kept_index = next(t["index"] for t in state["takes"] if t["kept"])
+        assert f"auto-pick was take #{kept_index}" in (pick.get("label") or ""), \
             f"the picker must say which one it chose for you: {pick.get('label')}"
+        # CONF_GOOD is provisional after the scorer fix; these lines are the calibration data.
+        for line in status.splitlines():
+            if line.strip().startswith("#"):
+                print(f"  [best_of_n] {line.strip()}")
 
         loser = str(next(t["index"] for t in state["takes"] if not t["kept"]))
         with tempfile.TemporaryDirectory() as vdir:

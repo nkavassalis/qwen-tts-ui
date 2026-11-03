@@ -2,6 +2,58 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — UI reorganised; clone quality
+
+### Changed
+
+- **The UI is reorganised around one Status box per tab.** The Clone tab had seven status
+  areas and two save paths. Now it is three numbered steps in two columns: reference on the
+  left (Upload / Record / From library, waveform, selection, a read-only *Reference clip*
+  player, transcript), say and save on the right. The GPU/RAM line moved to a sidebar on a 5s
+  timer instead of being appended to every status. Settings (post-processing, sampling) live
+  in the same sidebar. The Clone tab is now the first tab.
+- **One Save per tab, saying what it saves.** On the Clone tab a radio offers *the reference*
+  or *take #k*; one button saves it. **Saving never overwrites** an existing voice: it used to
+  replace it silently. Library writes are atomic.
+- **A new Voices tab** lists the library in a table: preview, choose the Speak/Chat route per
+  voice (`prefer`: auto / clip / description), load a voice back as a clone reference, and a
+  two-step delete. Every voice list on every tab refreshes after any library change.
+- **Best of 3 is the Clone tab default** (was 1).
+
+### Added — clone quality
+
+- **Reference cleanup** (`prepare_reference`, on by default, switchable): DC removal, 60Hz
+  high-pass, edge trim to ~0.2s. No denoise and no level change. Used by Speak/Chat too.
+- **Auto-pick scores speech coverage, not loudness**, penalises clipping, and snaps both edges
+  into pauses so the reference doesn't start or end mid-word. Uploads start on that pick.
+- **A live reference checklist**: length, SNR estimate, speech coverage, mid-word edges,
+  clipping and transcript plausibility, recomputed whenever the reference or transcript changes.
+- **Transcribe sets the target language** from what Whisper heard when it was on Auto.
+
+### Fixed
+
+- **Whisper confidence was scored with a doubled decoder prefix.** The text was tokenised with
+  special tokens and then prefixed again, so every take paid for two impossible tokens.
+  `CONF_GOOD` moves from -2.60 to a provisional -1.00 pending re-calibration on the GPU box.
+- `generate_voice_clone`'s validation exits returned 2 values to 9 outputs (an error toast
+  instead of a status).
+- Deleting a voice cleared the Clone tab's reference.
+- `/voices_available` listed a described voice as `Nones`.
+- `scripts/make_voice.py` loaded models without the single-owner lock.
+- Media decode is capped (`MAX_MEDIA_SECONDS`, ffmpeg `-t`) and ffmpeg runs under a timeout.
+- The clone-prompt cache was duplicated and held one entry; it is one content-keyed LRU of 8.
+
+### API
+
+- `/generate_voice_clone` gains a trailing `clean_reference` input. `/speak`,
+  `/voices_available` and `scripts/say.py` are unchanged.
+- `delete_saved_voice` returns 2 values; `voice_library_updates` returns 6.
+
+### Not verified
+
+No GPU in this session. The CPU tier passes (84/84); the GPU tier was not run, and its
+`smoke_test.py` was edited. Audio-quality effects of cleanup and snapping are unmeasured.
+
 ## [Unreleased] — CustomVoice removed; voices can ship as descriptions
 
 ### Removed

@@ -13,10 +13,11 @@ A local, offline deployment of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen
 (1.7B checkpoints) behind a Gradio UI, tuned for **one** 16GB Blackwell consumer GPU —
 RTX 5070 Ti, RTX 5080, anything in that class (the 5070 Ti is the SKU it is developed and
 tested on, not the only one it targets). The product name is **qwen3-tts-ui** (the repo, the
-browser tab title and the README H1 all agree). Four tabs: **Design a voice** (from a text
-description), **Clone a voice** (from a ~3-10s reference clip), **Speak** (the one-call
-endpoint `scripts/say.py` uses) and **Chat** (streams a reply sentence by sentence). Nick uses
-it at his desk; it is not a service.
+browser tab title and the README H1 all agree). Five tabs: **Clone a voice** (from a ~3-10s
+reference clip), **Design a voice** (from a text description), **Speak** (the one-call
+endpoint `scripts/say.py` uses), **Chat** (streams a reply sentence by sentence) and
+**Voices** (the library). Settings and the runtime line live in a sidebar. Nick uses it at
+his desk; it is not a service.
 
 Two checkpoints ship (`VoiceDesign` + `Base` + the tokenizer, ~9.3GB). The third upstream
 capability, CustomVoice with its nine preset speakers, was removed: the product is your
@@ -41,12 +42,15 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
                            through paplay/ffplay/aplay/afplay
+scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 74 checks, no weights, ~10s with deps installed
-tests/smoke_test.py      GPU tier: 10 end-to-end flows, writes tests/output/*.wav
+tests/test_app_logic.py  CPU tier: 84 checks, no weights, ~8s with deps installed
+tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
+docs/quality.md          every quality measurement and what the app does about it
+docs/design.md           the why behind the code shape, including the UI layout rules
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
-README.md              human-facing docs, troubleshooting table
+README.md              user guide: workflow, safety, configuration, troubleshooting
 CHANGELOG.md           one entry per change, newest first
 
 gitignored, created on demand:
@@ -58,27 +62,27 @@ certs/  logs/  tests/output/  .qwen-tts.lock  .gradio/
 
 ```bash
 ./setup.sh                       # uv venv + torch cu128 + upstream + 9.3GB weights + Whisper + fox
-./run.sh                         # -> http://127.0.0.1:7860, "Runtime:" line shows GPU/RAM
+./run.sh                         # -> http://127.0.0.1:7860; GPU/RAM status is in the sidebar
 ./run.sh --ip 0.0.0.0 --username u --password-file ~/tts.pw   # LAN, authenticated
 ./run.sh --ssl-self-signed --ip 0.0.0.0 --username u --password-file ~/tts.pw   # browser mic needs HTTPS
 ./run.sh --device cpu            # CPU inference (slow; works, no CUDA needed)
 ```
 
-You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` line, then
+You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RAM: …` line, then
 `* Running on local URL`. If the second one never appears, check `nvidia-smi` (VRAM) and
 `free -m` (RAM) — the hub refuses to over-commit rather than swapping.
 
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 74 checks, ~10s
-.venv/bin/python tests/smoke_test.py       # GPU tier — 10 flows, ~90s, needs weights
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 84 checks, ~8s
+.venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~2 min, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 74/74 passing**, run on Python 3.12 with
-torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
-session** — the box had no GPU; see *Testing limitations*.
+Current state (2026-11-03, UI/clone-quality review): **CPU tier 84/84 passing**, Python 3.12,
+torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3, `qwen-tts` from PyPI. **GPU tier
+NOT run** — the box had no GPU, and `smoke_test.py` was edited; see *Testing limitations*.
 
 The CPU tier imports `torch`, `gradio`, `qwen_tts`, `soundfile`, `librosa` and `PIL`, so
 it needs the venv — it just needs no weights and no CUDA. The GPU tier refuses to start
@@ -164,7 +168,8 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
 - **`_rms_windows` pads with `ceil`, not `floor`** — with `floor` the pad width went negative
   for any length that was not an exact multiple of the window and numpy raised. It hid because
   every earlier caller passed round-number clip lengths.
-- **A preferred take can be kept as a voice** (`save_generated_voice`). The library used to
+- **A preferred take can be kept as a voice** (`save_generated_voice`, reached through the
+  one Save control via `save_clone_voice`). The library used to
   hold only *references*, so the take you actually liked could only leave the browser as a
   download. Each candidate is written to `tmp/media/` at generation time and its **path**
   travels through `gr.State` (`build_take_state`) — never a module-level "last generation"
@@ -172,33 +177,60 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   The saved copy is the **raw 24kHz decode**, not the post-processed listening copy: a saved
   voice is usually a future clone reference, and a reference is better straight from the
   model than through an EQ curve. Files fall under `MEDIA_TTL_SECONDS` pruning.
-- **Candidate ranking is a penalty, calibrated by measurement, not by taste**
-  (`candidate_penalty`). WER ×2.0 dominates; Whisper decoder confidence ×0.4 but only below
-  `CONF_GOOD = -2.60`; waveform defects capped at 0.3; SIM is a tie-break only. Three things
-  learned the hard way, all measured on the real checkpoint:
-  * **Confidence reads ~-1.9 on a clean take**, not near zero. The first guess of -0.35
-    would have penalised *every* candidate ~0.6 and swamped WER. Pure silence reads -6.3;
-    added tail silence, clipping and half-speed pacing move it by <0.15, so it is a
-    disaster detector, not a quality meter. Do not tune `CONF_GOOD` upward toward zero.
-  * **Score the text we asked for** (`Transcriber.score_transcript`), never Whisper's own
-    transcript: on a noise-degraded take, grading the returned transcript read -1.91 and
-    missed it, grading the intended text read -2.07 and caught it. Whisper is confident
-    about whatever it decided to hear.
+- **Candidate ranking is a penalty** (`candidate_penalty`). WER ×2.0 dominates; Whisper
+  decoder confidence ×0.4 but only below `CONF_GOOD`; waveform defects capped at 0.3; SIM is
+  a tie-break only. What was learned, on the real checkpoint:
+  * **The confidence scorer had a double-prefix bug until 2026-11-03.** `_confidence`
+    tokenised the text with `tokenizer(text)`, which *adds* `<|startoftranscript|>
+    <|notimestamps|>` … `<|endoftext|>`, then prepended the decoder prefix again. Every take
+    paid for two impossible tokens and its words were scored in a corrupted context — the
+    real reason "a clean take reads ~-1.9", and why short lines read worse than long ones.
+    Now `_text_ids` uses `add_special_tokens=False` and `_prefix_ids` builds
+    `<|startoftranscript|><|lang|><|transcribe|><|notimestamps|>` explicitly, with the
+    language Whisper detected. `test_whisper_confidence_scores_only_the_words` pins it.
+  * **`CONF_GOOD` is therefore provisional (-1.00, was -2.60).** The old number and every
+    confidence figure recorded before 2026-11-03 belong to the buggy scale. Re-calibrate from
+    the per-take lines `smoke_test.py --only best_of_n` now prints; clean takes should sit
+    near zero and pure silence far below -1. Do not reuse the old -1.9/-6.3 figures.
+  * **Score the text we asked for** (`Transcriber.assess`), never Whisper's own transcript:
+    on a noise-degraded take, grading the returned transcript missed it, grading the
+    intended text caught it. Whisper is confident about whatever it decided to hear.
+    `assess` is one beam search plus one teacher-forced pass per take (it used to be two
+    beam searches).
   * **`_mean_token_logprob`'s `offset` is `prefix_len - 1`** — `logits[t]` predicts
-    `fed[t+1]`, and the fed sequence carries Whisper's forced start/language/task/timestamp
-    prefix. One token off reads -13.5 (worse than uniform) with no error raised.
-    `test_mean_token_logprob_alignment` pins it; the GPU tier cannot, because it looks
-    plausible either way.
-  Confidence comes from a second teacher-forced forward pass, not from beam bookkeeping:
-  `output_scores` is silently dropped by Whisper's own generation-config juggling (only
-  `logprob_threshold`/`return_token_timestamps` force it on) and `sequences_scores` comes
-  back None.
-- **The clone tab is three numbered steps, and the order is load-bearing.** Reference →
-  what it should say → keep it. Save used to sit between the reference and the synthesis
-  controls, which made people look for it in the wrong place and misread *Target text* as
-  something other than "the line to synthesise"; `test_clone_tab_reads_top_to_bottom` pins
-  the order and the two box labels so the layout cannot drift back. `gr.File` and `gr.Audio`
-  take no `info=` in Gradio 6 — put guidance in a Markdown/Textbox instead.
+    `fed[t+1]`. One token off reads worse than uniform with no error raised.
+    `test_mean_token_logprob_alignment` pins it; the GPU tier cannot.
+  Confidence comes from a teacher-forced forward pass, not from beam bookkeeping:
+  `output_scores` is silently dropped by Whisper's own generation-config juggling.
+- **The UI follows four layout rules** (2026-11-03, `docs/design.md`): one **Status** box
+  per tab; the runtime line in the **sidebar** on a `gr.Timer` (`concurrency_limit=None`, so
+  it never queues behind a generation) instead of appended to every status; one **Save** per
+  tab that says what it saves; the library managed on the **Voices** tab, with every voice
+  list refreshed by `voice_library_updates` after any change and on page load. The Clone
+  tab is three numbered steps in two columns — reference (left), say + save (right) —
+  pinned by `test_clone_tab_reads_top_to_bottom`. The reference arrives by Upload (imports on
+  `.upload`), Record (`.stop_recording`) or Library; all three land in a **read-only**
+  reference player, and the checklist reads that player, so it is right whichever way the
+  clip came in. `gr.File` and `gr.Audio` take no `info=` in Gradio 6.
+- **Saving never overwrites** (`voice_exists`/`_taken_message`). Two people naming a voice
+  the same thing used to silently replace the first one's clip. Writes are atomic
+  (temp + `os.replace`). Deleting is two clicks on the Voices tab, and no longer clears the
+  Clone tab's reference box.
+- **Reference handling is where clone quality is won** (measured: transcript mismatch, noise,
+  then length). So: `auto_pick_window` scores speech coverage (adaptive threshold between
+  the 5th- and 95th-percentile frame level), penalises clipping, and `snap_to_pauses` moves
+  each edge into a pause; `import_media` starts on that pick instead of the first 6s;
+  `reference_report` is a live checklist (length, SNR, coverage, mid-word edges, clipping,
+  transcript fit); `prepare_reference` (DC, 60Hz high-pass, edge trim to 0.2s, no denoise,
+  no level change — level was measured irrelevant) runs before encoding on both the Clone
+  tab (switchable) and Speak/Chat. Transcribe sets an Auto target language to what Whisper
+  heard. **None of this has been A/B-measured on the GPU yet** — see *Testing limitations*.
+- **Best of 3 is the Clone tab default** (was 1). Sampling variance was the one quality
+  loss no knob fixed (WER 0.000 on one seed, 0.133 on three); it costs two extra generations.
+- **Each voice can choose its Speak/Chat route** (`prefer`: auto/clip/description,
+  `voice_route`). Auto keeps the measured default (description when present); a frozen clip
+  is the steadier identity across a multi-sentence reply because a description is re-rolled
+  per chunk.
 - **Every best-of-N candidate stays auditionable.** The callback returns one audio player
   per take (labelled with its WER/SIM, winner marked) alongside the auto-pick, because
   `choose_best_candidate` is only defensible as a *suggestion*: it rejects dud takes well,
@@ -228,6 +260,13 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   silence.
 - **The waveform is drawn with PIL.** No matplotlib; pixel geometry is deterministic, so
   `test_render_waveform` can assert the shaded selection actually changes the image.
+- **Every `generate_voice_clone` exit returns `CLONE_OUTPUTS` values** (`_clone_failure`).
+  The validation exits used to return 2 values to 9 wired outputs, which Gradio turns into
+  an error toast instead of a status line.
+- **The clone-prompt cache is a content-keyed LRU of 8** (`_clone_prompt`), shared by the
+  Clone tab and Speak/Chat (there used to be two copies of the logic, each holding one entry).
+- **Media decode is bounded**: `MAX_MEDIA_SECONDS` (600) via `ffmpeg -t` / `sf.read(frames=)`,
+  and ffmpeg runs under `FFMPEG_TIMEOUT_SECONDS`. A two-hour upload used to be decoded whole.
 - **`gr.State` holds JSON only** (clip path + duration), never a numpy array — it must
   survive the browser round-trip. `test_media_state_is_json_serialisable` guards it.
 - **"Save as voice" takes the clip as an input** (2026-11-02). It used to read a
@@ -285,6 +324,13 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
     `--allow-skip`. `test_smoke_test_skips_are_not_passes`.
 14. Extracted clips are pruned (`MEDIA_TTL_SECONDS`, default 6h) so `tmp/media/` cannot
     grow forever and hold people's voices. `test_prune_media`.
+15. `/speak` keeps its 8 positional inputs and `/voices_available` stays public — that is
+    the `scripts/say.py` contract. `test_build_ui_constructs`.
+16. One Status box per tab; no generation status carries the runtime line.
+    `test_build_ui_constructs`, `test_runtime_status_lives_in_the_sidebar`.
+17. Saving never replaces an existing voice. `test_saving_never_overwrites`.
+18. Every model-loading entry point takes the single-owner lock — the web UI, the smoke
+    test and `make_voice.py` (without `--no-clip`). (make_voice: not automated)
 
 ## Conventions
 
@@ -316,8 +362,22 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   resident 1.7B model on 16GB, but it does eat into the VRAM margin.
 - `default_concurrency_limit=1` serialises everything: a Whisper load blocks a queued
   generation behind it. Deliberate (one GPU), but surprising if two people share it.
-- The clone-prompt cache holds exactly one entry (`_CLONE_PROMPTS.clear()` before each
-  insert) — right for retakes, wasteful if you alternate references.
+- **`CONF_GOOD` needs re-calibrating** on the GPU box after the scorer fix (see *Design
+  decisions*). Until then best-of-N leans on WER and defects; the confidence term may be
+  too strict or too lax.
+- **`generate_voice_clone` gained a `clean_reference` input** at the end of its argument
+  list. The UI is wired for it; a script calling `/generate_voice_clone` positionally with
+  the old 12 arguments needs updating (`/speak` is unchanged).
+- **Warm post-processing's `tanh` stage runs on every sample**, not only near full scale —
+  `tanh(1.25x)/tanh(1.25)` is ~2.3 dB of compression at 0.5. Unmeasured colouring; consider
+  a peak-only limiter and A/B it.
+- **Designed voices drift across a long reply**: Speak/Chat re-roll the description per
+  chunk (pairwise SIM 0.974). The `prefer: clip` route is the workaround; a better fix is to
+  render the first chunk by description and clone it for the rest — untried.
+- **`webui/app.py` is ~3,300 lines.** Natural seams for a split: `hub.py` (ModelHub,
+  memory guards, lock), `media.py` (ingest, path guards, reference analysis/cleanup),
+  `asr.py` (Transcriber), `scoring.py` (penalty, defects, labels), `chunking.py`,
+  `library.py`, `ui.py`. Not done yet because the tests import `app` as one module.
 - `smoke_test.py` fetches its clone reference over the network — the example clip URL from
   the upstream Qwen3-TTS README (Alibaba's own public asset host, flagged by the secret
   scan by design). The GPU tier therefore needs network for that one case; there is no
@@ -413,6 +473,29 @@ Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunkin
 - **Latent bug found and fixed while building this**: `_rms_windows` padded with a negative
   width for any clip length that was not an exact multiple of the window (numpy raised). It had
   survived every earlier test because they all used round-number lengths.
+
+Run on 2026-11-03 (UI and clone-quality review) on a **CPU-only box, no GPU, no weights**:
+
+- **CPU tier 84/84 passing.** Rewritten: the layout tests (they pinned the old widgets),
+  `test_candidate_penalty` (now relative to `CONF_GOOD`), `test_auto_pick_window` (edges
+  snap). `test_media_helpers` now stubs `shutil.which`, so it no longer needs ffmpeg.
+  New: scorer token layout, pauses/snapping, reference checklist, reference cleanup, no-
+  overwrite saves, voice routes and the Voices-tab helpers, library loading, clone
+  validation outputs, the prompt LRU, transcribe→language, the sidebar status.
+- **Verified by launching the real server** (CPU, `--no-asr`): the UI builds and serves; all
+  five tabs render (headless-Chromium screenshots of Clone, Speak and Voices checked by eye);
+  `scripts/say.py --list` works against it; `/speak` reaches the model loader and fails only
+  on the missing weights, as expected. Found and fixed there: a described voice listed as
+  `Nones` in `/voices_available`.
+- **GPU tier: NOT run, and `smoke_test.py` was edited** (`transcribe_reference` now returns 3
+  values; the best-of-N picker assertions follow the one-Save semantics; it prints per-take
+  confidences). Run it before pushing.
+- **Not verified, needs the GPU box:** that reference cleanup, the speech-coverage auto-pick
+  and pause snapping improve (or at least do not hurt) SIM/WER — they are designed to be
+  neutral-or-better, not measured; the corrected confidence scale and `CONF_GOOD`; that
+  `transcribe_detailed` reports the detected language on real audio; microphone recording
+  into the new Record sub-tab; the Voices-tab row-click (`gr.SelectData.row_value`) in a real
+  browser; the two-step delete; `make_voice.py` under the lock.
 
 ## Do-not-touch list
 

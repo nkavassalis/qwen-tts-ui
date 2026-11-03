@@ -184,6 +184,8 @@ FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "ffmpeg")
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".flv", ".wmv", ".mpeg", ".mpg", ".3gp"}
 AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".aiff", ".aif", ".wma", ".amr"}
 MEDIA_SUFFIXES = sorted(VIDEO_SUFFIXES | AUDIO_SUFFIXES)
+MAX_MEDIA_SECONDS = 600         # only the first 10 minutes of an upload are read
+FFMPEG_TIMEOUT_SECONDS = 120
 
 # Transcription of the reference transcript (the ICL clone needs it to match the clip).
 ASR_MODEL_ID = "openai/whisper-large-v3"
@@ -325,7 +327,14 @@ def take_label(index: int, wer: Optional[float], sim: Optional[float], kept: boo
 # are deliberately small so a slightly long tail of silence cannot outvote a take that says
 # the words wrong.
 
-CONF_GOOD = -2.60          # mean decoder log-prob considered clean; below this it is penalised
+# Mean per-token decoder log-prob of the *intended* text (plus end-of-text), teacher-forced
+# behind Whisper's own prefix. Clean speech scores close to zero; a take Whisper cannot
+# match to the text falls well below -1. The previous value (-2.60) was calibrated against
+# a scorer that fed the start-of-transcript prefix twice (see `Transcriber._text_ids`), which
+# dragged every take down by the cost of two impossible tokens. -1.0 is provisional until
+# it is re-measured on the GPU box (`tests/smoke_test.py --only best_of_n` prints each
+# take's confidence).
+CONF_GOOD = -1.00          # below this a take is penalised
 WER_WEIGHT = 2.0           # content dominates: no defect or confidence gap outranks it
 CONF_WEIGHT = 0.4          # a full log-prob below the line costs less than 20% wrong words
 DEFECT_CAP = 0.3           # defects alone cannot outrank a take that says the words wrong
@@ -1007,8 +1016,13 @@ HUB: Optional[ModelHub] = None
 
 
 def _ok(audio: Tuple[int, np.ndarray], message: str) -> Tuple[Any, str]:
-    """Gradio output pair: (audio, status line including live VRAM info)."""
-    return audio, f"{message}\n{HUB.status()}"
+    """Gradio output pair: (audio, status line).
+
+    The runtime line (VRAM, RAM, which models are where) used to be appended to every
+    status, so each tab's status box was half diagnostics. It lives in the sidebar now and
+    refreshes on its own.
+    """
+    return audio, message
 
 
 def _post_note(mode: str) -> str:
@@ -1201,9 +1215,16 @@ def ffmpeg_extract_audio(src: str, dst: str, sr: int = REF_SAMPLE_RATE) -> str:
             f"`{FFMPEG_BIN}` not found on PATH — video uploads need ffmpeg "
             f"(apt install ffmpeg, or pass --ffmpeg-bin)."
         )
+    # `-t` caps what is decoded: a reference needs seconds, and an uncapped two-hour upload
+    # would become ~700MB of float32 in RAM plus a waveform drawn from all of it.
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src),
+           "-t", str(MAX_MEDIA_SECONDS),
            "-vn", "-map", "0:a:0", "-ac", "1", "-ar", str(sr), "-c:a", "pcm_s16le", str(dst)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise MediaError(f"ffmpeg took longer than {FFMPEG_TIMEOUT_SECONDS}s to read "
+                         f"{os.path.basename(str(src))} — try a shorter or simpler file.")
     if proc.returncode != 0:
         detail = (proc.stderr or "").strip().splitlines()
         tail = detail[-1] if detail else f"exit code {proc.returncode}"
@@ -1238,7 +1259,8 @@ def _load_media(path: str, sr: int) -> Tuple[np.ndarray, int]:
                 os.remove(extracted)
 
     try:
-        wav, in_sr = sf.read(path, dtype="float32", always_2d=False)
+        frames = int(MAX_MEDIA_SECONDS * sf.info(path).samplerate)
+        wav, in_sr = sf.read(path, frames=frames, dtype="float32", always_2d=False)
     except Exception:  # noqa: BLE001 - unsupported codec: let ffmpeg decode it
         fd, extracted = tempfile.mkstemp(prefix="qwen-tts-media-", suffix=".wav", dir=media_dir())
         os.close(fd)
@@ -1298,25 +1320,207 @@ def slice_audio(wav: np.ndarray, sr: int, start: float, end: float) -> np.ndarra
     return wav[a:max(b, a + 1)]
 
 
+# ---------------------------------------------------------------------------
+# Reference analysis: where the pauses are, and how clean the stretch is
+# ---------------------------------------------------------------------------
+# ICL cloning hands the talker the reference's own codec codes and asks it to *continue*
+# them. A reference cut off in the middle of a word asks it to continue half a phoneme,
+# and the transcript then has to describe half a word, which Whisper rarely gets right. So
+# the selection should start and end in a pause. A pause is found relative to the clip's
+# own levels (its noise floor and its speech level), not a fixed dBFS, so the same rule
+# works for a quiet phone memo and a loud podcast.
+
+FRAME_SECONDS = 0.02
+PAUSE_SEARCH_SECONDS = 0.35     # how far auto-pick moves an edge to land it in a pause
+MIN_DYNAMIC_DB = 10.0           # below this spread there are no pauses to find (music, tone)
+NOISY_SNR_DB = 20.0             # under this the background is audible in a clone
+REF_HIGHPASS_HZ = 60.0          # below a deep voice's fundamental; above mains hum and rumble
+REF_EDGE_KEEP_MS = 200          # natural pause kept at each end of a cleaned reference
+
+
+def _frame_levels(wav: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
+    """Per-20ms RMS level in dBFS, and the frame length in samples."""
+    window = max(1, int(FRAME_SECONDS * sr))
+    rms = _rms_windows(np.asarray(wav, dtype=np.float32).reshape(-1), sr, window)
+    return 20.0 * np.log10(np.maximum(rms, 1e-6)), window
+
+
+def _activity(db: np.ndarray) -> Tuple[Optional[np.ndarray], float, float]:
+    """(active-frame mask, noise floor dB, speech level dB). Mask is None without pauses."""
+    if db.size == 0:
+        return None, -120.0, -120.0
+    # 5th percentile, not 10th: fluent read speech can have under a tenth of its frames in
+    # pauses, and then the "floor" lands on speech and no pause is ever found.
+    floor = float(np.percentile(db, 5))
+    level = float(np.percentile(db, 95))
+    if level - floor < MIN_DYNAMIC_DB:
+        return None, floor, level
+    threshold = max(floor + 0.35 * (level - floor), 20.0 * np.log10(SILENCE_RMS))
+    return db >= threshold, floor, level
+
+
+def find_pause(wav: np.ndarray, sr: int, at: float,
+               radius: float = PAUSE_SEARCH_SECONDS) -> Optional[float]:
+    """The pause nearest to `at` seconds, within `radius` — or None if there is none."""
+    db, window = _frame_levels(wav, sr)
+    active, _, _ = _activity(db)
+    if active is None:
+        return None
+    frame_s = window / float(sr)
+    centre = int(at / frame_s)
+    span = int(np.ceil(radius / frame_s))
+    lo, hi = max(0, centre - span), min(active.size, centre + span + 1)
+    quiet = [i for i in range(lo, hi) if not active[i]]
+    if not quiet:
+        return None
+    best = min(quiet, key=lambda i: abs(i - centre))
+    return round(min(len(wav) / float(sr), (best + 0.5) * frame_s), 3)
+
+
+def snap_to_pauses(wav: np.ndarray, sr: int, start: float, end: float,
+                   radius: float = PAUSE_SEARCH_SECONDS) -> Tuple[float, float]:
+    """Move each edge of a selection into the nearest pause, if one is close enough."""
+    snapped_start = find_pause(wav, sr, start, radius)
+    snapped_end = find_pause(wav, sr, end, radius)
+    new_start = start if snapped_start is None else snapped_start
+    new_end = end if snapped_end is None else snapped_end
+    if new_end - new_start < REF_MIN_SECONDS:      # snapping must never break the floor
+        return round(start, 3), round(end, 3)
+    return round(new_start, 3), round(new_end, 3)
+
+
 def auto_pick_window(wav: np.ndarray, sr: int, target: float = REF_TARGET_SECONDS,
                      step: float = 0.25) -> Tuple[float, float]:
-    """Pick the loudest contiguous `target`-second window (skips silence / room tone)."""
+    """Pick the `target`-second stretch with the most speech, then land its edges in pauses.
+
+    It used to pick the *loudest* window, which favours shouting, music beds and clipped
+    peaks. Speech coverage is the better proxy for "a clean stretch of one person talking";
+    level only breaks ties, and windows with clipped samples are pushed down.
+    """
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
     duration = len(wav) / float(sr)
     if duration <= target:
         return 0.0, round(duration, 3)
-    squared = wav.astype(np.float64) ** 2
-    cumulative = np.concatenate([[0.0], np.cumsum(squared)])
-    best_energy, best_start = -1.0, 0.0
-    window = int(target * sr)
+    db, window = _frame_levels(wav, sr)
+    active, _, _ = _activity(db)
+    if active is None:                 # no pauses at all: fall back to level alone
+        active = db >= float(np.percentile(db, 50))
+    frame_s = window / float(sr)
+    per = max(1, int(round(target / frame_s)))
+    clipped = np.abs(wav) >= 0.999
+    clip_cum = np.concatenate([[0], np.cumsum(clipped)])
+    act_cum = np.concatenate([[0], np.cumsum(active.astype(np.float64))])
+    db_cum = np.concatenate([[0.0], np.cumsum(db.astype(np.float64))])
+    best_score, best_start = -np.inf, 0.0
     position = 0.0
     while position + target <= duration + 1e-6:
-        i0 = int(position * sr)
-        i1 = min(len(wav), i0 + window)
-        energy = (cumulative[i1] - cumulative[i0]) / max(1, i1 - i0)
-        if energy > best_energy:
-            best_energy, best_start = energy, position
+        f0 = int(position / frame_s)
+        f1 = min(active.size, f0 + per)
+        frames = max(1, f1 - f0)
+        coverage = (act_cum[f1] - act_cum[f0]) / frames
+        level = (db_cum[f1] - db_cum[f0]) / frames
+        i0, i1 = int(position * sr), min(len(wav), int((position + target) * sr))
+        clip_share = (clip_cum[i1] - clip_cum[i0]) / max(1, i1 - i0)
+        score = coverage - 50.0 * clip_share + 0.001 * level
+        if score > best_score:
+            best_score, best_start = score, position
         position += step
-    return round(float(best_start), 3), round(float(best_start + target), 3)
+    start, end = round(float(best_start), 3), round(float(min(duration, best_start + target)), 3)
+    return snap_to_pauses(wav, sr, start, end)
+
+
+def reference_report(clip: np.ndarray, sr: int, text: str = "",
+                     x_vector_only: bool = False, start: Optional[float] = None) -> str:
+    """Markdown checklist for the selected reference: length, noise, speech, edges, transcript.
+
+    Every line is something measured to matter, in the order it costs you: a transcript that
+    does not match (WER 1.0, 3x the length), background noise (the largest similarity loss),
+    then length and clean edges. Advisory only — nothing here blocks a generation.
+    """
+    clip = np.asarray(clip, dtype=np.float32).reshape(-1)
+    seconds = len(clip) / float(sr) if sr else 0.0
+    if not clip.size:
+        return "No reference yet — upload a file, record one, or load a saved voice."
+    lines: List[str] = []
+    guidance = clip_guidance(seconds)
+    good_length = REF_MIN_SECONDS <= seconds <= REF_MAX_SECONDS
+    lines.append(("✅ " if good_length else "⚠️ ") + guidance)
+
+    db, window = _frame_levels(clip, sr)
+    active, floor, level = _activity(db)
+    if active is None:
+        lines.append("⚠️ No pauses found — this may be music, a tone, or wall-to-wall noise. "
+                     "One person talking in a quiet room clones best.")
+    else:
+        snr = level - floor
+        if snr < NOISY_SNR_DB:
+            lines.append(f"⚠️ Noisy background (speech is ~{snr:.0f} dB above it). Noise was the "
+                         f"biggest similarity loss measured — find a quieter stretch if you can.")
+        else:
+            lines.append(f"✅ Clean background (speech ~{snr:.0f} dB above the noise floor).")
+        coverage = float(np.mean(active))
+        if coverage < 0.45:
+            lines.append(f"⚠️ Speech fills only {coverage:.0%} of the selection — tighten it "
+                         f"around the talking.")
+        edge = max(1, int(0.06 / FRAME_SECONDS))
+        offset = float(start or 0.0)
+        cut = []
+        if active[:edge].all():
+            cut.append(f"starts mid-word (at {offset:.2f}s)")
+        if active[-edge:].all():
+            cut.append(f"ends mid-word (at {offset + seconds:.2f}s)")
+        if cut:
+            lines.append("⚠️ The selection " + " and ".join(cut) + ". Move the edge into a pause "
+                         "— **Auto-pick** lands edges in pauses for you.")
+        else:
+            lines.append("✅ Starts and ends in a pause.")
+    clipped = float(np.mean(np.abs(clip) >= 0.999))
+    if clipped > CLIP_FRACTION:
+        lines.append(f"⚠️ Clipped peaks ({clipped:.2%} of samples at full scale) — the clone "
+                     f"inherits the distortion.")
+
+    if x_vector_only:
+        lines.append("ℹ️ x-vector only: the transcript is not used (lower similarity).")
+    else:
+        fit = transcript_fit(seconds, text or "")
+        lines.append(("⚠️ " + fit) if fit else "✅ Transcript length fits the clip — still read "
+                     "it against what you hear.")
+    return "\n\n".join(lines)
+
+
+def prepare_reference(wav: np.ndarray, sr: int) -> np.ndarray:
+    """Tidy a reference before it is encoded: DC, rumble, and dead air at the edges.
+
+    Deliberately conservative — nothing here changes the voice. Level is left alone
+    (measured: a reference peaking at 0.1 cloned as well as a full-scale one), and there is
+    no denoiser, because a denoiser's artefacts are exactly the kind of thing the codec
+    faithfully reproduces. What it does remove:
+      * DC offset and sub-60Hz rumble (handling noise, HVAC, mains hum's fundamental):
+        energy the speaker encoder and codec spend bits on that is not the voice;
+      * more than ~0.2s of silence at either end, so the clip the model continues from ends
+        in a short natural pause rather than in a long stretch of room tone.
+    Falls back to the input on any failure: cleanup must not be able to break a clone.
+    """
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if wav.size < int(0.25 * sr):
+        return wav
+    try:
+        out = wav - float(np.mean(wav))
+        try:
+            from scipy.signal import butter, sosfiltfilt
+            sos = butter(2, REF_HIGHPASS_HZ / (sr / 2.0), btype="high", output="sos")
+            out = np.asarray(sosfiltfilt(sos, out.astype(np.float64)), dtype=np.float32)
+        except ImportError:
+            pass
+        out = trim_edges(out, sr, keep_ms=REF_EDGE_KEEP_MS)
+        if out.size < int(REF_MIN_SECONDS * sr * 0.75):    # trimming ate the clip: undo it
+            return wav
+        peak = float(np.max(np.abs(out))) if out.size else 0.0
+        if peak > 1.0:
+            out = out / peak
+        return out.astype(np.float32)
+    except Exception:  # noqa: BLE001 - polish must never sink a clone
+        return wav
 
 
 def render_waveform(wav: np.ndarray, sr: int, start: Optional[float] = None,
@@ -1447,77 +1651,117 @@ class Transcriber:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _text_ids(self, text: str) -> List[int]:
+        """Token ids for `text` as Whisper would emit them after its prefix: no specials.
+
+        `WhisperTokenizer.__call__` adds `<|startoftranscript|><|notimestamps|>` in front
+        and `<|endoftext|>` behind by default. The scorer used to take that output and put
+        the generation prefix in front of it *again*, so every take was charged for two
+        impossible tokens (start-of-transcript after no-timestamps) and its real words were
+        scored in a corrupted context — which is why a clean take read about -1.9 instead
+        of near zero, and why short lines read worse than long ones. Leading space because
+        Whisper's transcripts begin with one (" Hello", not "Hello").
+        """
+        body = self.tokenizer(" " + (text or "").strip(), add_special_tokens=False).input_ids
+        return [int(t) for t in body] + [int(self.tokenizer.eos_token_id)]
+
+    def _prefix_ids(self, language_code: Optional[str]) -> List[int]:
+        """The forced decoder prefix: start, language (if known), transcribe, no-timestamps."""
+        tokens = ["<|startoftranscript|>"]
+        if language_code:
+            tokens.append(f"<|{language_code}|>")
+        tokens += ["<|transcribe|>", "<|notimestamps|>"]
+        return [int(t) for t in self.tokenizer.convert_tokens_to_ids(tokens)]
+
+    def _detected_code(self, ids: Any) -> Optional[str]:
+        """The language token Whisper put in its own prefix, e.g. 'en' — or None."""
+        try:
+            for token in ids[0][:4].tolist():
+                name = self.tokenizer.convert_ids_to_tokens(int(token)) or ""
+                match = re.fullmatch(r"<\|([a-z]{2,3})\|>", name)
+                if match:
+                    return match.group(1)
+        except Exception:  # noqa: BLE001 - detection is a convenience
+            pass
+        return None
+
     def _confidence(self, features: Any, padding_mask: np.ndarray, text: str,
-                    ids: Any = None) -> Optional[float]:
-        """How sure Whisper was about the transcript it just produced.
+                    language_code: Optional[str] = None) -> Optional[float]:
+        """Mean log-probability Whisper's decoder gives `text`, given the audio.
 
-        A second, teacher-forced forward pass over the *returned* text rather than a read
-        of the beam-search bookkeeping: `output_scores` is dropped somewhere inside
-        Whisper's own generation-config juggling (it is only forced on for token timestamps
-        and `logprob_threshold`), and the beam path would have to be reconstructed from
-        `beam_indices` anyway. One forward pass is cheap, exact, and does not depend on
-        which decoding strategy produced the text.
+        A teacher-forced forward pass rather than a read of the beam-search bookkeeping:
+        `output_scores` is dropped somewhere inside Whisper's own generation-config juggling
+        (it is only forced on for token timestamps and `logprob_threshold`). One forward
+        pass is cheap, exact, and does not depend on which decoding strategy ran.
 
-        The forced decoder prefix (start-of-transcript, language, task, no-timestamps) is
-        reused from the sequence `generate` returned. Scoring the text without it asks the
-        decoder a different question — measured, the same clean clip reads -3.06 with no
-        prefix and near -0.3 with it, which would make the whole signal meaningless.
-
-        The value is a per-token mean, so it is comparable across clip lengths: roughly
-        above -0.35 is clean audio, below about -0.8 means the decoder was guessing.
+        The prefix is built explicitly (`_prefix_ids`) and the text is tokenised without
+        specials (`_text_ids`), so the scored tokens are exactly the words plus end-of-text.
+        A per-token mean, so it is comparable across line lengths: near zero for clean
+        audio, well below -1 when the decoder cannot find the text in the audio.
         """
         try:
-            if not text:
+            if not (text or "").strip():
                 return None
-            encoded = self.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
-            if encoded.numel() == 0:
-                return None
-            prefix = None
-            if ids is not None and ids.shape[1] >= 4:
-                prefix = ids[0][:4].to(self.device).unsqueeze(0)  # start, language, task, timestamps
-            if prefix is None:
-                start = int(self.model.config.decoder_start_token_id)
-                prefix = torch.full((1, 1), start, dtype=torch.long, device=self.device)
-            shifted = torch.cat([prefix, encoded[:, :-1]], dim=1)
+            target = self._text_ids(text)
+            prefix = self._prefix_ids(language_code)
+            fed = torch.tensor([prefix + target[:-1]], dtype=torch.long, device=self.device)
             with torch.inference_mode():
                 out = self.model(
                     input_features=features,
                     attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
-                    decoder_input_ids=shifted)
+                    decoder_input_ids=fed)
             # logits[t] predicts fed[t+1], and fed = prefix + text[:-1]: the first scoreable
             # token therefore lines up with logits[prefix_len - 1], not logits[prefix_len].
-            return _mean_token_logprob(getattr(out, "logits", None), encoded[0].tolist(),
-                                       offset=max(0, int(prefix.shape[1]) - 1))
+            return _mean_token_logprob(getattr(out, "logits", None), target,
+                                       offset=max(0, len(prefix) - 1))
         except Exception:  # noqa: BLE001 - confidence is a bonus, never a failure
             return None
+
+    def _generate_ids(self, features: Any, padding_mask: np.ndarray,
+                      language_code: Optional[str]) -> Any:
+        with torch.inference_mode():
+            out = self.model.generate(
+                features,
+                attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
+                language=language_code, task="transcribe",
+                num_beams=4, no_repeat_ngram_size=4, return_dict_in_generate=True)
+        return getattr(out, "sequences", out)
 
     def transcribe(self, wav: np.ndarray, sr: int, language: Optional[str] = None) -> str:
         return self.transcribe_with_confidence(wav, sr, language)[0]
 
-    def score_transcript(self, wav: np.ndarray, sr: int, text: str,
-                         language: Optional[str] = None) -> Optional[float]:
-        """How well Whisper thinks this audio matches `text` — independent of what it heard.
+    def assess(self, wav: np.ndarray, sr: int, intended: str,
+               language: Optional[str] = None) -> Tuple[str, Optional[float]]:
+        """(what Whisper heard, how well the audio matches the *intended* text).
 
-        Used to rank candidates, which is why it scores the text we *asked for* rather than
-        Whisper's own transcript: measured on a noise-degraded take, scoring the transcript
-        it produced read -1.911 (no worse than clean) while scoring the intended text read
-        -2.067. Whisper is confidently consistent about whatever it decided to hear, so
-        grading it against its own answer measures self-consistency, not audio.
+        One beam search plus one teacher-forced pass per take. It used to be two beam
+        searches — `transcribe_with_confidence` and then `score_transcript`, which ran
+        `generate` again only to recover the prefix.
+
+        The confidence scores the text we *asked for*, never Whisper's own transcript:
+        measured on a noise-degraded take, scoring its own answer missed the damage while
+        scoring the intended text caught it. Whisper is confidently consistent about
+        whatever it decided to hear.
         """
-        if not wav.size or not (text or "").strip():
-            return None
+        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+        if not wav.size:
+            return "", None
+        code = ASR_LANGUAGE_CODES.get((language or "").strip().lower())
         with self.lock:
             self.load()
             features, padding_mask = self._features(wav, sr)
-            with torch.inference_mode():
-                out = self.model.generate(
-                    features,
-                    attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
-                    language=ASR_LANGUAGE_CODES.get((language or "").strip().lower()),
-                    task="transcribe", num_beams=4, no_repeat_ngram_size=4,
-                    return_dict_in_generate=True)
-            ids = getattr(out, "sequences", out)
-            return self._confidence(features, padding_mask, text, ids)
+            ids = self._generate_ids(features, padding_mask, code)
+            heard = self.tokenizer.decode(ids[0], skip_special_tokens=True).strip()
+            confidence = self._confidence(features, padding_mask, intended,
+                                          code or self._detected_code(ids))
+        return heard, confidence
+
+    def score_transcript(self, wav: np.ndarray, sr: int, text: str,
+                         language: Optional[str] = None) -> Optional[float]:
+        """How well Whisper thinks this audio matches `text` (see `assess`)."""
+        if not np.asarray(wav).size or not (text or "").strip():
+            return None
+        return self.assess(wav, sr, text, language)[1]
 
     def _features(self, wav: np.ndarray, sr: int) -> Tuple[Any, np.ndarray]:
         """Mel features plus the padding mask, resampled to Whisper's 16kHz."""
@@ -1535,32 +1779,34 @@ class Transcriber:
         padding_mask[:min(len(wav), max_samples)] = 1
         return features, padding_mask
 
-    def transcribe_with_confidence(self, wav: np.ndarray, sr: int,
-                                   language: Optional[str] = None) -> Tuple[str, Optional[float]]:
-        """Transcribe, and also return Whisper's length-normalised sequence log-probability.
+    def transcribe_detailed(self, wav: np.ndarray, sr: int,
+                            language: Optional[str] = None) -> Dict[str, Any]:
+        """Transcribe; returns text, confidence and the language Whisper used (UI name).
 
-        That number is the more graded of the two signals: WER counts discrete word errors,
-        while confidence falls on mumble, doubled words and hallucinated tails even when the
-        edit distance stays at zero. None when the decoder did not report it.
+        The language matters for cloning: setting it explicitly instead of Auto is upstream's
+        own advice, and Whisper has already worked it out by the time the transcript exists.
         """
-        if not wav.size:
+        if not np.asarray(wav).size:
             raise MediaError("Nothing to transcribe — pick a non-empty clip.")
         code = ASR_LANGUAGE_CODES.get((language or "").strip().lower())
         with self.lock:
             self.load()
             features, padding_mask = self._features(wav, sr)
-            with torch.inference_mode():
-                out = self.model.generate(
-                    features,
-                    attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
-                    language=code, task="transcribe",
-                    num_beams=4, no_repeat_ngram_size=4, return_dict_in_generate=True)
-            ids = getattr(out, "sequences", out)
+            ids = self._generate_ids(features, padding_mask, code)
             text = self.tokenizer.decode(ids[0], skip_special_tokens=True).strip()
-            confidence = self._confidence(features, padding_mask, text, ids)
+            used = code or self._detected_code(ids)
+            confidence = self._confidence(features, padding_mask, text, used)
         if not text:
             raise MediaError("Transcription came back empty — the clip may be music or silence.")
-        return text, confidence
+        by_code = {c: name.title() for name, c in ASR_LANGUAGE_CODES.items()}
+        return {"text": text, "confidence": confidence, "code": used,
+                "language": by_code.get(used or "")}
+
+    def transcribe_with_confidence(self, wav: np.ndarray, sr: int,
+                                   language: Optional[str] = None) -> Tuple[str, Optional[float]]:
+        """Transcribe, and also return how confident Whisper is in its own transcript."""
+        result = self.transcribe_detailed(wav, sr, language)
+        return result["text"], result["confidence"]
 
 
 ASR: Optional[Transcriber] = None
@@ -1603,7 +1849,8 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
 
 # Reusable clone prompts, keyed by a hash of the uploaded reference audio, so the
 # reference encoder is not recomputed for every line (big speedup for repeated takes).
-_CLONE_PROMPTS: Dict[str, Any] = {}
+_CLONE_PROMPTS: "OrderedDict[str, Any]" = OrderedDict()
+CLONE_CACHE_SIZE = 8
 
 
 # ============================================================================
@@ -1645,11 +1892,72 @@ def save_voice(name: str, wav: Any = None, sr: int = 0, text: str = "", instruct
         "text": text,
         "sample_rate": int(sr),
         "seconds": round(len(wav) / float(sr), 2) if wav is not None and sr else None,
+        "prefer": "auto",
     }
+    # Write-then-rename, so a crash mid-save cannot leave a half-written sidecar that
+    # `list_voices` then silently skips.
     if wav is not None:
-        sf.write(wav_path, wav, sr)
-    with open(meta_path, "w", encoding="utf-8") as fh:
+        tmp_wav = f"{wav_path}.tmp.wav"
+        sf.write(tmp_wav, wav, sr)
+        os.replace(tmp_wav, wav_path)
+    elif os.path.exists(wav_path):
+        # Re-saving a name as description-only must not leave the old clip behind, paired
+        # with a description it never came from.
+        os.remove(wav_path)
+    tmp_meta = f"{meta_path}.tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp_meta, meta_path)
+    return record
+
+
+def voice_exists(name: str) -> bool:
+    """True when saving under `name` would replace a voice already in the library."""
+    try:
+        return os.path.exists(_voice_paths(_slug(name))[1])
+    except ValueError:
+        return False
+
+
+def _taken_message(name: str) -> str:
+    return (f"Error: a voice called ‘{name.strip()}’ is already in the library. Pick another "
+            f"name, or delete the old one on the Voices tab first — saving never overwrites.")
+
+
+VOICE_ROUTES = ("auto", "clip", "description")
+
+
+def voice_route(record: Dict[str, Any]) -> str:
+    """How Speak and Chat should say this voice: 'design' or 'clip'.
+
+    A record may carry both a clip and a description. `voice_kind` prefers the description
+    (the brighter sound); the record's `prefer` field, set on the Voices tab, can override
+    that — a frozen clip is the steadier identity across the sentences of a long reply,
+    because a description is re-rolled for every chunk.
+    """
+    prefer = str(record.get("prefer") or "auto").strip().lower()
+    has_clip = os.path.exists(record.get("wav") or _voice_paths(record["slug"])[0])
+    has_description = bool(str(record.get("description") or record.get("instruct") or "").strip())
+    if prefer == "clip" and has_clip:
+        return "clip"
+    if prefer == "description" and has_description:
+        return "design"
+    return voice_kind(record)
+
+
+def set_voice_preference(slug: str, prefer: str) -> Dict[str, Any]:
+    """Persist which route Speak/Chat use for one voice (see `voice_route`)."""
+    prefer = (prefer or "auto").strip().lower()
+    if prefer not in VOICE_ROUTES:
+        raise ValueError(f"unknown route {prefer!r}")
+    meta_path = _voice_paths(_slug(slug))[1]
+    with open(meta_path, encoding="utf-8") as fh:
+        record = json.load(fh)
+    record["prefer"] = prefer
+    tmp_meta = f"{meta_path}.tmp"
+    with open(tmp_meta, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp_meta, meta_path)
     return record
 
 
@@ -1692,7 +2000,7 @@ def list_voices() -> List[Dict[str, Any]]:
 def voice_choices() -> List[Tuple[str, str]]:
     entries = []
     for record in list_voices():
-        if voice_kind(record) == "design":
+        if voice_route(record) == "design":
             entries.append((f"{record['name']} (described)", record["slug"]))
         else:
             entries.append((f"{record['name']} ({record.get('seconds', '?')}s)", record["slug"]))
@@ -1729,10 +2037,12 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
         return gr.update(), "Error: give the voice a name first.", gr.update()
     if not (text or "").strip():
         return gr.update(), "Error: the text the clip speaks is empty — it is what ICL cloning needs.", gr.update()
+    if voice_exists(name):
+        return gr.update(), _taken_message(name), gr.update()
     try:
         parsed = _audio_to_tuple(audio)
         if parsed is None:
-            return gr.update(), "Nothing to save yet — generate something on the Design a voice tab first.", gr.update()
+            return gr.update(), "Nothing to save yet — press Generate first.", gr.update()
         wav, sr = parsed
         record = save_voice(
             name=name,
@@ -1764,12 +2074,13 @@ def save_reference_voice(name: str, audio: Any, ref_text: str, language: str) ->
     """
     if not (name or "").strip():
         return gr.update(), "Error: give the voice a name first.", gr.update()
+    if voice_exists(name):
+        return gr.update(), _taken_message(name), gr.update()
     try:
         parsed = _audio_to_tuple(audio)
         if parsed is None:
             return (gr.update(),
-                    "Nothing to save — hit ‘Extract audio & show waveform’ first, or upload a "
-                    "reference into the clip box.",
+                    "Nothing to save — upload, record or load a reference in step 1 first.",
                     gr.update())
         wav, sr = parsed
         seconds = len(wav) / float(sr)
@@ -1786,7 +2097,7 @@ def save_reference_voice(name: str, audio: Any, ref_text: str, language: str) ->
     return (
         gr.update(),
         f"Saved ‘{record['name']}’ ({record['seconds']}s) from the reference clip{note}. "
-        f"It is in the Saved voices list below.",
+        f"It is on the Voices tab, and in Speak and Chat, now.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -1835,6 +2146,8 @@ def save_generated_voice(state: Any, selection: Any, name: str) -> Tuple[Any, st
         return gr.update(), "Error: give the voice a name first.", gr.update()
     if not isinstance(state, dict) or not state.get("takes"):
         return gr.update(), "Nothing to save yet — press ‘Clone & generate’ first.", gr.update()
+    if voice_exists(name):
+        return gr.update(), _taken_message(name), gr.update()
     takes = state["takes"]
     wanted = str(selection).strip() if selection is not None else ""
     chosen = next((t for t in takes if str(t.get("index")) == wanted), None)
@@ -1842,7 +2155,7 @@ def save_generated_voice(state: Any, selection: Any, name: str) -> Tuple[Any, st
         chosen = takes[0]          # one candidate: nothing to choose, so take it
     if chosen is None:
         return (gr.update(),
-                "Error: pick which take to keep (the radio under the take players).",
+                "Error: pick which take to keep under ‘What to save’.",
                 gr.update())
     try:
         path = resolve_input_path(chosen.get("path"))
@@ -1857,7 +2170,7 @@ def save_generated_voice(state: Any, selection: Any, name: str) -> Tuple[Any, st
         gr.update(),
         f"Saved take #{chosen['index']} as ‘{record['name']}’ ({record['seconds']}s, "
         f"voices/{record['slug']}.wav) — the model's own decode, not the post-processed copy. "
-        f"It is in the **Saved voices** list here and in the **Speak** and **Chat** tabs now.",
+        f"It is on the Voices tab, and in Speak and Chat, now.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -1885,7 +2198,7 @@ def load_saved_voice(slug: str) -> Tuple[Any, Any, str]:
 
 def delete_saved_voice(slug: str) -> Tuple[Any, str, Any]:
     if not slug:
-        return gr.update(), "Error: choose a saved voice to delete.", gr.update()
+        return gr.update(), "Error: choose a saved voice to delete."
     wav_path, meta_path = _voice_paths(_slug(slug))
     removed = []
     for path in (wav_path, meta_path):
@@ -1893,14 +2206,16 @@ def delete_saved_voice(slug: str) -> Tuple[Any, str, Any]:
             os.remove(path)
             removed.append(os.path.basename(path))
     msg = f"Deleted {', '.join(removed)}" if removed else f"Nothing saved under ‘{slug}’."
-    return gr.update(choices=voice_choices(), value=None), msg, gr.update(value=None)
+    # Deleting a library entry used to clear the Clone tab's reference box too, throwing
+    # away whatever was loaded there even when it was not the voice being deleted.
+    return gr.update(choices=voice_choices(), value=None), msg
 
 
 def refresh_voices() -> Any:
     return gr.update(choices=voice_choices())
 
 
-def voice_library_updates() -> Tuple[Any, Any, Any, str]:
+def voice_library_updates() -> Tuple[Any, Any, Any, Any, str, Any]:
     """Refresh **every** dropdown that can speak a saved voice, plus the machine-readable list.
 
     The library dropdowns used to live and die inside the tab that owned them: keep a take on
@@ -1910,7 +2225,8 @@ def voice_library_updates() -> Tuple[Any, Any, Any, str]:
     """
     choices = voice_choices()
     return (gr.update(choices=choices), gr.update(choices=choices),
-            gr.update(choices=choices), voices_available())
+            gr.update(choices=choices), gr.update(choices=choices), voices_available(),
+            gr.update(value=voice_table_rows()))
 
 
 def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[Any, int, str]], Optional[str]]:
@@ -1953,7 +2269,7 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
         raise MediaError(error)
     record = resolved
     description = str(record.get("description") or record.get("instruct") or "").strip()
-    if voice_kind(record) == "design" and description:
+    if voice_route(record) == "design" and description:
         # Speak the description straight: measured 2.67m of energy above 9kHz against 0.57m
         # for cloning a saved take, because cloning keeps only ~60% of whatever reference it
         # is handed. The clip in the sidecar is still what Voice Clone loads.
@@ -1974,6 +2290,7 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
     if error:
         raise MediaError(error)
     ref_wav, ref_sr, ref_text = resolved
+    ref_wav = prepare_reference(ref_wav, ref_sr)     # same cleanup the Clone tab applies
     use_xvector = not ref_text
     cache: Dict[str, Any] = {}
 
@@ -1981,17 +2298,7 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
         with HUB.lock:
             tts = HUB.acquire("voice_clone")
             if "prompt" not in cache:
-                key = _clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)
-                prompt = _CLONE_PROMPTS.get(key)
-                if prompt is None:
-                    prompt = tts.create_voice_clone_prompt(
-                        ref_audio=(ref_wav, ref_sr),
-                        ref_text=ref_text or None,
-                        x_vector_only_mode=use_xvector,
-                    )
-                    _CLONE_PROMPTS.clear()
-                    _CLONE_PROMPTS[key] = prompt
-                cache["prompt"] = prompt
+                cache["prompt"] = _clone_prompt(tts, ref_wav, ref_sr, ref_text, use_xvector)
             wavs, rate = tts.generate_voice_clone(
                 text=chunk,
                 language=language,
@@ -2108,9 +2415,14 @@ def voices_available() -> str:
     """Machine-readable voice list for `say.py --list`."""
     records = list_voices()
     if not records:
-        return "(no voices saved yet — use ‘Save to voice library’ or ‘Save selected take’)"
-    return "\n".join(
-        f"{r['slug']}\t{r.get('seconds', '?')}s\t{(r.get('text') or '')[:60]}" for r in records)
+        return "(no voices saved yet — save one on the Clone or Design tab)"
+
+    def line(r: Dict[str, Any]) -> str:
+        # A described voice has no clip, so no length: it used to print as "Nones".
+        if voice_route(r) == "design":
+            return f"{r['slug']}\tdescribed\t{_short(r.get('description') or r.get('instruct'), 60)}"
+        return f"{r['slug']}\t{r.get('seconds') or '?'}s\t{_short(r.get('text'), 60)}"
+    return "\n".join(line(r) for r in records)
 
 
 
@@ -2127,72 +2439,117 @@ def _clone_cache_key(audio_tuple, ref_text, x_vector_only) -> str:
     return f"{sr}|{wav.shape[0]}|{digest}|{ref_text or ''}|{bool(x_vector_only)}"
 
 
+CLONE_OUTPUTS = 2 + MAX_CANDIDATES + 3     # audio, status, takes…, note, take state, save picker
+SAVE_REFERENCE = "reference"
+
+
+def _clone_failure(message: str) -> Tuple[Any, ...]:
+    """Every exit from `generate_voice_clone` returns one value per wired output.
+
+    The early-validation exits used to return just (audio, status) to a callback wired to
+    nine outputs, which Gradio rejects as a server error — so "Target text is required"
+    reached the user as a red error toast instead of a status line.
+    """
+    return (None, message) + tuple(gr.skip() for _ in range(CLONE_OUTPUTS - 2))
+
+
+def _clone_prompt(tts: Any, wav: np.ndarray, sr: int, ref_text: str, x_vector_only: bool) -> Any:
+    """The encoded reference (codec codes + speaker embedding), cached by content.
+
+    One helper for the Clone tab and Speak/Chat, which used to carry two copies of the
+    cache logic. A prompt is a few hundred codec frames and one embedding, so keeping the
+    last `CLONE_CACHE_SIZE` costs nothing and alternating between references stops
+    re-encoding both every time.
+    """
+    key = _clone_cache_key((wav, sr), ref_text, x_vector_only)
+    prompt = _CLONE_PROMPTS.get(key)
+    if prompt is None:
+        prompt = tts.create_voice_clone_prompt(
+            ref_audio=(wav, sr),
+            ref_text=(ref_text or "").strip() or None,
+            x_vector_only_mode=bool(x_vector_only),
+        )
+        _CLONE_PROMPTS[key] = prompt
+        while len(_CLONE_PROMPTS) > CLONE_CACHE_SIZE:
+            _CLONE_PROMPTS.popitem(last=False)
+    else:
+        _CLONE_PROMPTS.move_to_end(key)
+    return prompt
+
+
+def save_choices(take_state: Any = None) -> List[Tuple[str, str]]:
+    """What the Clone tab's one Save button can keep: the reference, or any take."""
+    choices = [("The reference clip + its transcript (best for cloning again)", SAVE_REFERENCE)]
+    if isinstance(take_state, dict):
+        for take in take_state.get("takes") or []:
+            if take.get("path"):
+                choices.append((f"Generated {take['label']}", str(take["index"])))
+    return choices
+
+
 def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector_only,
                          temperature, top_p, top_k, rep_penalty,
                          postproc=POSTPROCESS_DEFAULT,
-                         candidates=1, seed="",
+                         candidates=1, seed="", clean_reference=True,
                          progress=gr.Progress(track_tqdm=True)):
     if not target_text or not target_text.strip():
-        return None, "Error: Target text is required."
-    audio_tuple = _audio_to_tuple(ref_audio)
+        return _clone_failure("Error: type what the cloned voice should say (step 2).")
+    try:
+        audio_tuple = _audio_to_tuple(ref_audio)
+    except (MediaError, OSError, ValueError) as e:
+        return _clone_failure(f"Error: {e}")
     if audio_tuple is None:
-        return None, "Error: Reference audio is required."
+        return _clone_failure("Error: no reference yet — upload, record or load one in step 1.")
     if not use_xvector_only and not (ref_text or "").strip():
-        return None, "Error: Reference text is required when 'x-vector only' is off."
+        return _clone_failure("Error: the reference needs a transcript — press Transcribe, or "
+                              "tick 'x-vector only' under Reference options.")
     try:
         n = max(1, min(int(candidates or 1), MAX_CANDIDATES))
     except (TypeError, ValueError):
-        return None, "Error: Candidates must be a whole number."
+        return _clone_failure("Error: Candidates must be a whole number.")
     seed_text = str(seed or "").strip()
     if seed_text:
         if not re.fullmatch(r"-?\d+", seed_text):
-            return None, "Error: Seed must be an integer (or blank for random)."
+            return _clone_failure("Error: Seed must be an integer (or blank for random).")
         base_seed = int(seed_text) % (2 ** 31)
     else:
         base_seed = int(time.time() * 1000) % (2 ** 31)
 
-    ref_seconds = len(audio_tuple[0]) / float(audio_tuple[1])
+    ref_wav, ref_sr = audio_tuple
+    ref_seconds = len(ref_wav) / float(ref_sr)
     fit = transcript_fit(ref_seconds, ref_text or "", bool(use_xvector_only))
+    if clean_reference:
+        ref_wav = prepare_reference(ref_wav, ref_sr)
     asr_language = None if (not language or language == "Auto") else str(language)
     try:
         budget = _budget(target_text)
         with HUB.lock:
             tts = HUB.acquire("voice_clone")
-            key = _clone_cache_key(audio_tuple, ref_text, use_xvector_only)
-            prompt = _CLONE_PROMPTS.get(key)
-            if prompt is None:
-                prompt = tts.create_voice_clone_prompt(
-                    ref_audio=audio_tuple,
-                    ref_text=(ref_text or "").strip() or None,
-                    x_vector_only_mode=bool(use_xvector_only),
-                )
-                _CLONE_PROMPTS.clear()
-                _CLONE_PROMPTS[key] = prompt
+            prompt = _clone_prompt(tts, ref_wav, ref_sr, ref_text, bool(use_xvector_only))
 
             ref_embedding = None
             try:
                 ref_embedding = tts.model.extract_speaker_embedding(
-                    audio=_to_24k(audio_tuple[0], audio_tuple[1]), sr=24000)
+                    audio=_to_24k(ref_wav, ref_sr), sr=24000)
                 ref_embedding = ref_embedding.float().cpu().numpy()
             except Exception:  # noqa: BLE001 - similarity is a bonus, never a blocker
                 ref_embedding = None
+
+            def one(chunk: str) -> Tuple[np.ndarray, int]:
+                wavs, rate = tts.generate_voice_clone(
+                    text=chunk,
+                    language=language,
+                    voice_clone_prompt=prompt,
+                    max_new_tokens=_budget(chunk),
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+                return wavs[0], rate
 
             results: List[Dict[str, Any]] = []
             for i in range(n):
                 if n > 1:
                     progress((i + 1) / (n + 2.0), desc=f"Candidate {i + 1} of {n}")
                 torch.manual_seed(base_seed + i)
-
-                def one(chunk: str) -> Tuple[np.ndarray, int]:
-                    wavs, rate = tts.generate_voice_clone(
-                        text=chunk,
-                        language=language,
-                        voice_clone_prompt=prompt,
-                        max_new_tokens=_budget(chunk),
-                        **_sampling(temperature, top_p, top_k, rep_penalty),
-                    )
-                    return wavs[0], rate
-
                 wav, sr, chunk_notes = generate_chunked(target_text, language, one, progress)
                 sim = wer = confidence = None
                 # Defects are measured whether or not Whisper is available: they are the
@@ -2207,11 +2564,10 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                         sim = None
                 if n > 1 and ASR is not None and ASR.enabled:
                     try:
-                        hypothesis, _ = ASR.transcribe_with_confidence(wav, sr, asr_language)
+                        # One beam search for what Whisper heard (WER) and one teacher-forced
+                        # pass for how well the audio carries the text we asked for.
+                        hypothesis, confidence = ASR.assess(wav, sr, target_text, asr_language)
                         wer = word_error_rate(hypothesis, target_text)
-                        # Graded companion to WER, scored against the intended text: it can
-                        # see a mumble that Whisper still transcribed perfectly.
-                        confidence = ASR.score_transcript(wav, sr, target_text, asr_language)
                     except Exception:  # noqa: BLE001 - scoring must not sink the generation
                         wer = confidence = None
                 metrics: Dict[str, Any] = {"index": i + 1, "wav": wav, "sr": int(sr),
@@ -2222,7 +2578,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
 
         best = choose_best_candidate(results)
         chosen = results[best]
-        kept_index = results[best]["index"]
+        kept_index = chosen["index"]
         # The auto-pick has to be impossible to miss: the player above shows one clip out of N
         # and nothing else on the page said which one you were listening to.
         report = _report(chosen["wav"], chosen["sr"], budget,
@@ -2241,11 +2597,11 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 if flags:
                     bits.append("⚠ " + ", ".join(flags))
                 return f"#{m['index']} " + " ".join(bits)
-            scored_by = ("penalty = WER + Whisper confidence + waveform defects"
+            scored_by = ("WER + Whisper confidence + waveform defects"
                          if any(m["wer"] is not None for m in results)
                          else "waveform defects (transcription off)")
-            notes.append(f"**Auto-pick: take #{kept_index} of {n}** — scored by {scored_by}: "
-                         + ", ".join(fmt(m) for m in results))
+            notes.append(f"Auto-pick: take #{kept_index} of {n}, scored by {scored_by}.")
+            notes.extend("  " + fmt(m) for m in results)
         else:
             flags = defect_flags(chosen.get("defects") or {})
             if flags:
@@ -2253,13 +2609,16 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                              " — the clip is worth a listen before you keep it")
         if fit:
             notes.append("WARNING: " + fit)
+        if clean_reference:
+            notes.append(f"Reference cleaned: {ref_seconds:.1f}s → {len(ref_wav) / ref_sr:.1f}s "
+                         f"(DC, rumble, edge silence)")
         if chosen.get("chunks"):
             notes.extend(chosen["chunks"])
         status = report + (("\n" + "\n".join(notes)) if notes else "")
         out_wav, out_sr = postprocess_output(chosen["wav"], chosen["sr"], postproc)
         # Hand back every take, not just the winner: the auto-pick is a first opinion, and
         # the only honest way to let someone overrule it is to let them hear the alternatives.
-        # Each one is also written to disk so 'keep this take' can name it later.
+        # Each one is also written to disk so the Save button can name it later.
         takes: List[Any] = []
         paths: List[Optional[str]] = []
         for item in results:
@@ -2271,24 +2630,24 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 take_wav, take_sr = postprocess_output(item["wav"], item["sr"], postproc)
                 takes.append(gr.update(value=(take_sr, take_wav), visible=True,
                                        label=take_label(item["index"], item["wer"], item["sim"],
-                                                        item["index"] == results[best]["index"],
+                                                        item["index"] == kept_index,
                                                         item.get("confidence"), item.get("defects"))))
             else:
                 takes.append(gr.update(value=None, visible=False))
         while len(takes) < MAX_CANDIDATES:
             takes.append(gr.update(value=None, visible=False))
-        take_state = build_take_state(results, results[best]["index"], paths, target_text, language)
-        pick_choices = [(t["label"], str(t["index"])) for t in take_state["takes"] if t["path"]]
+        take_state = build_take_state(results, kept_index, paths, target_text, language)
+        # The one Save control offers the reference and every take. It stays on the
+        # reference by default — that is what "save this voice" usually means — and the
+        # label says which take the auto-pick chose, so overruling it is one click.
         pick_update = gr.update(
-            choices=pick_choices,
-            value=str(kept_index) if pick_choices else None,
-            visible=n > 1 and len(pick_choices) > 1,
-            label=f"Which take to keep — the auto-pick was take #{kept_index}; select another "
-                  f"to overrule it, then Save selected take")
-        return _ok((out_sr, out_wav), status + _post_note(postproc)) + tuple(takes) + (
-            gr.update(visible=n > 1), take_state, pick_update)
+            choices=save_choices(take_state), value=SAVE_REFERENCE,
+            label=(f"What to save — the auto-pick was take #{kept_index}" if n > 1
+                   else "What to save"))
+        return (_ok((out_sr, out_wav), status + _post_note(postproc)) + tuple(takes)
+                + (gr.update(visible=n > 1), take_state, pick_update))
     except Exception as e:  # noqa: BLE001
-        return None, f"Error: {type(e).__name__}: {e}"
+        return _clone_failure(f"Error: {type(e).__name__}: {e}")
 
 
 def clip_guidance(seconds: float, minimum: float = REF_MIN_SECONDS,
@@ -2331,8 +2690,16 @@ def import_media(file_value: Any) -> Tuple[Any, str, Any, Any, Any, Any, str]:
         sf.write(stored, wav, sr)
         state = {"path": stored, "name": os.path.basename(str(path)), "kind": kind,
                  "duration": round(len(wav) / sr, 3), "sample_rate": int(sr)}
-        wave, audio, info, start, end = _clip_outputs(state, None, None)
-        status = f"Loaded {state['name']} ({kind}): {len(wav) / sr:.1f}s @ {sr}Hz"
+        # Start on the best stretch, not on the first few seconds: an intro, a count-in or
+        # room tone at the head of a recording used to be the default reference.
+        try:
+            first = auto_pick_window(wav, sr)
+        except (MediaError, ValueError):
+            first = (None, None)
+        wave, audio, info, start, end = _clip_outputs(state, *first)
+        status = (f"Loaded {state['name']} ({kind}): {len(wav) / sr:.1f}s @ {sr}Hz — "
+                  f"selected {start:.1f}–{end:.1f}s. Drag the sliders to change it, then "
+                  f"Transcribe.")
         duration = round(len(wav) / sr, 2)
         return (state, status, wave,
                 gr.update(maximum=duration, value=start),
@@ -2362,21 +2729,36 @@ def auto_pick_clip(state: Any) -> Tuple[Any, Any, Any, Any, str]:
         return None, None, f"Error: {type(e).__name__}: {e}", gr.update(), gr.update()
 
 
-def transcribe_reference(state: Any, start: Any, end: Any, language: Any) -> Tuple[Any, str]:
-    """Whisper the *selected* window into the editable transcript box."""
-    if ASR is None:
-        return gr.update(), "Error: transcription is disabled on this server (--asr-model)."
+def transcribe_reference(state: Any, start: Any, end: Any, language: Any,
+                         target_language: Any = None) -> Tuple[Any, str, Any]:
+    """Whisper the *selected* window into the editable transcript box.
+
+    Returns (transcript, status, target-language update). When the target language is
+    still Auto it is set to the language Whisper heard: upstream's own advice is to name
+    the language rather than leave it on Auto, and by now we know it.
+    """
+    if ASR is None or not ASR.enabled:
+        return (gr.update(), "Error: transcription is disabled on this server (--asr-model). "
+                             "Type the transcript, or tick x-vector only.", gr.update())
     try:
         wav, sr = _state_audio(state)
         start, end = trim_window(len(wav) / sr, start, end)
         clip = slice_audio(wav, sr, start, end)
         t0 = time.time()
-        text = ASR.transcribe(clip, sr, None if not language or language == "Auto" else str(language))
-        return gr.update(value=text), (
-            f"Transcribed {end - start:.1f}s in {time.time() - t0:.1f}s — "
-            f"check and edit the text before cloning.")
+        result = ASR.transcribe_detailed(
+            clip, sr, None if not language or language == "Auto" else str(language))
     except (MediaError, OSError, ValueError, RuntimeError) as e:
-        return gr.update(), f"Error: {type(e).__name__}: {e}"
+        return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
+    heard = result.get("language")
+    lang_update = gr.update()
+    lang_note = ""
+    if heard and heard in LANGUAGE_VALUES and (not target_language or target_language == "Auto"):
+        lang_update = gr.update(value=heard)
+        lang_note = f" Language set to {heard}."
+    return (gr.update(value=result["text"]),
+            f"Transcribed {end - start:.1f}s in {time.time() - t0:.1f}s.{lang_note} Check the "
+            f"text against what you hear and fix any mistakes before cloning.",
+            lang_update)
 
 
 def clip_fit_status(ref_text: Any, start: Any, end: Any, x_vector_only: Any = False) -> Any:
@@ -2388,336 +2770,547 @@ def clip_fit_status(ref_text: Any, start: Any, end: Any, x_vector_only: Any = Fa
     return gr.update(value=transcript_fit(seconds, ref_text or "", bool(x_vector_only)))
 
 
-def refresh_status():
-    return HUB.status()
+def reference_check(ref_audio: Any, ref_text: Any, x_vector_only: Any = False,
+                    start: Any = None) -> str:
+    """The Clone tab's reference checklist, recomputed from the clip that will be cloned.
+
+    Reads the reference box itself, not the upload state, so it is right whichever way the
+    reference arrived — upload, microphone or library.
+    """
+    try:
+        parsed = _audio_to_tuple(ref_audio)
+    except (MediaError, OSError, ValueError) as e:
+        return f"⚠️ The reference could not be read: {e}"
+    if parsed is None:
+        return "*No reference yet — upload, record or load one above.*"
+    wav, sr = parsed
+    try:
+        offset = float(start) if start not in (None, "") else None
+    except (TypeError, ValueError):
+        offset = None
+    return reference_report(wav, sr, str(ref_text or ""), bool(x_vector_only), offset)
+
+
+def load_voice_for_cloning(slug: Any) -> Tuple[Any, ...]:
+    """Put a saved voice back into step 1 of the Clone tab, as if it had been uploaded.
+
+    Returns the `import_media` outputs plus (transcript, language). The whole clip is
+    selected: its transcript describes all of it, so trimming would break the match.
+    """
+    blank = (None, "", None, gr.update(), gr.update(), None, "", gr.update(), gr.update())
+    record, error = _find_voice(str(slug or ""))
+    if error:
+        return (None, error) + blank[2:]
+    wav_path = record.get("wav") or _voice_paths(record["slug"])[0]
+    if not os.path.exists(wav_path):
+        return (None, f"Error: ‘{record['name']}’ is a described voice — it has no clip to "
+                      f"clone. Speak and Chat can use it as it is.") + blank[2:]
+    try:
+        wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+        wav = _normalize_audio(wav)
+        prune_media()
+        stored = os.path.join(media_dir(), f"{uuid.uuid4().hex}.wav")
+        sf.write(stored, wav, sr)
+        duration = round(len(wav) / float(sr), 3)
+        state = {"path": stored, "name": f"{record['name']} (library)", "kind": "saved voice",
+                 "duration": duration, "sample_rate": int(sr)}
+        wave, audio, info, start, end = _clip_outputs(state, 0.0, duration)
+    except (MediaError, OSError, ValueError) as e:
+        return (None, f"Error: {type(e).__name__}: {e}") + blank[2:]
+    text = str(record.get("text") or "").strip()
+    language = str(record.get("language") or "Auto")
+    note = "" if text else " It has no transcript — Transcribe it, or tick x-vector only."
+    return (state, f"Loaded ‘{record['name']}’ from the library ({duration:.1f}s).{note}",
+            wave, gr.update(maximum=round(duration, 2), value=start),
+            gr.update(maximum=round(duration, 2), value=end), audio, info,
+            gr.update(value=text),
+            gr.update(value=language if language in LANGUAGE_VALUES else "Auto"))
+
+
+def save_clone_voice(what: Any, name: Any, ref_audio: Any, ref_text: Any, language: Any,
+                     take_state: Any) -> Tuple[Any, str]:
+    """The Clone tab's one Save button: keep the reference, or one of the generated takes.
+
+    There used to be two name boxes, two Save buttons, a take radio and three status boxes
+    for this, and nothing said which one did what.
+    """
+    choice = str(what or SAVE_REFERENCE)
+    if choice == SAVE_REFERENCE:
+        name_update, message, _ = save_reference_voice(str(name or ""), ref_audio,
+                                                       str(ref_text or ""), str(language or "Auto"))
+    else:
+        name_update, message, _ = save_generated_voice(take_state, choice, str(name or ""))
+    return name_update, message
+
+
+def refresh_status() -> str:
+    """Sidebar runtime panel: what is loaded where, and how much memory is left."""
+    if HUB is None:
+        return "Models are not loaded yet."
+    return "\n".join(f"- {part.strip()}" for part in HUB.status().split("|"))
+
+
+# ----------------------------------------------------------------------------
+# Voices tab
+# ----------------------------------------------------------------------------
+VOICE_TABLE_HEADERS = ["Name", "Slug", "Speaks from", "Clip", "Language", "Transcript / description"]
+
+
+def _short(text: Any, limit: int = 70) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def voice_table_rows() -> List[List[Any]]:
+    """One row per saved voice for the Voices tab table."""
+    rows = []
+    for record in list_voices():
+        route = voice_route(record)
+        has_clip = os.path.exists(record.get("wav") or _voice_paths(record["slug"])[0])
+        words = record.get("description") or record.get("instruct") if route == "design" \
+            else record.get("text")
+        rows.append([record.get("name", record["slug"]), record["slug"],
+                     "description" if route == "design" else "clip",
+                     f"{record.get('seconds')}s" if has_clip and record.get("seconds") else "—",
+                     record.get("language") or "Auto", _short(words)])
+    return rows
+
+
+def voice_details(slug: Any) -> Tuple[str, Any, Any]:
+    """(details markdown, preview clip, preference radio) for the selected voice."""
+    if not slug:
+        return "*Pick a voice to see its details.*", None, gr.update(value="auto")
+    record, error = _find_voice(str(slug))
+    if error:
+        return error, None, gr.update(value="auto")
+    wav_path = record.get("wav") or _voice_paths(record["slug"])[0]
+    preview = None
+    if os.path.exists(wav_path):
+        try:
+            wav, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+            preview = (int(sr), _normalize_audio(wav))
+        except (OSError, ValueError):
+            preview = None
+    route = voice_route(record)
+    description = str(record.get("description") or record.get("instruct") or "").strip()
+    lines = [f"### {record.get('name', record['slug'])}",
+             f"`{record['slug']}` · saved {str(record.get('created', '?'))[:10]} · "
+             f"language {record.get('language') or 'Auto'}",
+             f"**Speak and Chat use:** {'its description (Voice Design)' if route == 'design' else 'its clip (cloning)'}"]
+    if preview is not None:
+        lines.append(f"**Clip:** {record.get('seconds')}s")
+    if record.get("text"):
+        lines.append(f"**Transcript:** {record['text']}")
+    if description:
+        lines.append(f"**Description:** {description}")
+    if preview is None:
+        lines.append("*No clip — this voice can only be spoken from its description.*")
+    prefer = str(record.get("prefer") or "auto").lower()
+    return "\n\n".join(lines), preview, gr.update(value=prefer if prefer in VOICE_ROUTES else "auto")
+
+
+def save_voice_preference(slug: Any, prefer: Any) -> str:
+    if not slug:
+        return "Error: pick a voice first."
+    record, error = _find_voice(str(slug))
+    if error:
+        return error
+    try:
+        updated = set_voice_preference(record["slug"], str(prefer or "auto"))
+    except (OSError, ValueError) as e:
+        return f"Error: {type(e).__name__}: {e}"
+    updated["wav"], updated["json"] = _voice_paths(updated["slug"])
+    route = voice_route(updated)
+    note = ""
+    if updated["prefer"] != "auto" and \
+            (route == "design") != (updated["prefer"] == "description"):
+        note = " (this voice has nothing to speak that way from, so it still uses the other)"
+    return (f"‘{updated['name']}’ is now spoken from its "
+            f"{'description' if route == 'design' else 'clip'} in Speak and Chat{note}.")
+
+
+def pick_voice_row(evt: gr.SelectData) -> Any:
+    """Voices-tab table click -> the slug of that row (column 1)."""
+    row = getattr(evt, "row_value", None)
+    if isinstance(row, (list, tuple)) and len(row) > 1:
+        return gr.update(value=row[1])
+    return gr.update()
+
+
+def ask_delete(slug: Any) -> Tuple[Any, str]:
+    """First click of the two-step delete: reveal the confirm button, naming the voice."""
+    if not slug:
+        return gr.update(visible=False), "Error: pick a voice to delete."
+    record, error = _find_voice(str(slug))
+    if error:
+        return gr.update(visible=False), error
+    return (gr.update(visible=True, value=f"Yes, delete ‘{record['name']}’"),
+            f"Press the red button to delete ‘{record['name']}’ for good — there is no undo.")
+
+
+def confirm_delete(slug: Any) -> Tuple[Any, str, Any]:
+    dropdown, message = delete_saved_voice(str(slug or ""))
+    return dropdown, message, gr.update(visible=False)
+
+
+UI_THEME = gr.themes.Soft(primary_hue="indigo", secondary_hue="slate")
+UI_CSS = (".gradio-container {max-width: 1500px !important;} "
+          ".gradio-container h1 {margin-bottom: .1em;} "
+          ".gradio-container h4 {margin: .4em 0 .2em; opacity: .85;} "
+          "#cl-check p, #cl-check li {margin: .1em 0;}")
+
+ETHICS_NOTE = ("> **Use it kindly.** Clone only voices you have permission to use — your own, or "
+               "someone else's with their consent — and never pass synthetic audio off as the "
+               "real person. Running it locally does not change that. See *Ethical use* in the "
+               "README.")
 
 
 # ============================================================================
 # UI
 # ============================================================================
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="qwen3-tts-ui", theme=gr.themes.Soft(primary_hue="indigo",
-                                                              secondary_hue="slate")) as demo:
+    """The web UI. Layout rules, so it does not drift back into a wall of boxes:
+
+    * one **Status** box per tab — every action on that tab reports there;
+    * settings and the runtime line live in the **sidebar**, not in every status;
+    * one **Save** control per tab, saying what it saves;
+    * the library is managed in one place, the **Voices** tab, and every list of voices
+      refreshes whenever it changes.
+    """
+    with gr.Blocks(title="qwen3-tts-ui") as demo:
         gr.Markdown(
-            """# qwen3-tts-ui
-**Design a voice** invents one from a description · **Clone a voice** works from a ~3s clip ·
-**Speak** and **Chat** talk as anything you have saved, from the browser or from a script.
+            "# qwen3-tts-ui\n"
+            "**Clone** a voice from a short clip · **Design** one from a description · "
+            "**Speak** and **Chat** as any saved voice · manage them under **Voices**. "
+            "Settings and the GPU/RAM status are in the sidebar — the › at the top left.")
 
-*Weights live in CPU RAM and move onto the GPU on demand, so the first request after you
-switch tabs pays a couple of seconds. Details in the Runtime line below.*
-"""
-        )
-        status_bar = gr.Textbox(value=HUB.status(), label="Runtime", interactive=False, lines=1)
-        refresh = gr.Button("Refresh runtime status", size="sm")
-        refresh.click(refresh_status, outputs=[status_bar])
-
-        with gr.Accordion("Sampling settings (advanced)", open=False):
+        with gr.Sidebar(open=False, label="Settings"):
+            gr.Markdown("### Runtime")
+            rt_status = gr.Markdown(refresh_status())
+            rt_timer = gr.Timer(5.0)
+            rt_timer.tick(refresh_status, outputs=[rt_status], concurrency_limit=None,
+                          show_progress="hidden", api_visibility="private")
             gr.Markdown(
-                "Defaults come from the checkpoint's `generation_config.json`. Lower "
-                "temperature / raise repetition penalty if a generation rambles or never stops. "
-                "Output length is capped at `min(2048, 4 × text length)` tokens."
-            )
-            with gr.Row():
-                s_temperature = gr.Slider(0.1, 2.0, value=SAMPLING_DEFAULTS["temperature"], step=0.05, label="Temperature")
-                s_top_p = gr.Slider(0.1, 1.0, value=SAMPLING_DEFAULTS["top_p"], step=0.05, label="Top-p")
-                s_top_k = gr.Slider(1, 200, value=SAMPLING_DEFAULTS["top_k"], step=1, label="Top-k")
-                s_rep = gr.Slider(1.0, 1.5, value=SAMPLING_DEFAULTS["repetition_penalty"], step=0.01, label="Repetition penalty")
-                s_postproc = gr.Dropdown(
-                    label="Output post-processing",
-                    choices=[(POSTPROCESS_LABELS[m], m) for m in POSTPROCESS_MODES],
-                    value=POSTPROCESS_DEFAULT,
-                    info="The vocoder decodes at 24kHz. 'Warm' resamples properly, cuts the "
-                         "imaging near 12kHz that reads as 'digital', and adds a little air. "
-                         "Measured likeness-neutral.")
+                "*Weights wait in CPU RAM and move to the GPU on demand, so the first request "
+                "after switching between Clone and Design pays a few seconds.*")
+            gr.Markdown("### Output")
+            s_postproc = gr.Dropdown(
+                label="Post-processing",
+                choices=[(POSTPROCESS_LABELS[m], m) for m in POSTPROCESS_MODES],
+                value=POSTPROCESS_DEFAULT,
+                info="The vocoder decodes at 24kHz. 'Warm' resamples properly and trims the "
+                     "imaging near 12kHz that reads as 'digital'. Saved takes are always the "
+                     "unprocessed decode.")
+            gr.Markdown("### Sampling")
+            gr.Markdown(
+                "Checkpoint defaults. Quality comes from the reference and its transcript far "
+                "more than from these; lower the temperature or raise the repetition penalty "
+                "only if a take rambles or never stops.")
+            s_temperature = gr.Slider(0.1, 2.0, value=SAMPLING_DEFAULTS["temperature"], step=0.05,
+                                      label="Temperature")
+            s_top_p = gr.Slider(0.1, 1.0, value=SAMPLING_DEFAULTS["top_p"], step=0.05, label="Top-p")
+            s_top_k = gr.Slider(1, 200, value=SAMPLING_DEFAULTS["top_k"], step=1, label="Top-k")
+            s_rep = gr.Slider(1.0, 1.5, value=SAMPLING_DEFAULTS["repetition_penalty"], step=0.01,
+                              label="Repetition penalty")
+            s_reset = gr.Button("Reset to defaults", size="sm")
+            s_reset.click(lambda: (SAMPLING_DEFAULTS["temperature"], SAMPLING_DEFAULTS["top_p"],
+                                   SAMPLING_DEFAULTS["top_k"], SAMPLING_DEFAULTS["repetition_penalty"]),
+                          outputs=[s_temperature, s_top_p, s_top_k, s_rep],
+                          api_visibility="private")
         sampling = [s_temperature, s_top_p, s_top_k, s_rep]
         output_options = [s_postproc]
 
-        with gr.Tabs():
-            with gr.Tab("Design a voice"):
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        vd_text = gr.Textbox(
-                            label="Text to synthesize", lines=4,
-                            value="It's in the top drawer... wait, it's empty? No way, that's impossible! I'm sure I put it there!",
-                        )
-                        vd_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
-                        vd_instruct = gr.Textbox(
-                            label="Voice description", lines=3,
-                            value="Speak in an incredulous tone, but with a hint of panic beginning to creep into your voice.",
-                            placeholder="Describe timbre, age, gender, emotion, accent, speaking rate...",
-                        )
-                        vd_btn = gr.Button("Generate voice", variant="primary")
-                        with gr.Row():
-                            vd_voice_name = gr.Textbox(
-                                label="Save as voice (name)", scale=3,
-                                placeholder="e.g. sleepy sea captain",
-                                info="Keeps the clip as a reusable clone speaker (voices/ on disk).",
-                            )
-                            vd_save_btn = gr.Button("Save as clone voice", size="sm", scale=1)
-                        vd_save_status = gr.Textbox(label="Voice library", lines=1, interactive=False)
-                    with gr.Column(scale=2):
-                        vd_audio = gr.Audio(label="Generated voice", type="filepath")
-                        vd_status = gr.Textbox(label="Status", lines=2, interactive=False)
-                vd_btn.click(generate_voice_design,
-                             inputs=[vd_text, vd_language, vd_instruct] + sampling + output_options,
-                             outputs=[vd_audio, vd_status])
-
-            with gr.Tab("Clone a voice"):
-                gr.Markdown(
-                    "Clone a voice from a short clip, then make it say anything — three steps, "
-                    "top to bottom. **Quality comes from the reference and its transcript**, not "
-                    "from the sliders; see the README's quality section. A clean 3–10s stretch of "
-                    "one speaker, with no music or reverb, clones best.")
-                gr.Markdown(
-                    "> **Use it kindly.** Clone a voice you have permission to use — your own, or "
-                    "someone else's with their consent. A cloned voice that is passed off as the "
-                    "real person is the misuse this feature makes easy, and running it locally "
-                    "does not change that. See *Ethical use* in the README.")
-
-                gr.Markdown("#### 1 · The reference — the clip the voice is taken from")
+        with gr.Tabs() as tabs:
+            # ---------------------------------------------------------------- Clone
+            with gr.Tab("Clone a voice", id="clone"):
+                gr.Markdown(ETHICS_NOTE)
                 cl_media_state = gr.State(value=None)
-                cl_upload = gr.File(label="Upload video or audio — video works, only its audio track is used",
-                                    file_types=MEDIA_SUFFIXES, type="filepath")
-                with gr.Row():
-                    cl_import_btn = gr.Button("Extract audio & show waveform", variant="primary")
-                    cl_auto_btn = gr.Button("Auto-pick best clip")
-                cl_media_status = gr.Textbox(label="Media", lines=1, interactive=False)
-                cl_wave = gr.Image(label="Reference waveform — shaded region is what gets cloned",
-                                   type="pil", height=180, interactive=False)
-                with gr.Row():
-                    cl_start = gr.Slider(0, 60, value=0, step=0.05, label="Start (s)")
-                    cl_end = gr.Slider(0, 60, value=0, step=0.05, label="End (s)")
-                cl_clip_info = gr.Textbox(label="Selected clip", lines=1, interactive=False)
-
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        cl_ref_audio = gr.Audio(label="Reference clip (the trimmed selection lands here)",
-                                                type="filepath", sources=["upload", "microphone"])
-                    with gr.Column(scale=2):
-                        cl_asr_language = gr.Dropdown(
-                            label="Transcript language",
-                            choices=[("Auto-detect", "Auto")] + [(k.title(), k) for k in ASR_LANGUAGE_CODES],
-                            value="Auto")
-                        cl_transcribe_btn = gr.Button("Transcribe selected clip", variant="primary")
-                cl_ref_text = gr.Textbox(
-                    label="The reference clip says… (transcript — must match what you hear)", lines=3,
-                    placeholder="Transcribe the selection above, then fix anything Whisper got wrong. "
-                                "This is what the clip says, not what you want it to say.")
-                cl_xvector = gr.Checkbox(
-                    label="x-vector only (no transcript needed, lower similarity)", value=False)
-                cl_fit = gr.Textbox(label="Fit check", lines=1, interactive=False)
-
-                gr.Markdown("#### 2 · What it should say")
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        cl_text = gr.Textbox(
-                            label="Say this in the cloned voice", lines=4,
-                            placeholder="New words for the cloned voice to speak…",
-                            info="The new line to synthesise — the box above is what the reference "
-                                 "says; this is what you want to hear.")
-                        cl_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
-                        with gr.Row():
-                            cl_candidates = gr.Slider(1, MAX_CANDIDATES, value=1, step=1,
-                                                      label="Candidates (best of N)",
-                                                      info="Each extra take costs ~7s. Helps when the "
-                                                           "model flubs a take; scored by Whisper WER then "
-                                                           "speaker similarity.")
-                            cl_seed = gr.Textbox(label="Seed (blank = random)", value="", scale=1,
-                                                 info="Same seed + same inputs reproduces the same audio.")
-                        cl_btn = gr.Button("Clone & generate", variant="primary")
-                    with gr.Column(scale=2):
-                        cl_audio = gr.Audio(label="Generated audio (the auto-pick)", type="numpy")
-                        cl_status = gr.Textbox(label="Status", lines=2, interactive=False)
-                with gr.Row():
-                    cl_take_1 = gr.Audio(label="Take #1", type="numpy", visible=False)
-                    cl_take_2 = gr.Audio(label="Take #2", type="numpy", visible=False)
-                    cl_take_3 = gr.Audio(label="Take #3", type="numpy", visible=False)
-                    cl_take_4 = gr.Audio(label="Take #4", type="numpy", visible=False)
-                cl_takes_note = gr.Markdown(
-                    visible=False,
-                    value="*Candidates (best of N)*: **Generated audio** above is the auto-pick, "
-                          "ranked by a penalty = Whisper WER + Whisper confidence + waveform "
-                          "defects (speaking rate, edge silence, clipping). Every take is left "
-                          "below with its numbers, and each has its own download icon — the "
-                          "scorer is a first opinion, not a gate. Trust your ears when the "
-                          "numbers look like a tie — and to keep one, name it under **3 · Keep "
-                          "it** and press Save selected take.")
-
-                gr.Markdown("#### 3 · Keep it — the voice library")
-                gr.Markdown(
-                    "Saving keeps the **reference clip + transcript** so you do not have to "
-                    "re-upload it next time; **Load** puts one back into step 1. The audio you "
-                    "generated is kept with the download icon on its player, not here.")
-                with gr.Row():
-                    cl_voice_name = gr.Textbox(
-                        label="Save this reference as a voice (name)", scale=3,
-                        placeholder="e.g. phone voice memo",
-                        info="Writes voices/<name>.wav + .json on this machine.")
-                    cl_save_btn = gr.Button("Save to voice library", size="sm", scale=1)
-                cl_save_status = gr.Textbox(label="Save status", lines=1, interactive=False)
-
                 cl_take_state = gr.State(value=None)
-                with gr.Row():
-                    cl_take_name = gr.Textbox(
-                        label="…or keep a generated take as a voice (name)", scale=3,
-                        placeholder="e.g. fox take #4",
-                        info="Stores the model's own decode of that take — not the post-processed "
-                             "listening copy — with the line it was asked to say as its transcript, "
-                             "so it can be cloned from later without re-uploading.")
-                    cl_take_save_btn = gr.Button("Save selected take", size="sm", scale=1)
-                cl_take_pick = gr.Radio(label="Which take to keep", choices=[], value=None,
-                                        visible=False)
-                cl_take_status = gr.Textbox(label="Take status", lines=1, interactive=False)
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 1 · Reference — the voice to copy")
+                        with gr.Tabs():
+                            with gr.Tab("Upload"):
+                                cl_upload = gr.File(
+                                    label="Video or audio file — only the audio track is used",
+                                    file_types=MEDIA_SUFFIXES, type="filepath", height=110)
+                            with gr.Tab("Record"):
+                                cl_mic = gr.Audio(label="Record 5–10s of natural speech",
+                                                  sources=["microphone"], type="filepath")
+                            with gr.Tab("From library"):
+                                with gr.Row():
+                                    cl_library = gr.Dropdown(label="Saved voice", choices=voice_choices(),
+                                                             value=None, scale=4)
+                                    cl_load_btn = gr.Button("Load", scale=1)
+                        cl_wave = gr.Image(label="Waveform — the shaded part is the reference",
+                                           type="pil", height=150, interactive=False)
+                        with gr.Row():
+                            cl_start = gr.Slider(0, 60, value=0, step=0.05, label="Start (s)")
+                            cl_end = gr.Slider(0, 60, value=0, step=0.05, label="End (s)")
+                        with gr.Row():
+                            cl_auto_btn = gr.Button("Auto-pick the best stretch", size="sm")
+                        cl_ref_audio = gr.Audio(label="Reference clip — exactly what will be cloned",
+                                                type="filepath", interactive=False)
+                        with gr.Row(equal_height=True):
+                            cl_asr_language = gr.Dropdown(
+                                label="Transcript language", scale=2,
+                                choices=[("Auto-detect", "Auto")] +
+                                        [(k.title(), k) for k in ASR_LANGUAGE_CODES],
+                                value="Auto")
+                            cl_transcribe_btn = gr.Button("Transcribe the clip", variant="primary",
+                                                          scale=1)
+                        cl_ref_text = gr.Textbox(
+                            label="What the reference says (must match the clip word for word)",
+                            lines=3,
+                            placeholder="Press Transcribe, then fix anything Whisper got wrong.")
+                        with gr.Accordion("Reference options", open=False):
+                            cl_clean = gr.Checkbox(
+                                label="Clean up the reference (remove DC, rumble below 60Hz and "
+                                      "long edge silence)", value=True)
+                            cl_xvector = gr.Checkbox(
+                                label="x-vector only — no transcript needed, but a weaker likeness",
+                                value=False)
+                        cl_check = gr.Markdown(reference_check(None, ""), elem_id="cl-check")
 
-                with gr.Row():
-                    cl_voice = gr.Dropdown(label="Saved voices (designed or saved from a clip)",
-                                           choices=voice_choices(),
-                                           value=None, scale=4, allow_custom_value=False,
-                                           info="Load fills in the reference clip and its transcript.")
-                    cl_load_btn = gr.Button("Load", size="sm", scale=1)
-                    cl_delete_btn = gr.Button("Delete", size="sm", scale=1, variant="stop")
-                    cl_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
-                cl_voice_status = gr.Textbox(label="Voice library", lines=1, interactive=False)
+                    with gr.Column(scale=1):
+                        gr.Markdown("#### 2 · What it should say")
+                        cl_text = gr.Textbox(label="Text for the cloned voice", lines=4,
+                                             placeholder="New words for the cloned voice to speak…")
+                        with gr.Row():
+                            cl_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
+                                                      value="Auto", scale=1,
+                                                      info="Transcribe fills this in.")
+                            cl_candidates = gr.Slider(1, MAX_CANDIDATES, value=3, step=1, scale=1,
+                                                      label="Takes (best of N)",
+                                                      info="One generation each; the best is kept.")
+                        with gr.Accordion("Seed", open=False):
+                            cl_seed = gr.Textbox(show_label=False, value="",
+                                                 placeholder="blank = random; a number reproduces a take")
+                        cl_btn = gr.Button("Clone & generate", variant="primary")
+                        cl_audio = gr.Audio(label="Result (the auto-picked take)", type="numpy")
+                        cl_status = gr.Textbox(label="Status", lines=5, max_lines=14,
+                                               interactive=False)
+                        cl_takes_note = gr.Markdown(
+                            visible=False,
+                            value="*Every take, scored. The pick ranks Whisper's word error rate, "
+                                  "its confidence and waveform defects; speaker similarity only "
+                                  "breaks ties. Trust your ears over the numbers.*")
+                        cl_takes = []
+                        for row_start in range(0, MAX_CANDIDATES, 2):
+                            with gr.Row():
+                                for i in range(row_start, min(row_start + 2, MAX_CANDIDATES)):
+                                    cl_takes.append(gr.Audio(label=f"Take #{i + 1}", type="numpy",
+                                                             visible=False))
+
+                        gr.Markdown("#### 3 · Save it to the voice library")
+                        cl_save_what = gr.Radio(label="What to save", choices=save_choices(None),
+                                                value=SAVE_REFERENCE)
+                        with gr.Row(equal_height=True):
+                            cl_save_name = gr.Textbox(label="Name", scale=3,
+                                                      placeholder="e.g. phone voice memo")
+                            cl_save_btn = gr.Button("Save voice", scale=1)
+
+                import_outputs = [cl_media_state, cl_status, cl_wave, cl_start, cl_end,
+                                  cl_ref_audio, cl_check]
+                slice_outputs = [cl_wave, cl_ref_audio, cl_check, cl_start, cl_end]
+                check_inputs = [cl_ref_audio, cl_ref_text, cl_xvector, cl_start]
+
+                def then_check(event: Any) -> Any:
+                    return event.then(reference_check, inputs=check_inputs, outputs=[cl_check],
+                                      show_progress="hidden", api_visibility="private")
+
+                then_check(cl_upload.upload(import_media, inputs=[cl_upload], outputs=import_outputs,
+                                            api_visibility="private"))
+                then_check(cl_mic.stop_recording(import_media, inputs=[cl_mic], outputs=import_outputs,
+                                                 api_visibility="private"))
+                then_check(cl_load_btn.click(load_voice_for_cloning, inputs=[cl_library],
+                                             outputs=import_outputs + [cl_ref_text, cl_language],
+                                             api_visibility="private"))
+                for slider in (cl_start, cl_end):
+                    then_check(slider.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
+                                              outputs=slice_outputs, api_visibility="private"))
+                then_check(cl_auto_btn.click(auto_pick_clip, inputs=[cl_media_state],
+                                             outputs=slice_outputs, api_visibility="private"))
+                then_check(cl_transcribe_btn.click(
+                    transcribe_reference,
+                    inputs=[cl_media_state, cl_start, cl_end, cl_asr_language, cl_language],
+                    outputs=[cl_ref_text, cl_status, cl_language], api_visibility="private"))
+                # The checklist is cheap (no model), so it runs outside the one-GPU queue and
+                # follows the transcript as it is typed.
+                for trigger in (cl_ref_text.input, cl_xvector.change):
+                    trigger(reference_check, inputs=check_inputs, outputs=[cl_check],
+                            concurrency_limit=None, trigger_mode="always_last",
+                            show_progress="hidden", api_visibility="private")
 
                 cl_btn.click(generate_voice_clone,
-                             inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling
-                                    + output_options + [cl_candidates, cl_seed],
-                             outputs=[cl_audio, cl_status, cl_take_1, cl_take_2, cl_take_3, cl_take_4,
-                                      cl_takes_note, cl_take_state, cl_take_pick])
-                cl_take_save_evt = cl_take_save_btn.click(
-                    save_generated_voice,
-                    inputs=[cl_take_state, cl_take_pick, cl_take_name],
-                    outputs=[cl_take_name, cl_take_status, cl_voice])
+                             inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector]
+                                    + sampling + output_options + [cl_candidates, cl_seed, cl_clean],
+                             outputs=[cl_audio, cl_status] + cl_takes
+                                     + [cl_takes_note, cl_take_state, cl_save_what],
+                             api_name="generate_voice_clone")
+                cl_save_evt = cl_save_btn.click(
+                    save_clone_voice,
+                    inputs=[cl_save_what, cl_save_name, cl_ref_audio, cl_ref_text, cl_language,
+                            cl_take_state],
+                    outputs=[cl_save_name, cl_status], api_visibility="private")
 
-                # Transcript/clip fit is a live, non-blocking check: a transcript that does not
-                # match the selection is the worst clone failure mode we measured, and it is
-                # invisible until the model has rambled for 17 seconds.
-                fit_inputs = [cl_ref_text, cl_start, cl_end, cl_xvector]
-                cl_ref_text.change(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-                cl_xvector.change(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-                cl_start.release(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-                cl_end.release(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-
-                cl_import_btn.click(import_media, inputs=[cl_upload],
-                                    outputs=[cl_media_state, cl_media_status, cl_wave,
-                                             cl_start, cl_end, cl_ref_audio, cl_clip_info]).then(
-                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-                cl_start.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
-                                 outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
-                cl_end.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
-                               outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
-                cl_auto_btn.click(auto_pick_clip, inputs=[cl_media_state],
-                                  outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end]).then(
-                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-                cl_transcribe_btn.click(transcribe_reference,
-                                        inputs=[cl_media_state, cl_start, cl_end, cl_asr_language],
-                                        outputs=[cl_ref_text, cl_media_status]).then(
-                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
-
+            # ---------------------------------------------------------------- Design
+            with gr.Tab("Design a voice", id="design"):
+                gr.Markdown(
+                    "Describe a voice and hear it say a line. **Save** keeps the description and "
+                    "the clip: Speak and Chat talk from the description, and the clip can be "
+                    "cloned like any other reference.")
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=1):
+                        vd_instruct = gr.Textbox(
+                            label="Voice description", lines=3,
+                            value="Speak in an incredulous tone, but with a hint of panic beginning "
+                                  "to creep into your voice.",
+                            placeholder="Timbre, age, gender, emotion, accent, speaking rate…")
+                        vd_text = gr.Textbox(
+                            label="Text to say", lines=4,
+                            value="It's in the top drawer... wait, it's empty? No way, that's "
+                                  "impossible! I'm sure I put it there!")
+                        vd_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
+                                                  value="Auto")
+                        vd_btn = gr.Button("Generate", variant="primary")
+                    with gr.Column(scale=1):
+                        vd_audio = gr.Audio(label="Designed voice", type="filepath")
+                        vd_status = gr.Textbox(label="Status", lines=3, interactive=False)
+                        gr.Markdown("#### Save this voice")
+                        with gr.Row(equal_height=True):
+                            vd_voice_name = gr.Textbox(label="Name", scale=3,
+                                                       placeholder="e.g. sleepy sea captain")
+                            vd_save_btn = gr.Button("Save voice", scale=1)
+                vd_btn.click(generate_voice_design,
+                             inputs=[vd_text, vd_language, vd_instruct] + sampling + output_options,
+                             outputs=[vd_audio, vd_status], api_name="generate_voice_design")
                 vd_save_evt = vd_save_btn.click(
                     save_designed_voice,
                     inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
-                    outputs=[vd_voice_name, vd_save_status, cl_voice])
-                cl_save_evt = cl_save_btn.click(save_reference_voice,
-                                                inputs=[cl_voice_name, cl_ref_audio, cl_ref_text, cl_language],
-                                                outputs=[cl_voice_name, cl_save_status, cl_voice])
-                cl_load_btn.click(load_saved_voice, inputs=[cl_voice],
-                                  outputs=[cl_ref_audio, cl_ref_text, cl_voice_status])
-                cl_delete_evt = cl_delete_btn.click(delete_saved_voice, inputs=[cl_voice],
-                                                     outputs=[cl_voice, cl_voice_status, cl_ref_audio])
-                cl_refresh_evt = cl_refresh_btn.click(refresh_voices, outputs=[cl_voice])
+                    outputs=[vd_voice_name, vd_status, cl_library], api_visibility="private")
 
-            with gr.Tab("Speak"):
+            # ---------------------------------------------------------------- Speak
+            with gr.Tab("Speak", id="speak"):
                 gr.Markdown(
-                    "One call: pick a saved voice, type what to say. This is also the endpoint "
-                    "external tools use — `scripts/say.py --voice <slug> --text \"...\"` renders it "
-                    "and plays it through your speakers, so a coding assistant can talk to you. "
-                    "It shares the one GPU with the other tabs, so a long line here queues a UI "
-                    "generation behind it. The reference clip and its transcript are read from "
-                    "`voices/` on the server — a caller only ever names the voice, never a path.")
-                with gr.Row():
-                    sp_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
-                                           scale=4, allow_custom_value=True,
-                                           info="Name or slug. A ‘(described)’ voice is spoken from "
-                                                "its description, which keeps the most top end; a "
-                                                "voice showing seconds is spoken by cloning its "
-                                                "saved clip. Voices come from the library on the "
-                                                "Clone a voice and Design a voice tabs.")
-                    sp_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
-                sp_text = gr.Textbox(
-                    label="What to say", lines=3,
-                    value="Build finished. Three tests failed, but I already fixed two of them.",
-                    placeholder="Type anything — long text is chunked and stitched automatically.")
-                with gr.Row():
-                    sp_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
-                    sp_btn = gr.Button("Speak", variant="primary")
-                with gr.Row():
-                    sp_audio = gr.Audio(label="Audio", type="numpy")
-                    sp_status = gr.Textbox(label="Status", lines=3, interactive=False)
-                sp_list = gr.Textbox(
-                    label="Voices on this server (slug · seconds · transcript)", lines=4,
-                    interactive=False,
-                    value=voices_available(),
-                    info="This box is also an API output — `scripts/say.py --list` reads it, "
-                         "which is how a script finds the slug to pass back.")
+                    "Pick a saved voice and type what to say; long text is split into sentences "
+                    "and stitched. This is also the endpoint scripts use — "
+                    "`scripts/say.py --voice <slug> --text \"…\"`.")
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=1):
+                        sp_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
+                                               allow_custom_value=True,
+                                               info="‘(described)’ voices speak from their "
+                                                    "description; the rest clone their clip. "
+                                                    "Change which on the Voices tab.")
+                        sp_text = gr.Textbox(
+                            label="What to say", lines=4,
+                            value="Build finished. Three tests failed, but I already fixed two of them.")
+                        sp_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
+                                                  value="Auto")
+                        sp_btn = gr.Button("Speak", variant="primary")
+                    with gr.Column(scale=1):
+                        sp_audio = gr.Audio(label="Result", type="numpy")
+                        sp_status = gr.Textbox(label="Status", lines=3, interactive=False)
+                with gr.Accordion("For scripts: the voice list as the API returns it", open=False):
+                    sp_list = gr.Textbox(
+                        show_label=False, lines=6, interactive=False, value=voices_available(),
+                        info="`scripts/say.py --list` prints this; pass a slug back as --voice.")
                 sp_btn.click(speak,
                              inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
-                             outputs=[sp_audio, sp_status])
+                             outputs=[sp_audio, sp_status], api_name="speak")
 
-            with gr.Tab("Chat"):
+            # ---------------------------------------------------------------- Chat
+            with gr.Tab("Chat", id="chat"):
                 gr.Markdown(
-                    "Type what you want heard. The reply is spoken **piece by piece**: you hear the "
-                    "first sentence after ~6–9s instead of waiting for the whole thing, and the log "
-                    "fills in as it goes. The model cannot stream samples, so this streams at the "
-                    "only granularity it has — sentences. Expect ~1.4× realtime overall; it shares "
-                    "the one GPU with every other tab.")
-                ch_log = gr.Chatbot(label="Assistant", height=320)
-                with gr.Row():
+                    "Type a line and hear it. Replies are spoken sentence by sentence, so the "
+                    "first one plays after a few seconds instead of after the whole reply.")
+                ch_log = gr.Chatbot(label="Conversation", height=320)
+                with gr.Row(equal_height=True):
                     ch_text = gr.Textbox(label="Say this", scale=5,
                                          placeholder="Type a sentence and press Enter…")
                     ch_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
-                                           scale=2, allow_custom_value=True,
-                                           info="From the voice library; name or slug.")
-                    ch_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
-                with gr.Row():
+                                           scale=2, allow_custom_value=True)
                     ch_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
-                                              value="Auto", scale=2)
-                    ch_send = gr.Button("Speak", variant="primary", scale=1)
-                    ch_clear = gr.Button("Clear", size="sm", scale=1)
+                                              value="Auto", scale=1)
+                with gr.Row():
+                    ch_send = gr.Button("Speak", variant="primary", scale=3)
+                    ch_clear = gr.Button("Clear", scale=1)
                 ch_player = gr.HTML(label="Now playing",
                                     value="<em style='opacity:.6'>Each sentence appears here and "
-                                          "starts playing on its own — no click needed.</em>")
+                                          "starts playing on its own.</em>")
                 ch_status = gr.Textbox(label="Status", lines=1, interactive=False)
                 chat_inputs = [ch_text, ch_log, ch_voice, ch_language] + sampling + output_options
-                ch_send.click(chat_say, inputs=chat_inputs,
-                              outputs=[ch_log, ch_player, ch_status])
-                ch_text.submit(chat_say, inputs=chat_inputs,
-                               outputs=[ch_log, ch_player, ch_status])
-                ch_clear.click(lambda: ([], "", "Cleared."),
-                               outputs=[ch_log, ch_player, ch_status])
+                ch_send.click(chat_say, inputs=chat_inputs, outputs=[ch_log, ch_player, ch_status],
+                              api_name="chat_say")
+                ch_text.submit(chat_say, inputs=chat_inputs, outputs=[ch_log, ch_player, ch_status],
+                               api_visibility="private")
+                ch_clear.click(lambda: ([], "", "Cleared."), outputs=[ch_log, ch_player, ch_status],
+                               api_visibility="private")
 
-            # Anything that changes the voice library must tell every tab that reads it. These
-            # are registered here because the Speak and Chat dropdowns do not exist yet when
-            # the Clone and Design tabs are wired. `.then()` lives on the event, not the Button.
-            library_outputs = [cl_voice, sp_voice, ch_voice, sp_list]
-            for event in (cl_save_evt, cl_take_save_evt, cl_delete_evt, cl_refresh_evt,
-                          vd_save_evt):
-                event.then(voice_library_updates, outputs=library_outputs)
-            sp_refresh_btn.click(refresh_voices, outputs=[sp_voice]).then(
-                voice_library_updates, outputs=library_outputs)
-            # The Chat tab had no way to see a voice saved elsewhere. This chain is also what
-            # keeps /voices_available a named endpoint, which `scripts/say.py --list` calls.
-            ch_refresh_btn.click(refresh_voices, outputs=[ch_voice]).then(
-                voices_available, outputs=[sp_list])
+            # ---------------------------------------------------------------- Voices
+            with gr.Tab("Voices", id="voices"):
+                gr.Markdown(
+                    "Every saved voice, in one place. Click a row to select it. Voices are "
+                    "files under `voices/` on the server (`<slug>.wav` + `<slug>.json`).")
+                with gr.Row(equal_height=False):
+                    with gr.Column(scale=3):
+                        vo_table = gr.Dataframe(value=voice_table_rows(), headers=VOICE_TABLE_HEADERS,
+                                                interactive=False, wrap=True, max_height=520)
+                    with gr.Column(scale=2):
+                        with gr.Row(equal_height=True):
+                            vo_select = gr.Dropdown(label="Selected voice", choices=voice_choices(),
+                                                    value=None, scale=4)
+                            vo_refresh_btn = gr.Button("Refresh", scale=1)
+                        vo_details = gr.Markdown(voice_details(None)[0])
+                        vo_preview = gr.Audio(label="Saved clip", type="numpy", interactive=False)
+                        vo_prefer = gr.Radio(
+                            label="Speak and Chat say this voice from…",
+                            choices=[("Auto — its description if it has one", "auto"),
+                                     ("Its clip (cloning: the steadiest identity)", "clip"),
+                                     ("Its description (Voice Design: the brightest sound)",
+                                      "description")],
+                            value="auto")
+                        with gr.Row():
+                            vo_use_btn = gr.Button("Use as clone reference", variant="primary")
+                            vo_delete_btn = gr.Button("Delete…")
+                        vo_confirm_btn = gr.Button("Yes, delete", variant="stop", visible=False)
+                        vo_status = gr.Textbox(label="Status", lines=2, interactive=False)
+
+                vo_table.select(pick_voice_row, outputs=[vo_select], api_visibility="private")
+                vo_select.change(voice_details, inputs=[vo_select],
+                                 outputs=[vo_details, vo_preview, vo_prefer],
+                                 api_visibility="private").then(
+                    lambda: gr.update(visible=False), outputs=[vo_confirm_btn],
+                    api_visibility="private")
+                vo_prefer_evt = vo_prefer.input(save_voice_preference, inputs=[vo_select, vo_prefer],
+                                                outputs=[vo_status], api_visibility="private")
+                then_check(vo_use_btn.click(
+                    load_voice_for_cloning, inputs=[vo_select],
+                    outputs=import_outputs + [cl_ref_text, cl_language],
+                    api_visibility="private").then(
+                    lambda: gr.Tabs(selected="clone"), outputs=[tabs], api_visibility="private"))
+                vo_delete_btn.click(ask_delete, inputs=[vo_select],
+                                    outputs=[vo_confirm_btn, vo_status], api_visibility="private")
+                vo_delete_evt = vo_confirm_btn.click(
+                    confirm_delete, inputs=[vo_select],
+                    outputs=[vo_select, vo_status, vo_confirm_btn], api_visibility="private")
+                # Kept as a named endpoint: `scripts/say.py --list` calls /voices_available.
+                vo_refresh_evt = vo_refresh_btn.click(voices_available, outputs=[sp_list],
+                                                      api_name="voices_available")
+
+        # Anything that changes the library refreshes every list of voices on every tab.
+        library_outputs = [cl_library, sp_voice, ch_voice, vo_select, sp_list, vo_table]
+        for event in (cl_save_evt, vd_save_evt, vo_delete_evt, vo_prefer_evt, vo_refresh_evt):
+            event.then(voice_library_updates, outputs=library_outputs, api_visibility="private")
+        # A page opened before someone else saved a voice should still see it on reload.
+        demo.load(voice_library_updates, outputs=library_outputs, api_visibility="private")
 
         gr.Markdown(
             "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen), "
-            "1.7B checkpoints, run offline. Long text is split on sentence boundaries and "
-            "stitched automatically, so you can paste a page and it will not rush.\n\n"
-            "**Ethical use:** clone only voices you have permission to use, never impersonate "
-            "someone to deceive or defraud them, and say so when audio is synthetic. "
-            "See *Ethical use* in the README."
-        )
+            "1.7B checkpoints, run offline. **Ethical use:** clone only voices you have "
+            "permission to use, never impersonate someone to deceive or defraud them, and say "
+            "so when audio is synthetic.")
     return demo
 
 
@@ -2863,10 +3456,7 @@ def main() -> int:
 
         launch_kwargs: Dict[str, Any] = dict(
             server_name=args.ip, server_port=args.port, share=args.share, auth=auth,
-            inbrowser=False,
-            css=".gradio-container {max-width: 1400px !important;} "
-                ".gradio-container h1 {margin-bottom: .1em;} "
-                ".gradio-container h4 {margin-bottom: .3em; opacity: .85;}",
+            inbrowser=False, theme=UI_THEME, css=UI_CSS,
         )
         if args.ssl_certfile and args.ssl_keyfile:
             launch_kwargs.update(ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)

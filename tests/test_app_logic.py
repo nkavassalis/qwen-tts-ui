@@ -213,7 +213,7 @@ def test_voice_library(tmp_dir=None) -> None:
             _, _, msg = webui.load_saved_voice("does_not_exist")
             check("no saved voice" in msg, "loading an unknown voice errors instead of returning silence")
 
-            _, msg, _ = webui.delete_saved_voice("sleepy_sea_captain")
+            _, msg = webui.delete_saved_voice("sleepy_sea_captain")
             check("Deleted" in msg and webui.list_voices() == [], "delete removes both files")
 
             # A half-written entry must not break the list.
@@ -437,6 +437,7 @@ def _media_helpers_body(tmp: str) -> None:
 
     try:
         webui.subprocess.run = fake_run
+        webui.shutil.which = lambda name: f"/usr/bin/{name}"   # hermetic: no real ffmpeg needed
         webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav", sr=24000)
         cmd = calls["cmd"]
         check(cmd[0] == webui.FFMPEG_BIN, "uses the configured ffmpeg")
@@ -444,6 +445,23 @@ def _media_helpers_body(tmp: str) -> None:
         check(cmd[cmd.index("-ac") + 1] == "1" and cmd[cmd.index("-ar") + 1] == "24000",
               "downmixes to mono at the requested rate")
         check(cmd[-1] == "/out/a.wav" and "pcm_s16le" in cmd, "writes PCM wav")
+        check(cmd[cmd.index("-t") + 1] == str(webui.MAX_MEDIA_SECONDS),
+              "decoding is capped at MAX_MEDIA_SECONDS, so a two-hour upload cannot fill RAM")
+        timeouts = {}
+        webui.subprocess.run = lambda cmd, **kw: (timeouts.update(kw),
+                                                  types.SimpleNamespace(returncode=0, stderr=""))[1]
+        webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav")
+        check(timeouts.get("timeout") == webui.FFMPEG_TIMEOUT_SECONDS, "ffmpeg runs under a timeout")
+
+        def hang(cmd, **kw):
+            raise webui.subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+        webui.subprocess.run = hang
+        try:
+            webui.ffmpeg_extract_audio("/in/huge.mp4", "/out/a.wav")
+            raise AssertionError("expected MediaError on an ffmpeg timeout")
+        except webui.MediaError as e:
+            check("took longer" in str(e) or "timed out" in str(e).lower(),
+                  f"a hung ffmpeg is reported, not left running: {e}")
 
         webui.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
             returncode=1, stderr="x\nStream map '0:a:0' matches no streams.")
@@ -643,8 +661,10 @@ def test_auto_pick_window() -> None:
     loud = (np.sin(np.linspace(0, 4000, sr * 5)) * 0.9).astype(np.float32)
     wav = np.concatenate([silence, loud, silence])           # loud from 20s..25s
     start, end = webui.auto_pick_window(wav, sr, target=5.0)
-    check(abs(start - 20.0) <= 0.3 and abs(end - start - 5.0) < 1e-6,
-          f"should land on the loud stretch, got {start}-{end}")
+    # The window snaps outwards into the surrounding pauses, so it covers the whole burst
+    # and may grow a little past `target` — never shrink below the clone minimum.
+    check(19.5 <= start <= 20.05 and 24.95 <= end <= 25.6,
+          f"should land on the loud stretch, edges in the silence around it, got {start}-{end}")
 
     short = np.ones(sr, dtype=np.float32) * 0.5
     check(webui.auto_pick_window(short, sr, target=5.0) == (0.0, 1.0), "shorter than target -> whole clip")
@@ -752,7 +772,7 @@ def test_build_ui_constructs() -> None:
     """
     class StubHub:
         def status(self) -> str:
-            return "stub"
+            return "GPU: stub | RAM: stub"
 
     original, webui.HUB = webui.HUB, StubHub()
     try:
@@ -761,23 +781,34 @@ def test_build_ui_constructs() -> None:
         webui.HUB = original
 
     check(demo is not None, "build_ui returned a Blocks instance")
-    check(len(demo.fns) >= 13, f"every button/slider is wired (found {len(demo.fns)} listeners)")
+    check(len(demo.fns) >= 25, f"every button/slider is wired (found {len(demo.fns)} listeners)")
 
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
-    # VoiceDesign + Clone output + Clone reference box + the four candidate players that
-    # make best-of-N auditionable + the Speak player. (The chat player is HTML.)
-    check(len(audios) == 8, f"two outputs, one reference input, four take players, one "
-                            f"speak player — found {len(audios)}")
-    for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
-        check(label in by_label, f"{label} exists")
+    # Clone: microphone, reference, result, four takes · Design result · Speak result ·
+    # Voices preview. (The chat player is HTML.)
+    check(len(audios) == 10, f"expected 10 audio players, found {len(audios)}")
+    reference = by_label.get("Reference clip — exactly what will be cloned")
+    check(reference is not None, "the reference player exists")
     # Anything we read back from the browser is filepath-typed so that we open it
     # ourselves, after resolve_input_path; with type="numpy" Gradio opens the client's
     # path before our code runs, so we never get a chance to check it.
-    check(by_label["Reference clip (the trimmed selection lands here)"].type == "filepath",
-          "the reference box is filepath-typed so resolve_input_path can guard it")
-    check(by_label["Generated voice"].type == "filepath",
-          "the Voice Design box is filepath-typed: 'Save as voice' reads it back")
+    check(reference.type == "filepath", "the reference box is filepath-typed so resolve_input_path can guard it")
+    check(not reference.interactive, "the reference is a result of step 1, not a second upload box")
+    check("Designed voice" in by_label and by_label["Designed voice"].type == "filepath",
+          "the Voice Design box is filepath-typed: Save reads it back")
+
+    # The public API surface: scripts/say.py depends on these names.
+    names = {d.get("api_name") for d in demo.config["dependencies"]
+             if d.get("api_visibility", "public") == "public"}
+    for name in ("speak", "voices_available", "generate_voice_clone", "generate_voice_design"):
+        check(name in names, f"/{name} stays a public endpoint")
+    speak = next(d for d in demo.config["dependencies"] if d.get("api_name") == "speak")
+    check(len(speak["inputs"]) == 8, "/speak keeps its 8 positional inputs (scripts/say.py)")
+
+    statuses = [b for b in demo.blocks.values()
+                if isinstance(b, gr.Textbox) and b.label == "Status"]
+    check(len(statuses) == 5, f"one Status box per tab, found {len(statuses)}")
 
 
 def test_acquire_works_without_cuda() -> None:
@@ -1063,18 +1094,20 @@ def test_choose_best_candidate() -> None:
 
 
 def test_clone_tab_wires_the_quality_controls() -> None:
-    """Drift guard: the fit check and best-of-N must stay wired to real components."""
+    """Drift guard: the reference check and best-of-N must stay wired to real components."""
     import inspect
 
     source = inspect.getsource(webui.build_ui)
-    check("cl_fit" in source and "clip_fit_status" in source,
-          "the Fit check box exists and is driven by the live checker")
-    check("cl_candidates" in source and "cl_seed" in source,
-          "best-of-N and seed controls are in the Clone tab")
-    check("+ [cl_candidates, cl_seed]" in source,
-          "they are actually passed into generate_voice_clone")
-    check(source.count("clip_fit_status") >= 5,
-          "the fit check is wired to transcript, sliders, x-vector and the post-action chains")
+    check("cl_check = gr.Markdown(reference_check" in source,
+          "the reference checklist exists and starts filled in")
+    check("then_check(" in source and source.count("then_check(") >= 7,
+          "every action that changes the reference re-runs the checklist")
+    check("cl_ref_text.input" in source, "and so does typing in the transcript")
+    check("cl_candidates" in source and "cl_seed" in source and "cl_clean" in source,
+          "best-of-N, seed and reference cleanup are in the Clone tab")
+    check("+ [cl_candidates, cl_seed, cl_clean]" in source,
+          "they are actually passed into generate_voice_clone, in its argument order")
+    check("value=3, step=1" in source, "best of 3 is the default — the measured quality lever")
 
 
 def test_postprocess_output() -> None:
@@ -1156,11 +1189,11 @@ def test_output_options_are_wired() -> None:
 
 
 def test_clone_tab_reads_top_to_bottom() -> None:
-    """The Clone tab must read as the three steps it actually is.
+    """The Clone tab must read as the three steps it actually is, with one Save.
 
-    It used to put 'Save this reference as a voice' between the reference section and the
-    synthesis section, which made people hunt for the save button in the wrong place and
-    wonder what 'Target text' meant. Order is the documentation here, so pin it.
+    It used to have two name boxes, two Save buttons, a take radio, a separate library row
+    and five status boxes, and nothing said which saved what. Order is the documentation
+    here, so pin it.
     """
     import inspect
 
@@ -1171,23 +1204,20 @@ def test_clone_tab_reads_top_to_bottom() -> None:
         assert index >= 0, f"missing {needle!r} in the Clone tab"
         return index
 
-    steps = [at("#### 1 · The reference"), at("#### 2 · What it should say"),
-             at("#### 3 · Keep it")]
+    steps = [at("#### 1 · Reference"), at("#### 2 · What it should say"),
+             at("#### 3 · Save it to the voice library")]
     check(steps == sorted(steps), "the three step headings appear in order")
-    check(at('cl_text = gr.Textbox') > at("#### 2 · What it should say"),
-          "the text to synthesise sits under step 2, not the reference section")
-    check(at('cl_voice_name = gr.Textbox') > at('cl_text = gr.Textbox'),
-          "the save controls come after the synthesis controls, not between them")
-    check(at('cl_voice_name = gr.Textbox') > at("#### 3 · Keep it"),
-          "saving lives in the library step, next to Load/Delete")
-    check(at('cl_save_btn = gr.Button') < at('cl_voice = gr.Dropdown'),
-          "Save sits directly above the saved-voices list it feeds")
-    check(at('cl_audio = gr.Audio') < at('cl_voice_name = gr.Textbox'),
-          "the generated audio stays next to the button that produced it")
+    check(at("cl_text = gr.Textbox") > steps[1], "the text to synthesise sits under step 2")
+    check(at("cl_ref_text = gr.Textbox") < steps[1], "the transcript sits under step 1")
+    check(at("cl_audio = gr.Audio") < steps[2], "the result sits next to the button that made it")
+    check(at("cl_save_what = gr.Radio") > steps[2] and at("cl_save_btn = gr.Button") > steps[2],
+          "saving lives in step 3")
+    check(source.count("gr.Button(\"Save voice\"") == 2,
+          "exactly one Save button on Clone and one on Design")
 
     # The two text boxes must not be confusable.
-    check("Say this in the cloned voice" in source, "the synthesis box says what it is for")
-    check("The reference clip says" in source, "the transcript box says it is what the clip says")
+    check("Text for the cloned voice" in source, "the synthesis box says what it is for")
+    check("What the reference says" in source, "the transcript box says it is what the clip says")
     check('label="Target text"' not in source, "'Target text' is gone — it named nothing")
 
 
@@ -1253,22 +1283,22 @@ def test_candidate_penalty() -> None:
     """Content still beats everything; confidence and defects only break near-ties."""
     pen = webui.candidate_penalty
     check(pen(0.0, -0.10, {"penalty": 0.0}) == 0.0, "a clean take costs nothing")
-    check(pen(0.4, -2.00, {"penalty": 0.0}) > pen(0.0, -3.5, {"penalty": 0.3}),
+    good = webui.CONF_GOOD
+    check(pen(0.4, good - 1.0, {"penalty": 0.0}) > pen(0.0, good - 1.5, {"penalty": 0.3}),
           "saying the words wrong outweighs a struggling decoder plus defects")
-    check(pen(0.0, -2.00, {"penalty": 0.0}) < pen(0.0, -3.50, {"penalty": 0.0}),
+    check(pen(0.0, good - 1.0, {"penalty": 0.0}) < pen(0.0, good - 2.5, {"penalty": 0.0}),
           "a struggling decoder separates two takes with identical WER")
     check(pen(None, None, None) == 0.0, "no signals at all costs nothing (ASR off)")
-    check(pen(0.0, -2.00, {"penalty": 5.0}) == webui.DEFECT_CAP,
+    check(pen(0.0, good - 1.0, {"penalty": 5.0}) == round(webui.CONF_WEIGHT + webui.DEFECT_CAP, 4),
           "defects are capped so they can never outvote content")
-    check(pen(0.0, webui.CONF_GOOD, None) == 0.0, "confidence exactly at the good line is free")
-    check(pen(0.0, webui.CONF_GOOD - 0.4, None) > 0.1, "below the line it is penalised")
-    check(pen(0.0, -1.9, None) == 0.0,
-          "the measured level of a clean take (-1.9) must cost nothing")
-    check(pen(0.0, -6.3, None) > 1.0,
-          "the measured level of pure silence (-6.3) must dominate every other signal")
+    check(pen(0.0, good, None) == 0.0, "confidence exactly at the good line is free")
+    check(pen(0.0, good - 0.4, None) > 0.1, "below the line it is penalised")
+    check(pen(0.0, good + 0.6, None) == 0.0, "a clean take, above the line, costs nothing")
+    check(pen(0.0, good - 4.0, None) > 1.0,
+          "a take Whisper cannot match to the text at all must dominate every other signal")
     check(pen(0.2, None, None) > pen(0.0, None, {"penalty": 0.4}),
           "10% wrong words outweighs a fistful of defect flags")
-    check(pen(0.02, None, None) < pen(0.0, -4.0, None),
+    check(pen(0.02, None, None) < pen(0.0, good - 3.0, None),
           "a take that is barely decodable can lose over one trivial word error")
 
 
@@ -1418,20 +1448,24 @@ def test_save_generated_voice_saves_the_chosen_take() -> None:
 
 
 def test_take_picker_is_wired() -> None:
-    """The picker and its button have to be connected, or 'keep this take' is decoration."""
+    """The one save picker must be fed by generation and read by Save."""
     import inspect
 
     source = inspect.getsource(webui.build_ui)
     check("cl_take_state = gr.State(value=None)" in source,
           "the take paths travel through gr.State, not a module global")
-    check("cl_take_pick = gr.Radio" in source, "there is a take picker")
-    check("cl_take_save_btn = gr.Button" in source, "and a button to keep the chosen one")
-    check("cl_take_state, cl_take_pick" in source,
-          "the button takes the state and the selection as inputs")
-    check("cl_takes_note, cl_take_state, cl_take_pick]" in source,
-          "generation populates the players, the note, the state and the picker")
-    check("inputs=[cl_take_state, cl_take_pick, cl_take_name]" in source,
-          "saving reads the selection from the page, not from server-side memory")
+    check("cl_takes_note, cl_take_state, cl_save_what]" in source,
+          "generation populates the players, the note, the state and the save picker")
+    check("inputs=[cl_save_what, cl_save_name, cl_ref_audio, cl_ref_text, cl_language,\n"
+          "                            cl_take_state]" in source,
+          "saving reads the selection and the takes from the page, not from server memory")
+
+    choices = webui.save_choices({"takes": [{"index": 1, "path": "/a", "label": "Take #1"},
+                                            {"index": 2, "path": None, "label": "Take #2"}]})
+    check(choices[0][1] == webui.SAVE_REFERENCE, "the reference is always the first choice")
+    check([value for _, value in choices] == [webui.SAVE_REFERENCE, "1"],
+          "a take that failed to reach disk is not offered")
+    check(webui.save_choices(None) == choices[:1], "before generating, only the reference")
 
 
 def test_candidate_players_are_wired() -> None:
@@ -1439,11 +1473,15 @@ def test_candidate_players_are_wired() -> None:
     import inspect
 
     source = inspect.getsource(webui.build_ui)
-    for n in (1, 2, 3, 4):
-        check(f"cl_take_{n} = gr.Audio" in source, f"take player {n} exists")
-    check("cl_take_1, cl_take_2, cl_take_3, cl_take_4" in source,
-          "the four players are outputs of Clone & generate")
-    check("cl_takes_note" in source, "the row that explains the auto-pick exists")
+    check("cl_takes.append(gr.Audio(" in source and "range(row_start" in source,
+          "one take player per candidate is built")
+    check("outputs=[cl_audio, cl_status] + cl_takes" in source,
+          "the players are outputs of Clone & generate")
+    check("cl_takes_note" in source, "the line that explains the auto-pick exists")
+    check(webui.CLONE_OUTPUTS == 2 + webui.MAX_CANDIDATES + 3,
+          "the output count matches what is wired")
+    check(len(webui._clone_failure("x")) == webui.CLONE_OUTPUTS,
+          "a validation failure returns a value for every wired output")
 
 
 # ---------------------------------------------------------------------------
@@ -1714,6 +1752,10 @@ def test_speak_resolves_voices_server_side() -> None:
             listing = webui.voices_available()
             check("ryan_narrator" in listing and "A test line." in listing,
                   f"--list shows the slug and the transcript: {listing}")
+            webui.save_voice("Words", None, 0, "", "airy and bright", "English",
+                             description="airy and bright", kind="design")
+            check("words\tdescribed\tairy and bright" in webui.voices_available(),
+                  "a described voice lists as described, not as 'Nones'")
             webui.VOICES_DIR = os.path.join(voices, "empty")
             check("no voices saved" in webui.voices_available(), "an empty library is stated")
         finally:
@@ -1872,8 +1914,9 @@ def test_tabs_and_readme_agree() -> None:
     import inspect
     import re
 
-    labels = re.findall(r'gr\.Tab\("([^"]+)"\)', inspect.getsource(webui.build_ui))
-    check(len(labels) == 4, f"four tabs are expected, found {labels}")
+    labels = re.findall(r'gr\.Tab\("([^"]+)", id=', inspect.getsource(webui.build_ui))
+    check(labels == ["Clone a voice", "Design a voice", "Speak", "Chat", "Voices"],
+          f"five top-level tabs, in order, found {labels}")
     with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
         readme = fh.read()
     missing = [label for label in labels if label not in readme]
@@ -1881,7 +1924,6 @@ def test_tabs_and_readme_agree() -> None:
 
     # The footer used to tell people to chunk their own text, which the app has done
     # automatically since the chunker landed.
-    import app as _self  # noqa: F401 - just to be sure we are reading the live module
     source = inspect.getsource(webui)
     check("split very long scripts into chunks" not in source,
           "the footer must not tell users to do what the app now does for them")
@@ -1933,24 +1975,25 @@ def test_a_saved_voice_reaches_every_tab() -> None:
 
     The library dropdowns were per-tab, so a take kept on the Clone tab was invisible to
     Speak and Chat until a reload. Every action that mutates the library now chains one
-    refresh over every dropdown that can speak a voice.
+    refresh over every list of voices.
     """
     import inspect
 
     updates = webui.voice_library_updates()
-    check(len(updates) == 4, "three dropdowns plus the machine-readable list")
-    check(all(isinstance(update, dict) and "choices" in update for update in updates[:3]),
+    check(len(updates) == 6, "four dropdowns, the machine-readable list and the table")
+    check(all(isinstance(update, dict) and "choices" in update for update in updates[:4]),
           "each dropdown gets its choices refreshed")
-    check(isinstance(updates[3], str), "the --list box gets the text list")
+    check(isinstance(updates[4], str), "the --list box gets the text list")
+    check(isinstance(updates[5], dict) and "value" in updates[5], "the Voices table gets its rows")
 
     source = inspect.getsource(webui.build_ui)
-    for event in ("cl_save_evt", "cl_take_save_evt", "cl_delete_evt", "cl_refresh_evt",
-                  "vd_save_evt"):
-        check(event in source, f"{event} must exist so its save/delete can chain the refresh")
-    check("event.then(voice_library_updates, outputs=library_outputs)" in source,
+    for event in ("cl_save_evt", "vd_save_evt", "vo_delete_evt", "vo_prefer_evt", "vo_refresh_evt"):
+        check(event in source, f"{event} must exist so its change can chain the refresh")
+    check("event.then(voice_library_updates, outputs=library_outputs" in source,
           "the refresh is chained onto every library-mutating action")
-    check("library_outputs = [cl_voice, sp_voice, ch_voice, sp_list]" in source,
-          "and it covers Clone, Speak, Chat and the API list box")
+    check("library_outputs = [cl_library, sp_voice, ch_voice, vo_select, sp_list, vo_table]" in source,
+          "and it covers Clone, Speak, Chat, Voices and the API list box")
+    check("demo.load(voice_library_updates" in source, "a fresh page load is current too")
 
 
 def test_a_described_voice_is_spoken_from_its_description() -> None:
@@ -2034,6 +2077,332 @@ def test_a_described_voice_is_spoken_from_its_description() -> None:
             check("text is required" in status.lower(), f"empty text is still refused: {status}")
         finally:
             webui.VOICES_DIR, webui.HUB = original_voices, original_hub
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: scoring, reference handling, library, Clone-tab plumbing
+# ---------------------------------------------------------------------------
+
+class _FakeWhisperTokenizer:
+    """Just enough of WhisperTokenizer to pin the scorer's token layout."""
+    SPECIAL = {"<|startoftranscript|>": 1, "<|en|>": 2, "<|transcribe|>": 3,
+               "<|notimestamps|>": 4, "<|endoftext|>": 0}
+    eos_token_id = 0
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, text, add_special_tokens=True):
+        self.calls.append(add_special_tokens)
+        body = [10 + (ord(c) % 50) for c in text]
+        if add_special_tokens:                       # what the real tokenizer does by default
+            body = [1, 4] + body + [0]
+        return types.SimpleNamespace(input_ids=body)
+
+    def convert_tokens_to_ids(self, tokens):
+        return [self.SPECIAL[t] for t in tokens]
+
+    def convert_ids_to_tokens(self, token):
+        return {v: k for k, v in self.SPECIAL.items()}.get(int(token), "x")
+
+
+def test_whisper_confidence_scores_only_the_words() -> None:
+    """The double-prefix bug: the scorer charged every take for two impossible tokens."""
+    import torch
+
+    asr = webui.Transcriber(model_id="openai/whisper-large-v3", enabled=False)
+    asr.tokenizer = _FakeWhisperTokenizer()
+    ids = asr._text_ids("Hi")
+    check(asr.tokenizer.calls == [False], "the text is tokenised without special tokens")
+    check(ids[-1] == 0 and 1 not in ids and 4 not in ids,
+          f"words plus end-of-text, no start/no-timestamps prefix inside: {ids}")
+    check(asr._prefix_ids("en") == [1, 2, 3, 4], "start, language, transcribe, no-timestamps")
+    check(asr._prefix_ids(None) == [1, 3, 4], "no language token when it is not known")
+    check(asr._detected_code(torch.tensor([[1, 2, 3, 4, 20]])) == "en",
+          "the language Whisper picked is read back from its own prefix")
+    check(asr._detected_code(torch.tensor([[1, 3, 4, 20]])) is None, "and None when absent")
+
+    # Alignment: a decoder that puts all its mass on the right next token scores ~0 only
+    # when the offset is len(prefix) - 1.
+    prefix, target, vocab = [1, 2, 3, 4], ids, 64
+    fed = prefix + target[:-1]
+    logits = torch.full((1, len(fed), vocab), -30.0)
+    for t in range(len(fed) - 1):
+        logits[0, t, fed[t + 1]] = 30.0
+    logits[0, len(fed) - 1, target[-1]] = 30.0
+    good = webui._mean_token_logprob(logits, target, offset=len(prefix) - 1)
+    bad = webui._mean_token_logprob(logits, target, offset=len(prefix))
+    check(good is not None and good > -0.01, f"aligned scoring is ~0 for a perfect decoder: {good}")
+    check(bad is None or bad < -10, f"an off-by-one is loud, not subtle: {bad}")
+
+
+def test_pauses_and_snapping() -> None:
+    sr = 8000
+    rng = np.random.default_rng(3)
+    speech = lambda s: (0.4 * rng.standard_normal(int(s * sr))).astype(np.float32)  # noqa: E731
+    quiet = lambda s: (0.0005 * rng.standard_normal(int(s * sr))).astype(np.float32)  # noqa: E731
+    wav = np.concatenate([speech(2.0), quiet(0.3), speech(3.0), quiet(0.3), speech(2.0)])
+    gap1 = 2.15                                   # centre of the first pause
+    found = webui.find_pause(wav, sr, 2.0)
+    check(found is not None and abs(found - gap1) <= 0.2, f"nearest pause found: {found}")
+    check(webui.find_pause(wav, sr, 3.5, radius=0.2) is None,
+          "mid-speech with no pause in reach returns None")
+    start, end = webui.snap_to_pauses(wav, sr, 2.05, 5.6)
+    check(abs(start - gap1) <= 0.2 and 5.3 <= end <= 5.65, f"both edges moved into pauses: {start}-{end}")
+    tone = (0.5 * np.sin(np.linspace(0, 2000, sr * 8))).astype(np.float32)
+    check(webui.snap_to_pauses(tone, sr, 1.0, 6.0) == (1.0, 6.0),
+          "no pauses at all leaves the selection alone")
+    s2, e2 = webui.snap_to_pauses(wav, sr, 2.1, 2.1 + webui.REF_MIN_SECONDS)
+    check(e2 - s2 >= webui.REF_MIN_SECONDS - 1e-6, "snapping never shrinks below the clone minimum")
+
+
+def test_reference_report() -> None:
+    sr = 16000
+    rng = np.random.default_rng(5)
+    body = (0.3 * rng.standard_normal(sr * 6)).astype(np.float32)
+    gap = (0.0003 * rng.standard_normal(int(sr * 0.3))).astype(np.float32)
+    clean = np.concatenate([gap, body[: sr * 3], gap, body[sr * 3:], gap])
+    report = webui.reference_report(clean, sr, "one two three four five six seven eight nine "
+                                               "ten eleven twelve thirteen fourteen")
+    check("selected" in report and "Clean background" in report, f"clean clip passes: {report}")
+    check("Starts and ends in a pause" in report, "edges in silence are recognised")
+
+    noisy = clean + (0.05 * rng.standard_normal(clean.size)).astype(np.float32)
+    check("Noisy background" in webui.reference_report(noisy, sr, "x"), "noise is flagged")
+    cut = np.concatenate([body[: sr * 2], gap, body[sr * 2: sr * 4], gap, body[sr * 4:]])
+    check("mid-word" in webui.reference_report(cut, sr, "x", start=4.0),
+          "a selection that cuts speech at both edges is flagged")
+    check("4.00s" in webui.reference_report(cut, sr, "x", start=4.0),
+          "the flagged edge is given in the source's own timeline")
+    hot = np.clip(body * 10, -1, 1)
+    check("Clipped" in webui.reference_report(hot, sr, "x"), "clipping is flagged")
+    check("x-vector only" in webui.reference_report(clean, sr, "", x_vector_only=True),
+          "x-vector mode says the transcript is unused")
+    check("No reference" in webui.reference_report(np.zeros(0, np.float32), sr),
+          "an empty clip explains itself")
+    check("No reference yet" in webui.reference_check(None, ""), "the UI wrapper handles no clip")
+
+
+def test_prepare_reference() -> None:
+    sr = 24000
+    t = np.arange(sr * 4) / sr
+    voice = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    padded = np.concatenate([np.zeros(sr, np.float32), voice, np.zeros(sr, np.float32)]) + 0.1
+    out = webui.prepare_reference(padded, sr)
+    check(abs(float(np.mean(out))) < 0.01, "DC offset removed")
+    check(4.0 <= len(out) / sr <= 4.5, f"long edge silence trimmed, voice kept: {len(out) / sr:.2f}s")
+    check(float(np.max(np.abs(out))) <= 1.0 and np.all(np.isfinite(out)), "finite, in range")
+    quiet = (0.05 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    check(abs(float(np.max(np.abs(webui.prepare_reference(quiet, sr)))) - 0.05) < 0.01,
+          "level is left alone — a quiet reference clones as well as a loud one")
+    short = np.zeros(int(sr * 0.5), np.float32)
+    check(webui.prepare_reference(short, sr).size == short.size,
+          "cleanup that would leave too little gives the input back")
+    check(webui.prepare_reference(np.zeros(0, np.float32), sr).size == 0, "empty passes through")
+
+
+def test_saving_never_overwrites() -> None:
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr * 4)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original_voices, original_media = webui.VOICES_DIR, webui.MEDIA_DIR
+        webui.VOICES_DIR = os.path.join(tmp, "voices")
+        webui.MEDIA_DIR = os.path.join(tmp, "media")
+        try:
+            os.makedirs(webui.MEDIA_DIR)
+            clip = os.path.join(webui.MEDIA_DIR, "ref.wav")
+            sf.write(clip, wav, sr)
+            _, msg = webui.save_clone_voice(webui.SAVE_REFERENCE, "Memo", clip, "hello there", "English", None)
+            check(msg.startswith("Saved"), f"first save works: {msg}")
+            check(webui.voice_exists("memo") and webui.voice_exists(" MEMO "), "the name is now taken")
+            _, msg = webui.save_clone_voice(webui.SAVE_REFERENCE, "memo", clip, "other", "English", None)
+            check("already in the library" in msg, f"a second save under the same name is refused: {msg}")
+            check(webui.list_voices()[0]["text"] == "hello there", "and the original is untouched")
+            _, msg, _ = webui.save_designed_voice("Memo", (sr, wav), "t", "a voice", "English")
+            check("already in the library" in msg, "Design refuses it too")
+
+            take = os.path.join(webui.MEDIA_DIR, "take.wav")
+            sf.write(take, wav, sr)
+            state = {"takes": [{"index": 1, "path": take, "label": "Take #1"}],
+                     "text": "the new line", "language": "English"}
+            _, msg = webui.save_clone_voice("1", "Take one", clip, "hello there", "English", state)
+            check(msg.startswith("Saved take #1"), f"the dispatcher saves a take when asked: {msg}")
+            saved = {v["slug"]: v for v in webui.list_voices()}
+            check(saved["take_one"]["text"] == "the new line",
+                  "a take is saved with the line it was asked to say, not the reference transcript")
+            check(saved["memo"].get("prefer") == "auto", "new voices start on the automatic route")
+            check(not any(f.endswith(".tmp") or ".tmp." in f for f in os.listdir(webui.VOICES_DIR)),
+                  "atomic writes leave no temp files behind")
+        finally:
+            webui.VOICES_DIR, webui.MEDIA_DIR = original_voices, original_media
+
+
+def test_voice_route_and_preference() -> None:
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr * 2)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
+        try:
+            webui.save_voice("Both", wav, sr, "line", "warm and low", "English",
+                             description="warm and low", kind="design")
+            webui.save_voice("Clip only", wav, sr, "line", "", "English")
+            webui.save_voice("Words only", None, 0, "", "airy", "English", description="airy",
+                             kind="design")
+            routes = {r["slug"]: webui.voice_route(r) for r in webui.list_voices()}
+            check(routes == {"both": "design", "clip_only": "clip", "words_only": "design"},
+                  f"auto follows the kind: {routes}")
+
+            webui.set_voice_preference("both", "clip")
+            check(webui.voice_route(webui._find_voice("both")[0]) == "clip",
+                  "a voice with both can be pinned to its clip")
+            check("(" in dict((v, k) for k, v in webui.voice_choices())["both"] and
+                  "described" not in dict((v, k) for k, v in webui.voice_choices())["both"],
+                  "the dropdown label follows the preference")
+            webui.set_voice_preference("words_only", "clip")
+            check(webui.voice_route(webui._find_voice("words_only")[0]) == "design",
+                  "a preference the voice cannot honour falls back instead of failing")
+            msg = webui.save_voice_preference("words_only", "clip")
+            check("still uses the other" in msg, f"and the UI says so: {msg}")
+            try:
+                webui.set_voice_preference("both", "loudly")
+                raise AssertionError("expected ValueError")
+            except ValueError:
+                pass
+
+            rows = webui.voice_table_rows()
+            check(len(rows) == 3 and all(len(r) == len(webui.VOICE_TABLE_HEADERS) for r in rows),
+                  "one table row per voice, one cell per header")
+            words_row = next(r for r in rows if r[1] == "words_only")
+            check(words_row[3] == "—" and words_row[2] == "description", f"no clip shown as such: {words_row}")
+            details, preview, prefer = webui.voice_details("clip_only")
+            check("Clip only" in details and preview is not None and preview[0] == sr,
+                  "details come with a playable preview")
+            check(webui.voice_details("words_only")[1] is None, "a described voice has no preview")
+            check("Pick a voice" in webui.voice_details(None)[0], "nothing selected is explained")
+
+            confirm, msg = webui.ask_delete("both")
+            check(confirm["visible"] and "no undo" in msg, "delete asks first")
+            _, msg, hidden = webui.confirm_delete("both")
+            check("Deleted" in msg and not hidden["visible"] and not webui.voice_exists("both"),
+                  "the second click deletes and hides the confirm button")
+        finally:
+            webui.VOICES_DIR = original
+
+
+def test_load_voice_for_cloning() -> None:
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr * 4)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original_voices, original_media = webui.VOICES_DIR, webui.MEDIA_DIR
+        webui.VOICES_DIR, webui.MEDIA_DIR = os.path.join(tmp, "v"), os.path.join(tmp, "m")
+        try:
+            webui.save_voice("Memo", wav, sr, "hello there", "", "French")
+            out = webui.load_voice_for_cloning("memo")
+            check(len(out) == 9, "import outputs plus transcript and language")
+            state, status, _, start, end, audio, _, text, language = out
+            check(state and os.path.dirname(state["path"]) == os.path.realpath(webui.MEDIA_DIR)
+                  or os.path.dirname(state["path"]) == webui.MEDIA_DIR,
+                  "the clip is copied into the media dir, where the request path guard allows it")
+            check(start["value"] == 0.0 and abs(end["value"] - 4.0) < 0.01,
+                  "the whole clip is selected — its transcript describes all of it")
+            check(text["value"] == "hello there" and language["value"] == "French",
+                  "transcript and language come back with it")
+            check(audio[1].shape[0] == sr * 4, "the reference player gets the clip")
+            webui.save_voice("Ghost", None, 0, "", "x", "English", description="x", kind="design")
+            out = webui.load_voice_for_cloning("ghost")
+            check(out[0] is None and "described voice" in out[1] and len(out) == 9,
+                  "a described voice is refused with the full output tuple")
+            check("no saved voice" in webui.load_voice_for_cloning("nope")[1], "unknown voice")
+        finally:
+            webui.VOICES_DIR, webui.MEDIA_DIR = original_voices, original_media
+
+
+def test_clone_validation_fills_every_output() -> None:
+    """Early exits used to return 2 values to 9 outputs — a red toast, not a message."""
+    for args, needle in (((None, "", "", "Auto", False), "say"),
+                         ((None, "", "hello", "Auto", False), "no reference"),
+                         (((24000, np.ones(48000, np.float32) * 0.1), "", "hello", "Auto", False),
+                          "transcript")):
+        out = webui.generate_voice_clone(*args, 0.9, 1.0, 50, 1.05)
+        check(len(out) == webui.CLONE_OUTPUTS, f"{len(out)} outputs for {needle}")
+        check(needle in out[1].lower(), f"the status explains it: {out[1]}")
+    out = webui.generate_voice_clone((24000, np.ones(48000, np.float32) * 0.1), "hi", "hello",
+                                     "Auto", False, 0.9, 1.0, 50, 1.05, seed="abc")
+    check("Seed must be an integer" in out[1], "a bad seed is explained")
+
+
+def test_clone_prompt_cache_is_bounded_lru() -> None:
+    class FakeTTS:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_voice_clone_prompt(self, **kw):
+            self.calls += 1
+            return [object()]
+
+    tts = FakeTTS()
+    webui._CLONE_PROMPTS.clear()
+    clips = [np.full(100, i / 100.0, np.float32) for i in range(webui.CLONE_CACHE_SIZE + 1)]
+    first = webui._clone_prompt(tts, clips[0], 24000, "a", False)
+    check(webui._clone_prompt(tts, clips[0], 24000, "a", False) is first and tts.calls == 1,
+          "the same reference is encoded once")
+    for clip in clips[1:]:
+        webui._clone_prompt(tts, clip, 24000, "a", False)
+        webui._clone_prompt(tts, clips[0], 24000, "a", False)    # keep the first one hot
+    check(len(webui._CLONE_PROMPTS) == webui.CLONE_CACHE_SIZE, "the cache is bounded")
+    check(webui._clone_prompt(tts, clips[0], 24000, "a", False) is first,
+          "recently used references survive eviction")
+    webui._clone_prompt(tts, clips[0], 24000, "b", False)
+    check(tts.calls == webui.CLONE_CACHE_SIZE + 2, "a different transcript is a different prompt")
+    webui._CLONE_PROMPTS.clear()
+
+
+def test_transcribe_reference_sets_the_language() -> None:
+    class FakeASR:
+        enabled = True
+
+        def transcribe_detailed(self, wav, sr, language=None):
+            return {"text": "bonjour à tous", "confidence": -0.2, "code": "fr", "language": "French"}
+
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr * 4)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original_media, original_asr = webui.MEDIA_DIR, webui.ASR
+        webui.MEDIA_DIR, webui.ASR = tmp, FakeASR()
+        try:
+            path = os.path.join(tmp, "r.wav")
+            sf.write(path, wav, sr)
+            state = {"path": path}
+            text, status, language = webui.transcribe_reference(state, 0, 4, "Auto", "Auto")
+            check(text["value"] == "bonjour à tous", "the transcript fills the box")
+            check(language.get("value") == "French" and "French" in status,
+                  "an Auto target language is set to what Whisper heard")
+            _, _, language = webui.transcribe_reference(state, 0, 4, "Auto", "English")
+            check("value" not in language, "a language the user chose is left alone")
+            webui.ASR = webui.Transcriber(model_id="none")
+            _, status, _ = webui.transcribe_reference(state, 0, 4, "Auto", "Auto")
+            check("disabled" in status, "disabled ASR is explained")
+        finally:
+            webui.MEDIA_DIR, webui.ASR = original_media, original_asr
+
+
+def test_runtime_status_lives_in_the_sidebar() -> None:
+    import inspect
+
+    check("HUB.status()" not in inspect.getsource(webui._ok),
+          "generation statuses no longer carry the runtime line")
+    original = webui.HUB
+    try:
+        webui.HUB = types.SimpleNamespace(status=lambda: "GPU: a | RAM: b | on GPU: -")
+        check(webui.refresh_status() == "- GPU: a\n- RAM: b\n- on GPU: -", "one bullet per item")
+        webui.HUB = None
+        check("not loaded" in webui.refresh_status(), "before the hub exists")
+    finally:
+        webui.HUB = original
+    source = inspect.getsource(webui.build_ui)
+    check("gr.Sidebar(" in source and "gr.Timer(" in source, "a sidebar panel that refreshes itself")
+    check("theme=" not in source.split("gr.Blocks(")[1].split(")")[0],
+          "the theme goes to launch() in Gradio 6, not Blocks()")
 
 
 if __name__ == "__main__":

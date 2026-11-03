@@ -23,6 +23,7 @@ The frozen clip is there for the Clone tab and for anyone who prefers the steadi
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 
@@ -62,15 +63,25 @@ def main(argv=None) -> int:
 
     wav, sr = None, 0
     if not args.no_clip:
-        hub = webui.ModelHub(webui.MODELS_DIR, torch.bfloat16, "sdpa", 1, 2)
-        webui.HUB = hub
-        torch.manual_seed(args.seed)
-        with hub.lock:
-            tts = hub.acquire("voice_design")
-            wavs, rate = tts.generate_voice_design(
-                text=args.line, language=args.language, instruct=description,
-                max_new_tokens=webui._budget(args.line),
-                **webui._sampling(0.9, 1.0, 50, 1.05))
+        # Loading a checkpoint while the web UI (or the smoke test) also holds one is how
+        # this machine was hard-locked once; take the same single-owner lock they do.
+        owner = contextlib.ExitStack()
+        try:
+            owner.enter_context(webui.exclusive_owner("make_voice"))
+        except RuntimeError as e:
+            print(f"error: {e}\n(or pass --no-clip to save the description without a GPU)",
+                  file=sys.stderr)
+            return 2
+        with owner:
+            hub = webui.ModelHub(webui.MODELS_DIR, torch.bfloat16, "sdpa", 1, 1)
+            webui.HUB = hub
+            torch.manual_seed(args.seed)
+            with hub.lock:
+                tts = hub.acquire("voice_design")
+                wavs, rate = tts.generate_voice_design(
+                    text=args.line, language=args.language, instruct=description,
+                    max_new_tokens=webui._budget(args.line),
+                    **webui._sampling(0.9, 1.0, 50, 1.05))
         wav = np.asarray(wavs[0], dtype=np.float32).reshape(-1)
         sr = int(rate)
         print(f"rendered {len(wav) / sr:.1f}s of {args.name} at {sr}Hz")
