@@ -145,7 +145,8 @@ def exclusive_owner(who: str) -> Iterator[None]:
         handle.close()
         raise RuntimeError(
             f"Another Qwen3-TTS process is already holding the weights: {holder}. "
-            f"Two at once means another ~4.3GB copy of the checkpoints in RAM, which on WSL2 "
+            f"A second one can add ~9GB or more of RAM (up to two ~4.3GB checkpoints plus "
+            f"Whisper), which on WSL2 "
             f"can hard-lock the machine. Stop it first (pgrep -af 'webui/app[.]py|smoke_test')."
         )
     handle.seek(0)

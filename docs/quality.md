@@ -134,7 +134,8 @@ the fix, on the GPU box:
 
 Clean speech sits at −0.02 to −0.06, exactly the "near zero" the fix predicted, and a real
 Japanese take sits at −0.51 — below clean English, nowhere near a disaster. `CONF_GOOD = −1.00`
-sits clear of every real measurement while staying far above what silence reads, so it is kept;
+sits clear of every real measurement, so it is kept (silence was not re-measured on the new
+scale, so how far below −1 it lands is not yet known);
 it is no longer provisional, though it is calibrated from a handful of takes rather than a
 sweep. The confidence term is still a disaster detector, not a quality meter: #1 and #3 were
 identical to two decimal places and the ranking still came from defects and SIM.

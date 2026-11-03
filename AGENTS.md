@@ -189,10 +189,11 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
     Now `_text_ids` uses `add_special_tokens=False` and `_prefix_ids` builds
     `<|startoftranscript|><|lang|><|transcribe|><|notimestamps|>` explicitly, with the
     language Whisper detected. `test_whisper_confidence_scores_only_the_words` pins it.
-  * **`CONF_GOOD` is therefore provisional (-1.00, was -2.60).** The old number and every
-    confidence figure recorded before 2026-11-03 belong to the buggy scale. Re-calibrate from
-    the per-take lines `smoke_test.py --only best_of_n` now prints; clean takes should sit
-    near zero and pure silence far below -1. Do not reuse the old -1.9/-6.3 figures.
+  * **`CONF_GOOD` is -1.00 (was -2.60), measured on the corrected scale**: clean takes read
+    -0.02 to -0.06, a real Japanese take -0.51 (`docs/quality.md`). Silence has not been
+    re-measured on this scale. Every confidence figure recorded before 2026-11-03 belongs to
+    the buggy scale — do not reuse the old -1.9/-6.3 figures. To re-check, read the per-take
+    lines `smoke_test.py --only best_of_n` prints.
   * **Score the text we asked for** (`Transcriber.assess`), never Whisper's own transcript:
     on a noise-degraded take, grading the returned transcript missed it, grading the
     intended text caught it. Whisper is confident about whatever it decided to hear.

@@ -79,7 +79,8 @@ messy long upload (cleanup is measured; *which window* gets picked is not).
   falls back silently when it is missing — so without this, a venv that lost librosa would drop
   the filter with no message.
 - The single-owner lock's error still said "two copies of ~13GB" from the three-checkpoint era;
-  it now says what a second copy actually costs (~4.3GB).
+  it now says what a second process can actually cost: up to two ~4.3GB checkpoints plus
+  Whisper, ~9GB or more (`--max-cpu-resident` defaults to 2).
 
 ## [Unreleased] — CustomVoice removed; voices can ship as descriptions
 
