@@ -30,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 45 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 49 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 45 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 49 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 45/45 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 49/49 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,14 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **A preferred take can be kept as a voice** (`save_generated_voice`). The library used to
+  hold only *references*, so the take you actually liked could only leave the browser as a
+  download. Each candidate is written to `tmp/media/` at generation time and its **path**
+  travels through `gr.State` (`build_take_state`) — never a module-level "last generation"
+  global, which is the bug class that once let one LAN user's Save persist another's clip.
+  The saved copy is the **raw 24kHz decode**, not the post-processed listening copy: a saved
+  voice is usually a future clone reference, and a reference is better straight from the
+  model than through an EQ curve. Files fall under `MEDIA_TTL_SECONDS` pruning.
 - **Candidate ranking is a penalty, calibrated by measurement, not by taste**
   (`candidate_penalty`). WER ×2.0 dominates; Whisper decoder confidence ×0.4 but only below
   `CONF_GOOD = -2.60`; waveform defects capped at 0.3; SIM is a tie-break only. Three things

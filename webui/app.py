@@ -1490,6 +1490,76 @@ def save_reference_voice(name: str, audio: Any, ref_text: str, language: str) ->
     )
 
 
+def build_take_state(results: List[Dict[str, Any]], best_index: int,
+                     paths: List[Optional[str]], text: str, language: Any) -> Dict[str, Any]:
+    """JSON-safe record of what was just generated, for the 'keep this take' button.
+
+    Paths, never arrays: `gr.State` round-trips through the browser, so anything here has
+    to survive JSON. The labels are kept alongside so the picker can show the same numbers
+    the players do.
+    """
+    takes = [{"index": item["index"], "path": path,
+              "label": take_label(item["index"], item.get("wer"), item.get("sim"),
+                                  item["index"] == best_index, item.get("confidence"),
+                                  item.get("defects")),
+              "kept": item["index"] == best_index}
+             for item, path in zip(results, paths)]
+    return {"takes": takes, "text": (text or "").strip(), "language": str(language or "Auto")}
+
+
+def _write_take(wav: np.ndarray, sr: int) -> str:
+    """Persist one candidate so a later Save click can name it.
+
+    The path travels through `gr.State`, never a module-level 'last generation' global:
+    that global is what once let one LAN user's Save button persist another's clip. Raw
+    model decode, not the post-processed listening copy — a saved voice is usually a future
+    clone reference, and a reference is better coming straight from the model than through
+    an EQ curve. Pruned by MEDIA_TTL_SECONDS like every other clip under tmp/media/.
+    """
+    prune_media()
+    path = os.path.join(media_dir(), f"{uuid.uuid4().hex}.wav")
+    sf.write(path, wav, sr)
+    return path
+
+
+def save_generated_voice(state: Any, selection: Any, name: str) -> Tuple[Any, str, Any]:
+    """Save one of the candidate takes from the last generation into the voice library.
+
+    The library used to hold only *references* — the clip a voice was taken from — so the
+    take you actually preferred could only leave the browser as a download, and turning it
+    into a reusable voice meant uploading it back and transcribing it. The selection comes
+    in as an input (which take), and the audio comes from the state this request produced.
+    """
+    if not (name or "").strip():
+        return gr.update(), "Error: give the voice a name first.", gr.update()
+    if not isinstance(state, dict) or not state.get("takes"):
+        return gr.update(), "Nothing to save yet — press ‘Clone & generate’ first.", gr.update()
+    takes = state["takes"]
+    wanted = str(selection).strip() if selection is not None else ""
+    chosen = next((t for t in takes if str(t.get("index")) == wanted), None)
+    if chosen is None and len(takes) == 1:
+        chosen = takes[0]          # one candidate: nothing to choose, so take it
+    if chosen is None:
+        return (gr.update(),
+                "Error: pick which take to keep (the radio under the take players).",
+                gr.update())
+    try:
+        path = resolve_input_path(chosen.get("path"))
+        wav, sr = sf.read(path, dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        record = save_voice(name=name, wav=wav, sr=sr, text=str(state.get("text") or "").strip(),
+                            instruct="", language=str(state.get("language") or "Auto"))
+    except (MediaError, OSError, ValueError) as e:
+        return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
+    return (
+        gr.update(),
+        f"Saved take #{chosen['index']} as ‘{record['name']}’ ({record['seconds']}s) — "
+        f"the model's own decode, not the post-processed copy. Pick it under Saved voices.",
+        gr.update(choices=voice_choices(), value=record["slug"]),
+    )
+
+
 def load_saved_voice(slug: str) -> Tuple[Any, Any, str]:
     """Fill the Voice Clone reference fields from a saved voice."""
     if not slug:
@@ -1658,8 +1728,14 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         out_wav, out_sr = postprocess_output(chosen["wav"], chosen["sr"], postproc)
         # Hand back every take, not just the winner: the auto-pick is a first opinion, and
         # the only honest way to let someone overrule it is to let them hear the alternatives.
+        # Each one is also written to disk so 'keep this take' can name it later.
         takes: List[Any] = []
+        paths: List[Optional[str]] = []
         for item in results:
+            try:
+                paths.append(_write_take(item["wav"], item["sr"]))
+            except (OSError, ValueError):  # noqa: BLE001 - disk trouble must not lose the audio
+                paths.append(None)
             if n > 1:
                 take_wav, take_sr = postprocess_output(item["wav"], item["sr"], postproc)
                 takes.append(gr.update(value=(take_sr, take_wav), visible=True,
@@ -1670,8 +1746,16 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 takes.append(gr.update(value=None, visible=False))
         while len(takes) < MAX_CANDIDATES:
             takes.append(gr.update(value=None, visible=False))
+        take_state = build_take_state(results, results[best]["index"], paths, target_text, language)
+        pick_choices = [(t["label"], str(t["index"])) for t in take_state["takes"] if t["path"]]
+        pick_update = gr.update(choices=pick_choices,
+                                value=str(results[best]["index"]) if pick_choices else None,
+                                visible=n > 1 and len(pick_choices) > 1)
+        pick_update = gr.update(choices=pick_choices,
+                                value=str(results[best]["index"]) if pick_choices else None,
+                                visible=n > 1 and len(pick_choices) > 1)
         return _ok((out_sr, out_wav), status + _post_note(postproc)) + tuple(takes) + (
-            gr.update(visible=n > 1),)
+            gr.update(visible=n > 1), take_state, pick_update)
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}"
 
@@ -1942,7 +2026,8 @@ after a model switch pays a few seconds of load time.
                           "defects (speaking rate, edge silence, clipping). Every take is left "
                           "below with its numbers, and each has its own download icon — the "
                           "scorer is a first opinion, not a gate. Trust your ears when the "
-                          "numbers look like a tie.")
+                          "numbers look like a tie — and to keep one, name it under **3 · Keep "
+                          "it** and press Save selected take.")
 
                 gr.Markdown("#### 3 · Keep it — the voice library")
                 gr.Markdown(
@@ -1956,6 +2041,20 @@ after a model switch pays a few seconds of load time.
                         info="Writes voices/<name>.wav + .json on this machine.")
                     cl_save_btn = gr.Button("Save to voice library", size="sm", scale=1)
                 cl_save_status = gr.Textbox(label="Save status", lines=1, interactive=False)
+
+                cl_take_state = gr.State(value=None)
+                with gr.Row():
+                    cl_take_name = gr.Textbox(
+                        label="…or keep a generated take as a voice (name)", scale=3,
+                        placeholder="e.g. fox take #4",
+                        info="Stores the model's own decode of that take — not the post-processed "
+                             "listening copy — with the line it was asked to say as its transcript, "
+                             "so it can be cloned from later without re-uploading.")
+                    cl_take_save_btn = gr.Button("Save selected take", size="sm", scale=1)
+                cl_take_pick = gr.Radio(label="Which take to keep", choices=[], value=None,
+                                        visible=False)
+                cl_take_status = gr.Textbox(label="Take status", lines=1, interactive=False)
+
                 with gr.Row():
                     cl_voice = gr.Dropdown(label="Saved voices (designed or saved from a clip)",
                                            choices=voice_choices(),
@@ -1970,7 +2069,10 @@ after a model switch pays a few seconds of load time.
                              inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling
                                     + output_options + [cl_candidates, cl_seed],
                              outputs=[cl_audio, cl_status, cl_take_1, cl_take_2, cl_take_3, cl_take_4,
-                                      cl_takes_note])
+                                      cl_takes_note, cl_take_state, cl_take_pick])
+                cl_take_save_btn.click(save_generated_voice,
+                                       inputs=[cl_take_state, cl_take_pick, cl_take_name],
+                                       outputs=[cl_take_name, cl_take_status, cl_voice])
 
                 # Transcript/clip fit is a live, non-blocking check: a transcript that does not
                 # match the selection is the worst clone failure mode we measured, and it is

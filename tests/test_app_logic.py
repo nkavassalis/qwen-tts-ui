@@ -1361,6 +1361,107 @@ def test_mean_token_logprob_alignment() -> None:
           "offset plus tokens running past the end is refused, not silently truncated")
 
 
+def test_build_take_state_is_json_safe_and_names_the_winner() -> None:
+    """gr.State round-trips through the browser, so the take record must be plain JSON."""
+    import json
+
+    results = [
+        {"index": 1, "wer": 0.0, "sim": 0.988, "confidence": -2.01,
+         "defects": {"penalty": 0.12, "rate_ratio": 1.3, "lead_silence": 0.9, "tail_silence": 0.0,
+                     "clipped_fraction": 0.0}},
+        {"index": 2, "wer": 0.0, "sim": 0.985, "confidence": -2.09,
+         "defects": {"penalty": 0.0, "rate_ratio": 1.2, "lead_silence": 0.1, "tail_silence": 0.0,
+                     "clipped_fraction": 0.0}},
+    ]
+    state = webui.build_take_state(results, 2, ["/tmp/a.wav", None], "  Say this.  ", "English")
+    json.dumps(state)                       # raises on anything non-serialisable
+    check([t["index"] for t in state["takes"]] == [1, 2], "one entry per candidate, in order")
+    check([t["path"] for t in state["takes"]] == ["/tmp/a.wav", None],
+          "paths are carried through, including the None from a failed write")
+    check([t["kept"] for t in state["takes"]] == [False, True], "the auto-pick is flagged")
+    check("silence" in state["takes"][0]["label"], "labels keep the same numbers the players show")
+    check(state["text"] == "Say this.", "the line it was asked to say is the transcript")
+    check(state["language"] == "English", "language travels with it")
+    check(webui.build_take_state([], 0, [], "x", None)["language"] == "Auto",
+          "no language means Auto, not None")
+
+
+def test_save_generated_voice_needs_a_name_and_a_generation() -> None:
+    _, status, _ = webui.save_generated_voice({"takes": [{"index": 1, "path": "/x"}],
+                                               "text": "hi", "language": "Auto"}, "1", "  ")
+    check("name" in status.lower(), f"an empty name is refused: {status}")
+    _, status, _ = webui.save_generated_voice(None, "1", "someone")
+    check("generate" in status.lower(), f"no generation yet is explained, not crashed: {status}")
+    _, status, _ = webui.save_generated_voice({"takes": [{"index": 1, "path": "/x"},
+                                                         {"index": 2, "path": "/y"}],
+                                               "text": "hi", "language": "Auto"}, None, "someone")
+    check("pick" in status.lower(), f"an ambiguous selection asks instead of guessing: {status}")
+
+
+def test_save_generated_voice_saves_the_chosen_take() -> None:
+    """The take you preferred becomes a reusable voice, with the line it spoke as transcript."""
+    sr = 24000
+    wav = (0.3 * np.sin(2 * np.pi * 160 * np.arange(sr * 3) / sr)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as media, tempfile.TemporaryDirectory() as voices:
+        original_media, original_voices = webui.MEDIA_DIR, webui.VOICES_DIR
+        webui.MEDIA_DIR, webui.VOICES_DIR = media, voices
+        try:
+            keep = os.path.join(media, "keep.wav")
+            other = os.path.join(media, "other.wav")
+            sf.write(keep, wav, sr)
+            sf.write(other, wav[:sr], sr)
+            state = {"takes": [{"index": 1, "path": keep, "label": "Take #1", "kept": False},
+                               {"index": 2, "path": other, "label": "Take #2", "kept": True}],
+                     "text": "Picking the best of several takes should never pick a worse one.",
+                     "language": "English"}
+            _, status, dropdown = webui.save_generated_voice(state, "1", "fox take one")
+            check("Saved take #1" in status, f"names the take it kept: {status}")
+            check("model's own decode" in status,
+                  "says it stored the raw decode, not the post-processed copy")
+            saved = webui.list_voices()
+            check(len(saved) == 1 and saved[0]["name"] == "fox take one", f"in the library: {saved}")
+            check(saved[0]["text"].startswith("Picking the best"),
+                  f"transcript is the line it was asked to say: {saved[0]['text']}")
+            check(saved[0]["language"] == "English" and 2.5 < saved[0]["seconds"] < 3.5,
+                  f"metadata is right: {saved[0]}")
+            check(os.path.exists(saved[0]["wav"]), "the wav is on disk")
+            reloaded, rate = sf.read(saved[0]["wav"], dtype="float32")
+            check(rate == sr and len(reloaded) == len(wav), "and it is the chosen take, not the other")
+            check(dropdown.get("value") == saved[0]["slug"], "the dropdown lands on the new voice")
+
+            # A single candidate has nothing to choose, so the selection may be blank.
+            single = {"takes": [{"index": 1, "path": keep, "label": "Take #1", "kept": True}],
+                      "text": "One take.", "language": "Auto"}
+            _, status, _ = webui.save_generated_voice(single, None, "solo take")
+            check("Saved take #1" in status, f"one candidate needs no selection: {status}")
+
+            # A state forged by a client must not read arbitrary files.
+            forged = {"takes": [{"index": 1, "path": "/etc/passwd", "label": "x", "kept": True}],
+                      "text": "x", "language": "Auto"}
+            _, status, _ = webui.save_generated_voice(forged, "1", "sneaky")
+            check(status.startswith("Error"), f"a path outside the upload dirs is refused: {status}")
+            check(not os.path.exists(os.path.join(voices, "sneaky.wav")), "and nothing was written")
+        finally:
+            webui.MEDIA_DIR, webui.VOICES_DIR = original_media, original_voices
+
+
+def test_take_picker_is_wired() -> None:
+    """The picker and its button have to be connected, or 'keep this take' is decoration."""
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+    check("cl_take_state = gr.State(value=None)" in source,
+          "the take paths travel through gr.State, not a module global")
+    check("cl_take_pick = gr.Radio" in source, "there is a take picker")
+    check("cl_take_save_btn = gr.Button" in source, "and a button to keep the chosen one")
+    check("cl_take_state, cl_take_pick" in source,
+          "the button takes the state and the selection as inputs")
+    check("cl_takes_note, cl_take_state, cl_take_pick]" in source,
+          "generation populates the players, the note, the state and the picker")
+    check("inputs=[cl_take_state, cl_take_pick, cl_take_name]" in source,
+          "saving reads the selection from the page, not from server-side memory")
+
+
 def test_candidate_players_are_wired() -> None:
     """Every take must reach the page — otherwise 'best of N' is a black box."""
     import inspect

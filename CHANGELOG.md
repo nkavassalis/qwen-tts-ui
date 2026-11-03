@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — keep the take you preferred, not just the one the scorer picked
+
+The voice library held only *references* — the clip a voice was taken from. So the take you
+actually preferred, once you had listened to all four, had exactly one way out: the browser
+download icon. Turning it into a reusable voice meant uploading it back, re-trimming it and
+transcribing it.
+
+- Each candidate is now written to `tmp/media/` at generation time; its **path** travels
+  through `gr.State` (`build_take_state`), never a module-level "last generation" global —
+  that global is the bug class that once let one LAN user's Save button persist another
+  person's clip. Files are covered by the existing `MEDIA_TTL_SECONDS` prune.
+- Step 3 gains *Which take to keep* (a radio carrying the same score labels as the players,
+  defaulting to the auto-pick) and **Save selected take**, which writes
+  `voices/<slug>.wav` + `.json` with the requested line as the transcript.
+- The saved copy is the **raw 24kHz model decode**, not the 48kHz post-processed listening
+  copy: a saved voice is usually a future clone reference, and a reference is better coming
+  straight from the model than through an EQ curve. Asserted in the GPU tier.
+- A forged state payload is still confined: the path goes through `resolve_input_path`, so a
+  client cannot point the Save button at `/etc/passwd`.
+- Tests: CPU tier 45 -> 49 (state is JSON-safe and flags the winner, name/selection/empty
+  validation, real save round-trip incl. transcript and refusal of an out-of-tree path,
+  picker wiring). The GPU tier now saves a non-preferred take end-to-end and checks the
+  stored wav is 24kHz — 7/7.
+
 ## 2026-11-03 — candidate scoring gets two more signals, both calibrated by measurement
 
 WER alone was a weak judge: a hard 0/1 per word, blind to a take that is half dead air and

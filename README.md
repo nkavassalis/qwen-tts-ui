@@ -62,12 +62,17 @@ The tab is three numbered steps, top to bottom, and they are the whole workflow.
 
 **3 · Keep it**
 
-6. Two different things to keep, two different controls:
-   - the **audio**: the download icon on its player. Files under `/tmp/gradio/` are
+6. Three different things you might mean by "keep", three different controls:
+   - the **audio file**: the download icon on its player. Files under `/tmp/gradio/` are
      ephemeral, so download rather than pathing to them.
-   - the **voice**: name it and press **Save to voice library** → `voices/<slug>.wav` +
-     `.json`, listed in *Saved voices* on every later run. **Load** restores clip +
-     transcript; **Delete** removes both files.
+   - the **reference voice** you built: name it and press **Save to voice library** →
+     `voices/<slug>.wav` + `.json`, listed in *Saved voices* on every later run. **Load**
+     restores clip + transcript; **Delete** removes both files.
+   - a **generated take you preferred**: pick it under *Which take to keep* (defaults to the
+     auto-pick), name it, press **Save selected take**. It stores the model's own decode —
+     not the post-processed listening copy — with the line it was asked to say as its
+     transcript, so you can clone from it later without re-uploading. This is how you
+     overrule the scorer and still keep the result as a reusable voice.
 
 #### Auditioning candidates
 
@@ -146,7 +151,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (45 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (49 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -232,7 +237,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 45 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 49 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

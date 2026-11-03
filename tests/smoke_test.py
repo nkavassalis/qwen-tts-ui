@@ -15,10 +15,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from typing import List, Tuple
@@ -254,13 +256,17 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
     webui.ASR = webui.Transcriber()
 
     def clone(*args, **kwargs):
-        """The callback returns (audio, status, take1..4, takes_note); most checks want two."""
+        """The callback returns (audio, status, take1..4, note, take_state, take_picker).
+
+        Most checks want the first two; the take record is handed back whole so the
+        'keep this take' path is exercised on real audio rather than a fixture.
+        """
         result = webui.generate_voice_clone(*args, **kwargs)
-        return result[0], result[1], list(result[2:6]), result[6]
+        return result[0], result[1], list(result[2:6]), result[6], result
 
     try:
         t0 = time.time()
-        audio, status, takes, takes_note = clone(
+        audio, status, takes, takes_note, full = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=3, seed=cfg["seed"])
         took = time.time() - t0
@@ -283,13 +289,51 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
             f"the auto-picked take must be marked: {[t.get('label') for t in visible]}"
         assert all(t.get("value") is not None for t in visible), "each take carries audio"
         assert takes_note.get("visible") is True, "the explanation should show when there are takes"
-        _, _, single_takes, single_note = clone((ref_sr, ref_wav), cfg["ref_text"], cfg["text"],
+
+        # 'Keep this take' runs on the real thing: the state must be JSON (it round-trips
+        # through the browser), the files must exist, and saving one must produce a voice
+        # whose transcript is the line it was asked to speak.
+        state, pick = full[7], full[8]
+        json.dumps(state)
+        assert len(state["takes"]) == 3, f"one record per candidate: {state['takes']}"
+        assert all(t["path"] and os.path.exists(t["path"]) for t in state["takes"]), \
+            f"every take must be on disk to be kept later: {state['takes']}"
+        assert sum(1 for t in state["takes"] if t["kept"]) == 1, "exactly one auto-pick"
+        assert state["text"] == cfg["text"], "the transcript is the requested line"
+        assert pick.get("visible") is True and len(pick["choices"]) == 3, \
+            f"the picker offers every take: {pick}"
+        assert pick["value"] == str(next(t["index"] for t in state["takes"] if t["kept"])), \
+            f"the picker defaults to the auto-pick: {pick['value']}"
+
+        loser = str(next(t["index"] for t in state["takes"] if not t["kept"]))
+        with tempfile.TemporaryDirectory() as vdir:
+            original_voices, webui.VOICES_DIR = webui.VOICES_DIR, vdir
+            try:
+                _, saved_msg, saved_dropdown = webui.save_generated_voice(state, loser, "smoke take")
+                assert saved_msg.startswith("Saved take #"), f"saving a take failed: {saved_msg}"
+                meta_path = os.path.join(vdir, "smoke_take.json")
+                assert os.path.exists(os.path.join(vdir, "smoke_take.wav")), "no wav written"
+                with open(meta_path, encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                assert meta["text"] == cfg["text"], f"wrong transcript: {meta}"
+                assert 1.0 < meta["seconds"] < 20.0, f"implausible length saved: {meta}"
+                assert saved_dropdown.get("value") == "smoke_take", \
+                    f"the library dropdown should land on the new voice: {saved_dropdown}"
+                # The saved copy is the model's own decode, so the vocoder's rate survives.
+                saved_wav, saved_sr = sf.read(os.path.join(vdir, "smoke_take.wav"), dtype="float32")
+                assert saved_sr == 24000, \
+                    f"a saved voice should be the raw 24kHz decode, not the 48kHz copy: {saved_sr}"
+                print(f"  [best_of_n] kept take #{loser} as a voice "
+                      f"({meta['seconds']}s @ {saved_sr}Hz) — overruling the auto-pick")
+            finally:
+                webui.VOICES_DIR = original_voices
+        _, _, single_takes, single_note, _ = clone((ref_sr, ref_wav), cfg["ref_text"], cfg["text"],
                                                 "English", False, 0.9, 1.0, 50, 1.05,
                                                 candidates=1, seed=cfg["seed"])
         assert not any(isinstance(t, dict) and t.get("visible") for t in single_takes), \
             "a single candidate must not leave four empty players on screen"
         assert single_note.get("visible") is False, "and no explanation row either"
-        raw_pair, _, _, _ = clone(
+        raw_pair, _, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, postproc="off", candidates=1, seed=cfg["seed"])
         raw_sr, raw = raw_pair
@@ -302,10 +346,10 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         check_audio(path, wav, sr)
 
         # The seed field promises reproducibility; two identical calls must agree bitwise.
-        first, _, _, _ = clone(
+        first, _, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=99)
-        second, _, _, _ = clone(
+        second, _, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=99)
         assert first[1].shape == second[1].shape, "same seed changed the clip length"
@@ -315,12 +359,12 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         # The fit guard is a plausibility check on words-per-second, so it catches the
         # failure that was actually measured (transcript of the whole upload, or a stub left
         # in) — not a same-length text with the wrong words. Assert exactly that.
-        _, too_short, _, _ = clone(
+        _, too_short, _, _, _ = clone(
             (ref_sr, ref_wav), "No.", cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=5)
         assert "WARNING" in too_short and "too short" in too_short, \
             f"a one-word transcript for a multi-second clip was not flagged:\n{too_short}"
-        _, too_long, _, _ = clone(
+        _, too_long, _, _, _ = clone(
             (ref_sr, ref_wav), " ".join(["padding"] * 160), cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=5)
         assert "too long" in too_long, \
