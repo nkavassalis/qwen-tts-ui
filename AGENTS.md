@@ -32,8 +32,8 @@ scripts/say.py             CLI over the assistant API: /speak + /voices_availabl
                            through paplay/ffplay/aplay/afplay
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 65 checks, no weights, ~10s with deps installed
-tests/smoke_test.py      GPU tier: 9 end-to-end flows, writes tests/output/*.wav
+tests/test_app_logic.py  CPU tier: 68 checks, no weights, ~10s with deps installed
+tests/smoke_test.py      GPU tier: 10 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
 CHANGELOG.md           one entry per change, newest first
@@ -60,12 +60,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 65 checks, ~10s
-.venv/bin/python tests/smoke_test.py       # GPU tier — 9 flows, ~90s, needs weights
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 68 checks, ~10s
+.venv/bin/python tests/smoke_test.py       # GPU tier — 10 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 65/65 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 68/68 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -98,6 +98,19 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **The chat tab streams *sentences*, not samples — and says so.** There is no partial-audio
+  API upstream; `non_streaming_mode` in the model code is about text going in, not audio coming
+  out. `chat_say` is a **generator** over `iter_chunked` that yields each piece as it is
+  generated into an `autoplay=True` player. Measured: first audio 12.6s into a 30.2s reply.
+  Two invariants that only bite in production, both tested: the hub lock is taken **per chunk
+  inside `one()`**, never across a `yield` (a client that walks away mid-reply closes the
+  generator, and a lock held across yields could strand the whole app); and each yield hands
+  out a **copy** of the message list, because yielding one mutated list makes every update
+  show the final state.
+- **`generate_chunked` is a thin consumer of `iter_chunked`** so the chat tab and the three
+  tabs cannot drift into two different chunkers. A single-chunk reply returns the model's own
+  decode **without** edge trimming — trimming is for joins, and trimming a one-shot answer
+  would silently shave the model's own silence handling.
 - **The assistant API takes a voice *name*, never a path** (`speak` + `scripts/say.py`). The
   reference clip and its transcript are read from `voices/<slug>.json` server-side by
   `_resolve_voice`, which slugs the name to `[a-z0-9_]` before touching the filesystem — so
@@ -335,7 +348,9 @@ tier the hardening pass could not execute:
 
 Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunking:
 
-- **CPU tier 65/65**, **GPU tier 9/9** (adds `long_text`, `speak_api`).
+- **CPU tier 68/68**, **GPU tier 10/10** (adds `long_text`, `speak_api`, `chat_stream`).
+- **Chat streaming measured**: 60-word reply → **first audio at 12.6s**, whole reply 30.2s, 3
+  pieces, 17.0s of speech, log text identical to the input.
 - **Assistant API verified live**: `scripts/say.py --list` and a real `/speak` call over HTTP
   returned 3.68s @ 48kHz, peak 0.9999 with `clipped_fraction` 5.7e-6 (one sample in 176k — a
   graze, not clipping), RMS 0.144, no defect flags.

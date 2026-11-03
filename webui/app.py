@@ -812,6 +812,37 @@ def stitch_clips(clips: List[np.ndarray], sr: int,
     return out.astype(np.float32)
 
 
+def iter_chunked(text: str, language: Optional[str], generate_one: Any,
+                 progress: Any = None):
+    """Yield one dict per spoken piece: index, total, text, wav, sr, rerolled.
+
+    A generator rather than a loop that returns a finished clip, because the chat tab wants
+    to hand you each piece the moment it exists — the model cannot stream samples, but it can
+    stream sentences, and the first one lands in ~6-9s instead of after the whole reply.
+    """
+    chunks = split_for_tts((text or "").strip(), language)
+    total = len(chunks)
+    for index, chunk in enumerate(chunks):
+        if progress is not None:
+            try:
+                progress((index + 1) / (total + 1.0), desc=f"Chunk {index + 1} of {total}")
+            except Exception:  # noqa: BLE001 - a progress bar is never a reason to fail
+                pass
+        wav, sr = generate_one(chunk)
+        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+        sr = int(sr)
+        rerolled = False
+        report = defect_report(wav, sr, chunk)
+        if any(flag.startswith("rate") for flag in defect_flags(report)):
+            retry, retry_sr = generate_one(chunk)
+            retry = np.asarray(retry, dtype=np.float32).reshape(-1)
+            second = defect_report(retry, retry_sr, chunk)
+            if abs(second["rate_ratio"] - 1.0) < abs(report["rate_ratio"] - 1.0):
+                wav, sr, rerolled = retry, int(retry_sr), True
+        yield {"index": index, "total": total, "text": chunk, "wav": wav, "sr": sr,
+               "rerolled": rerolled}
+
+
 def generate_chunked(text: str, language: Optional[str], generate_one: Any,
                      progress: Any = None) -> Tuple[np.ndarray, int, List[str]]:
     """Synthesise `text`, in pieces when it is long enough to rush.
@@ -821,37 +852,22 @@ def generate_chunked(text: str, language: Optional[str], generate_one: Any,
     out of band is re-rolled once — that is the failure this whole path exists to avoid, and
     one retry costs ~10s against re-running the whole document.
     """
-    text = (text or "").strip()
-    chunks = split_for_tts(text, language)
-    notes: List[str] = []
-    if len(chunks) <= 1:
-        wav, sr = generate_one(text)
-        return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr), notes
-
     pieces: List[np.ndarray] = []
     seconds: List[str] = []
+    notes: List[str] = []
     sr = REF_SAMPLE_RATE
-    for index, chunk in enumerate(chunks):
-        if progress is not None:
-            try:
-                progress((index + 1) / (len(chunks) + 1.0),
-                         desc=f"Chunk {index + 1} of {len(chunks)}")
-            except Exception:  # noqa: BLE001 - a progress bar is never a reason to fail
-                pass
-        wav, sr = generate_one(chunk)
-        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
-        report = defect_report(wav, sr, chunk)
-        if any(flag.startswith("rate") for flag in defect_flags(report)):
-            retry, retry_sr = generate_one(chunk)
-            retry = np.asarray(retry, dtype=np.float32).reshape(-1)
-            second = defect_report(retry, retry_sr, chunk)
-            if abs(second["rate_ratio"] - 1.0) < abs(report["rate_ratio"] - 1.0):
-                wav, sr, report = retry, retry_sr, second
-                notes.append(f"chunk {index + 1} re-rolled to {report['rate_ratio']:.2f}x speed")
-        pieces.append(wav)
-        seconds.append(f"{len(wav) / sr:.1f}")
+    for piece in iter_chunked(text, language, generate_one, progress):
+        sr = piece["sr"]
+        if piece["rerolled"]:
+            notes.append(f"chunk {piece['index'] + 1} re-rolled to hold a natural pace")
+        if piece["total"] == 1:
+            return piece["wav"], sr, notes      # one pass: the model's own decode, untouched
+        pieces.append(piece["wav"])
+        seconds.append(f"{len(piece['wav']) / sr:.1f}")
+    if not pieces:
+        return np.zeros(0, dtype=np.float32), sr, notes
     out = stitch_clips(pieces, sr)
-    notes.append(f"Chunked: {len(chunks)} pieces ({'+'.join(seconds)}s) stitched with a "
+    notes.append(f"Chunked: {len(pieces)} pieces ({'+'.join(seconds)}s) stitched with a "
                  f"{CROSSFADE_MS}ms crossfade")
     return out, int(sr), notes
 
@@ -1931,6 +1947,49 @@ def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[str, int, str]], Optional
     return (ref_wav, int(ref_sr), ref_text), None
 
 
+def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
+                 top_k: int, rep_penalty: float) -> Tuple[Any, str]:
+    """Resolve a saved voice into a `generate_one(chunk) -> (wav, sr)` callable.
+
+    The hub lock is taken *per chunk*, not around a whole reply. The chat handler is a
+    generator, and a client that walks away mid-reply leaves the generator closed — a lock
+    held across yields could then be released late or not at all, and a stuck lock stops the
+    whole app. Per-chunk acquisition costs an LRU check and cannot deadlock the box.
+    """
+    resolved, error = _resolve_voice(voice)
+    if error:
+        raise MediaError(error)
+    ref_wav, ref_sr, ref_text = resolved
+    use_xvector = not ref_text
+    cache: Dict[str, Any] = {}
+
+    def one(chunk: str) -> Tuple[np.ndarray, int]:
+        with HUB.lock:
+            tts = HUB.acquire("voice_clone")
+            if "prompt" not in cache:
+                key = _clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)
+                prompt = _CLONE_PROMPTS.get(key)
+                if prompt is None:
+                    prompt = tts.create_voice_clone_prompt(
+                        ref_audio=(ref_wav, ref_sr),
+                        ref_text=ref_text or None,
+                        x_vector_only_mode=use_xvector,
+                    )
+                    _CLONE_PROMPTS.clear()
+                    _CLONE_PROMPTS[key] = prompt
+                cache["prompt"] = prompt
+            wavs, rate = tts.generate_voice_clone(
+                text=chunk,
+                language=language,
+                voice_clone_prompt=cache["prompt"],
+                max_new_tokens=_budget(chunk),
+                **_sampling(temperature, top_p, top_k, rep_penalty),
+            )
+        return wavs[0], int(rate)
+
+    return one, ("x-vector" if use_xvector else "ICL")
+
+
 def speak(voice: str, text: str, language: str = "Auto",
           temperature: float = SAMPLING_DEFAULTS["temperature"],
           top_p: float = SAMPLING_DEFAULTS["top_p"],
@@ -1947,43 +2006,71 @@ def speak(voice: str, text: str, language: str = "Auto",
     """
     if not (text or "").strip():
         return None, "Error: Text is required."
-    resolved, error = _resolve_voice(voice)
-    if error:
-        return None, error
-    ref_wav, ref_sr, ref_text = resolved
-    use_xvector = not ref_text
     try:
+        one, mode = _voice_synth(voice, language, temperature, top_p, top_k, rep_penalty)
         budget = _budget(text)
-        with HUB.lock:
-            tts = HUB.acquire("voice_clone")
-            key = _clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)
-            prompt = _CLONE_PROMPTS.get(key)
-            if prompt is None:
-                prompt = tts.create_voice_clone_prompt(
-                    ref_audio=(ref_wav, ref_sr),
-                    ref_text=ref_text or None,
-                    x_vector_only_mode=use_xvector,
-                )
-                _CLONE_PROMPTS.clear()
-                _CLONE_PROMPTS[key] = prompt
-
-            def one(chunk: str) -> Tuple[np.ndarray, int]:
-                wavs, rate = tts.generate_voice_clone(
-                    text=chunk,
-                    language=language,
-                    voice_clone_prompt=prompt,
-                    max_new_tokens=_budget(chunk),
-                    **_sampling(temperature, top_p, top_k, rep_penalty),
-                )
-                return wavs[0], rate
-
-            wav, sr, chunk_notes = generate_chunked(text, language, one)
-        mode = "x-vector" if use_xvector else "ICL"
+        wav, sr, chunk_notes = generate_chunked(text, language, one)
         return _ok(*_present(wav, sr, budget, f"Speak ({mode})", postproc, chunk_notes))
     except MediaError as e:
         return None, f"Error: {e}"
     except Exception as e:  # noqa: BLE001 - a caller over the network gets a message, not a traceback
         return None, f"Error: {type(e).__name__}: {e}"
+
+
+def chat_say(text: str, history: Any, voice: str, language: str = "Auto",
+             temperature: float = SAMPLING_DEFAULTS["temperature"],
+             top_p: float = SAMPLING_DEFAULTS["top_p"],
+             top_k: int = SAMPLING_DEFAULTS["top_k"],
+             rep_penalty: float = SAMPLING_DEFAULTS["repetition_penalty"],
+             postproc: str = POSTPROCESS_DEFAULT,
+             synth: Any = None, progress: Any = None):
+    """Chat-style reply: speak `text` piece by piece, yielding each one as it is ready.
+
+    The model cannot stream samples, so this streams at the only granularity it has —
+    sentences. You hear the first one after ~6-9s instead of waiting for the whole reply,
+    and the chat log fills in as it goes. `synth` is injected so the flow is testable without
+    weights; the real one comes from `_voice_synth`.
+    """
+    messages = list(history or [])
+    wanted = (text or "").strip()
+
+    def snapshot() -> List[dict]:
+        """A copy per yield. Mutating one list and handing it out repeatedly means every
+        update shows the *final* state once Gradio comes to serialise it — and makes the
+        streaming impossible to test."""
+        return [dict(message) for message in messages]
+
+    if not wanted:
+        yield snapshot(), None, "Nothing to say."
+        return
+    messages.append({"role": "user", "content": wanted})
+    messages.append({"role": "assistant", "content": "…"})
+    yield snapshot(), None, "Thinking…"
+    try:
+        if synth is None:
+            synth, mode = _voice_synth(voice, language, temperature, top_p, top_k, rep_penalty)
+        else:
+            mode = "test"
+        spoken = 0.0
+        pieces = 0
+        for piece in iter_chunked(wanted, language, synth, progress):
+            wav, sr = piece["wav"], piece["sr"]
+            listen_wav, listen_sr = postprocess_output(wav, sr, postproc)
+            spoken += len(wav) / sr
+            pieces += 1
+            messages[-1]["content"] = (piece["text"] if pieces == 1
+                                       else f"{messages[-1]['content']} {piece['text']}")
+            yield (snapshot(), (listen_sr, listen_wav),
+                   f"Speaking piece {pieces}/{piece['total']} — {spoken:.1f}s so far "
+                   f"({mode}, {listen_sr}Hz)")
+        yield snapshot(), gr.update(), (f"Said {pieces} piece{'s' if pieces != 1 else ''}, "
+                                        f"{spoken:.1f}s of audio in {voice}")
+    except MediaError as e:
+        messages[-1]["content"] = f"⚠ {e}"
+        yield snapshot(), None, f"Error: {e}"
+    except Exception as e:  # noqa: BLE001 - the chat must stay usable after a bad reply
+        messages[-1]["content"] = f"⚠ {type(e).__name__}: {e}"
+        yield snapshot(), None, f"Error: {type(e).__name__}: {e}"
 
 
 def voices_available() -> str:
@@ -2555,6 +2642,35 @@ after a model switch pays a few seconds of load time.
                 sp_btn.click(speak,
                              inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
                              outputs=[sp_audio, sp_status])
+
+            with gr.Tab("Chat (speak as it goes)"):
+                gr.Markdown(
+                    "Type what you want heard. The reply is spoken **piece by piece**: you hear the "
+                    "first sentence after ~6–9s instead of waiting for the whole thing, and the log "
+                    "fills in as it goes. The model cannot stream samples, so this streams at the "
+                    "only granularity it has — sentences. Expect ~1.4× realtime overall; it shares "
+                    "the one GPU with every other tab.")
+                ch_log = gr.Chatbot(label="Assistant", height=320)
+                with gr.Row():
+                    ch_text = gr.Textbox(label="Say this", scale=5,
+                                         placeholder="Type a sentence and press Enter…")
+                    ch_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
+                                           scale=2, allow_custom_value=True,
+                                           info="From the voice library; name or slug.")
+                with gr.Row():
+                    ch_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
+                                              value="Auto", scale=2)
+                    ch_send = gr.Button("Speak", variant="primary", scale=1)
+                    ch_clear = gr.Button("Clear", size="sm", scale=1)
+                ch_audio = gr.Audio(label="Now playing", type="numpy", autoplay=True)
+                ch_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                chat_inputs = [ch_text, ch_log, ch_voice, ch_language] + sampling + output_options
+                ch_send.click(chat_say, inputs=chat_inputs,
+                              outputs=[ch_log, ch_audio, ch_status])
+                ch_text.submit(chat_say, inputs=chat_inputs,
+                               outputs=[ch_log, ch_audio, ch_status])
+                ch_clear.click(lambda: ([], None, "Cleared."),
+                               outputs=[ch_log, ch_audio, ch_status])
 
         gr.Markdown(
             "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen). "

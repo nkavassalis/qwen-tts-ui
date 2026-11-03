@@ -152,8 +152,8 @@ run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
 scripts/say.py      CLI for the assistant API: render text in a saved voice and play it
-tests/test_app_logic.py   CPU-only unit tests (65 cases) for UI helpers and guards
-tests/smoke_test.py       GPU end-to-end: 9 flows, generates audio and validates the wav
+tests/test_app_logic.py   CPU-only unit tests (68 cases) for UI helpers and guards
+tests/smoke_test.py       GPU end-to-end: 10 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
 CHANGELOG.md        one entry per change
@@ -271,10 +271,25 @@ For an assistant, the useful pattern is fire-and-forget on things worth hearing:
 finishing, tests failing, a long job ending. Not narration — at 1.4× realtime, having it
 read everything aloud is a way to make your terminal slower.
 
+### The Chat tab, and what "real-time" means here
+
+The **Chat (speak as it goes)** tab types-and-talks: you enter text, it appears in a log and
+is spoken aloud, and **each sentence is handed to the player the moment it exists** — you are
+listening while the rest is still being generated.
+
+It is worth being precise, because "streaming TTS" can mean two things and this is only one of
+them. The model cannot stream *samples* — there is no partial-audio API upstream, and
+`non_streaming_mode` in the model code is about how text goes *in*, not how audio comes out.
+What it can stream is **sentences**, which is the only granularity that exists here. Measured
+on a 60-word reply: **first audio at 12.6s, whole reply at 30.2s**, three pieces, 17s of speech.
+
+So: good for "read this to me" where you want to start hearing it now, not a conversation
+partner. The player is `autoplay=True`, so each piece starts on arrival without a click.
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 65 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 68 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

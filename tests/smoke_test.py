@@ -72,6 +72,8 @@ CASES = {
     ),
     # The one-call endpoint for external tools (scripts/say.py). Reads best_of_n's reference.
     "speak_api": dict(),
+    # The chat tab: progressive playback, measured as time-to-first-audio.
+    "chat_stream": dict(),
     # Long-text chunking: the same 300 words that measured 4.04 words/s and WER 0.68 in one
     # pass, now through the splitter and the stitcher.
     "long_text": dict(
@@ -506,6 +508,50 @@ def run_speak_api(hub: webui.ModelHub) -> None:
             webui.VOICES_DIR = original_voices
 
 
+def run_chat_stream(hub: webui.ModelHub) -> None:
+    """The chat tab's whole claim is that you hear the first sentence early."""
+    cfg = CASES["best_of_n"]
+    ref_path = os.path.join(webui.media_dir(), "best_of_n_ref.wav")
+    if not os.path.exists(ref_path):
+        urllib.request.urlretrieve(cfg["ref_audio"], ref_path)
+    ref_wav, ref_sr = sf.read(ref_path, dtype="float32")
+    if ref_wav.ndim > 1:
+        ref_wav = ref_wav.mean(axis=1)
+
+    text = ("The build finished cleanly and the test suite is green. "
+            "I rewrote the chunker so long text is spoken at a natural pace instead of rushing. "
+            "The seam between pieces uses a short equal-power crossfade, so there is no click. "
+            "Tell me if it still sounds hurried anywhere and I will widen the band.")
+
+    with tempfile.TemporaryDirectory() as vdir:
+        original_voices, webui.VOICES_DIR = webui.VOICES_DIR, vdir
+        try:
+            webui.save_voice(name="Smoke Narrator", wav=ref_wav, sr=ref_sr,
+                             text=cfg["ref_text"], instruct="", language="English")
+            started = time.time()
+            first_audio = None
+            turns = []
+            for turn in webui.chat_say(text, [], "Smoke Narrator", "English"):
+                if first_audio is None and isinstance(turn[1], tuple):
+                    first_audio = time.time() - started
+                turns.append(turn)
+            total = time.time() - started
+
+            streamed = [t for t in turns if isinstance(t[1], tuple)]
+            assert len(streamed) >= 2, f"a 60-word reply should arrive in pieces: {len(streamed)}"
+            assert all(len(t[1][1]) > 0 for t in streamed), "a hand-off carried no audio"
+            assert all(float(np.max(np.abs(t[1][1]))) <= 1.0 for t in streamed), "streamed audio clipped"
+            assert first_audio is not None and first_audio < total - 1.0, \
+                f"first audio must land well before the end (ttfb {first_audio:.1f}s of {total:.1f}s)"
+            said = turns[-1][0][-1]["content"]
+            assert said.replace(" ", "") == text.replace(" ", ""), "the log lost or reordered words"
+            assert "Said" in turns[-1][2], f"final status: {turns[-1][2]}"
+            print(f"  [chat_stream] {total:.1f}s | first audio {first_audio:.1f}s | "
+                  f"{len(streamed)} pieces | {turns[-1][2]}")
+        finally:
+            webui.VOICES_DIR = original_voices
+
+
 def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
     if capability == "media_pipeline":
         run_media_pipeline(hub, use_asr)
@@ -549,6 +595,16 @@ def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool
 
     if capability == "speak_api":
         run_speak_api(hub)
+        if not keep_gpu:
+            with hub.lock:
+                while hub.on_gpu:
+                    _, resident = hub.on_gpu.popitem(last=False)
+                    hub._move(resident, torch.device("cpu"))
+                    torch.cuda.empty_cache()
+        return
+
+    if capability == "chat_stream":
+        run_chat_stream(hub)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:

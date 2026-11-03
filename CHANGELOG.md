@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — Chat tab: type it, hear it, starting before the reply is finished
+
+Asked whether there could be a chat-style interface with semi-real-time playback. The honest
+answer shaped the feature: the model has **no partial-audio API** — `non_streaming_mode` in the
+model code is about how text goes *in*, not how audio comes out — so the only streamable
+granularity is the sentence. The Chat tab streams at that.
+
+- **`chat_say` is a generator** over the chunker: each piece is post-processed and handed to an
+  `autoplay=True` player the moment it exists, while the rest is still decoding. Measured on a
+  60-word reply: **first audio 12.6s, whole reply 30.2s**, 3 pieces, 17.0s of speech.
+- **`generate_chunked` became a thin consumer of a new `iter_chunked`**, so the chat path and
+  the three tabs cannot grow two different chunkers. A single-chunk reply still returns the
+  model's own decode *without* edge trimming — trimming is for joins.
+- Two bugs caught while building it, both now pinned by tests:
+  - the hub lock was being held across `yield`s. A client that walks away mid-reply closes the
+    generator, and a stranded lock stops the entire app. It is now taken **per chunk inside
+    `one()`** — an LRU check per piece is a cheap price for not being able to deadlock the box.
+  - every yield handed out the *same* mutated message list, so all updates render the final
+    state. Yields now carry copies.
+- Tests: CPU 65 -> 68 (progressive hand-offs, log text exactly equal to the input, the reply
+  filling in over time, failures reported in the bubble instead of killing the chat, per-chunk
+  locking, Enter submits, autoplay really set). GPU 9 -> 10 flows with `chat_stream`, which
+  asserts time-to-first-audio is well before the end rather than trusting the claim.
+- Documented rather than oversold: at ~1.4x realtime this is "read this to me now", not a
+  conversation partner.
+
 ## 2026-11-03 — assistant API: one call to make a saved voice speak, plus `scripts/say.py`
 
 The Clone tab's flow (resolve a voice, upload its wav, supply the transcript) is three calls

@@ -786,9 +786,9 @@ def test_build_ui_constructs() -> None:
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
     # CustomVoice + VoiceDesign + Clone output + Clone reference box + the four candidate
-    # players that make best-of-N auditionable + the Speak tab's player.
-    check(len(audios) == 9, f"three outputs, one reference input, four take players, one "
-                            f"speak player — found {len(audios)}")
+    # players that make best-of-N auditionable + the Speak player + the chat player.
+    check(len(audios) == 10, f"three outputs, one reference input, four take players, one "
+                            f"speak player, one chat player — found {len(audios)}")
     for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
         check(label in by_label, f"{label} exists")
     # Anything we read back from the browser is filepath-typed so that we open it
@@ -1180,8 +1180,9 @@ def test_output_options_are_wired() -> None:
 
     source = inspect.getsource(webui.build_ui)
     check("s_postproc" in source and "output_options" in source, "the dropdown exists")
-    check(source.count("+ output_options") == 4,
-          "every generation surface (CustomVoice, VoiceDesign, Clone, Speak) receives the choice")
+    check(source.count("+ output_options") == 5,
+          "every generation surface (CustomVoice, VoiceDesign, Clone, Speak, Chat) receives "
+          "the choice")
 
 
 def test_clone_tab_reads_top_to_bottom() -> None:
@@ -1767,8 +1768,10 @@ def test_speak_and_voice_list_are_api_endpoints() -> None:
 
     import inspect
     source = inspect.getsource(webui.speak)
-    check("_resolve_voice(" in source, "speak resolves the voice server-side")
-    check("resolve_input_path" not in source,
+    check("_voice_synth(" in source, "speak shares the voice resolution with the chat tab")
+    check("_resolve_voice(" in inspect.getsource(webui._voice_synth),
+          "resolution happens server-side, in one place")
+    check("resolve_input_path" not in source and "resolve_input_path" not in inspect.getsource(webui._voice_synth),
           "speak takes no client path at all — there is nothing to confine")
     check("generate_chunked(" in source, "speak gets the chunked long-text path too")
 
@@ -1785,6 +1788,75 @@ def test_say_py_is_a_thin_client() -> None:
           "credentials follow the server's precedence")
     check("--ref-audio" not in source and "--voice-path" not in source,
           "the CLI must never be able to name a server path")
+
+
+def test_chat_say_streams_one_piece_at_a_time() -> None:
+    """The point of the chat tab is that you hear the first sentence early."""
+    sr = 24000
+    calls = []
+
+    def fake(chunk: str):
+        calls.append(chunk)
+        words, _ = webui.speech_units(chunk)
+        t = np.arange(int(max(0.4, words / 2.5) * sr)) / sr
+        return (0.25 * np.sin(2 * np.pi * 170 * t)).astype(np.float32), sr
+
+    text = ("The build finished cleanly. Three tests failed in the database layer. "
+            "I fixed two of them already and the third needs a migration. "
+            "Want me to write the migration now or leave it for the morning?")
+    turns = list(webui.chat_say(text, [], "someone", "English", synth=fake))
+
+    check(len(turns) >= 4, f"a reply should arrive in several updates, got {len(turns)}")
+    check(len(calls) >= 2, f"the text should have been chunked, got {len(calls)} calls")
+    streamed = [t for t in turns if isinstance(t[1], tuple)]
+    check(len(streamed) == len(calls),
+          f"one audio hand-off per piece ({len(streamed)} vs {len(calls)})")
+    waves = [t[1][1] for t in streamed]
+    check(all(len(w) for w in waves), "every hand-off carries audio")
+    check(all(float(np.max(np.abs(w))) <= 1.0 for w in waves),
+          "streamed audio stays inside full scale")
+
+    final_messages = turns[-1][0]
+    check(final_messages[0]["role"] == "user" and final_messages[1]["role"] == "assistant",
+          "the log is a user turn then an assistant turn")
+    said = final_messages[1]["content"]
+    check(said.replace(" ", "") == text.replace(" ", ""),
+          "the log must contain exactly what was asked to be said, in order")
+    grew = [len(t[0][-1]["content"]) for t in turns if t[0] and t[0][-1]["role"] == "assistant"]
+    check(grew == sorted(grew) and grew[-1] > grew[0], "the reply fills in as it goes")
+    check("Said" in turns[-1][2] and "piece" in turns[-1][2], f"final status: {turns[-1][2]}")
+
+
+def test_chat_say_reports_failures_without_killing_the_chat() -> None:
+    turns = list(webui.chat_say("   ", [], "someone", "English", synth=lambda c: (None, 0)))
+    check("nothing to say" in turns[-1][2].lower(), f"empty input is answered: {turns[-1][2]}")
+
+    def explode(chunk: str):
+        raise webui.MediaError("no saved voice ‘someone’")
+
+    turns = list(webui.chat_say("Hello there friend, this is a reasonably long sentence.",
+                                [], "someone", "English", synth=explode))
+    check(turns[-1][2].startswith("Error"), f"the status line carries the error: {turns[-1][2]}")
+    check("⚠" in turns[-1][0][-1]["content"], "the bubble says what went wrong instead of vanishing")
+
+
+def test_chat_path_shares_the_chunker_and_locks_per_chunk() -> None:
+    """Two invariants that only bite in production: one chunker, and no lock across yields."""
+    import inspect
+
+    chat_source = inspect.getsource(webui.chat_say)
+    check("iter_chunked(" in chat_source, "chat uses the same splitter as everything else")
+    check("_voice_synth(" in chat_source, "and the same voice resolution as /speak")
+
+    synth_source = inspect.getsource(webui._voice_synth)
+    check(synth_source.index("def one(chunk") < synth_source.index("with HUB.lock"),
+          "the hub lock must be taken inside one(), per chunk — holding it across a yielded "
+          "reply can strand the app if the client walks away")
+
+    demo_source = inspect.getsource(webui.build_ui)
+    check("autoplay=True" in demo_source, "the chat player actually plays without a click")
+    check("ch_text.submit(chat_say" in demo_source,
+          "Enter submits, not just the button")
 
 
 if __name__ == "__main__":
