@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — argv-free credentials, GPU tier verified
+
+- `resolve_credentials()` takes the UI password from `--password-file` (contents never
+  reach argv or the logs), then `QWEN_TTS_PASSWORD`, then an interactive hidden prompt.
+  `--password` still works but warns: a command line is world-readable through `ps`/`/proc`
+  (demonstrated during review — the test run's password was visible in `pgrep`).
+  `QWEN_TTS_USERNAME` is read as well; a password without a username fails closed to
+  unauthenticated, as does an empty or unreadable secret file. A world-readable secret
+  file is accepted but called out for `chmod 600`.
+- Tests: CPU tier 28 → 30 (credential source priority, fail-closed paths, prompt
+  labelling, "the secret never appears in output"). `test_smoke_test_skips_are_not_passes`
+  now stubs `exclusive_owner` instead of depending on the webui server being stopped.
+- GPU tier executed on the RTX 5070 Ti box: 6/6 smoke cases, auth 401s unauthenticated
+  API calls, and the path guard refuses `/etc/passwd` and friends over HTTP.
+- Recorded: all three checkpoints ship `do_sample: true`, so the sampling sliders are
+  effective (an open question from the CPU-only run).
+
 ## 2026-11-02 — pre-public hardening
 
 Security / exposure:

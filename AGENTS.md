@@ -28,7 +28,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 28 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 30 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -44,8 +44,8 @@ certs/  logs/  tests/output/  .qwen-tts.lock  .gradio/
 ```bash
 ./setup.sh                       # uv venv + torch cu128 + upstream + 14GB weights + Whisper
 ./run.sh                         # -> http://127.0.0.1:7860, "Runtime:" line shows GPU/RAM
-./run.sh --ip 0.0.0.0 --username u --password p   # LAN, authenticated
-./run.sh --ssl-self-signed --ip 0.0.0.0 --username u --password p   # browser mic needs HTTPS
+./run.sh --ip 0.0.0.0 --username u --password-file ~/tts.pw   # LAN, authenticated
+./run.sh --ssl-self-signed --ip 0.0.0.0 --username u --password-file ~/tts.pw   # browser mic needs HTTPS
 ./run.sh --device cpu            # CPU inference (slow; works, no CUDA needed)
 ```
 
@@ -56,12 +56,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 28 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 30 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-02): **CPU tier 28/28 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 30/30 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -182,8 +182,10 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
 - `requirements.txt` is ranges, not a lock, because the pins were frozen on a box without
   its venv available. Freeze the venv that ran the green GPU tier and commit
   `requirements.lock.txt`.
-- `--username/--password` is a single shared credential (Gradio's `auth=`), not users.
-  Fine for a house LAN; do not put this on the internet.
+- Credentials are one shared credential (Gradio's `auth=`), not users. Fine for a house
+  LAN; do not put this on the internet. `resolve_credentials()` takes the secret from
+  `--password-file`, then `QWEN_TTS_PASSWORD`, then an interactive prompt; `--password`
+  remains only as a warned-about fallback because argv is world-readable via `ps`/`/proc`.
 - `Transcriber` keeps Whisper (~3.1GB bf16) on the GPU once loaded and is never evicted
   by `ModelHub`; `unload()` exists but only the smoke test calls it. Fits next to one
   resident 1.7B model on 16GB, but it does eat into the VRAM margin.
@@ -220,6 +222,28 @@ Run on 2026-11-02 on a **CPU-only Linux box with no GPU and no weights**:
   at startup; check that line once on the real box.
 - Upstream API claims in this file were checked against a `main` checkout of
   QwenLM/Qwen3-TTS (2026-11-02), not against the pinned `repo/` Nick actually runs.
+
+Run on 2026-11-03 on the **real GPU box** (RTX 5070 Ti, 16GB, CUDA, 14GB of weights) — the
+tier the hardening pass could not execute:
+
+- **CPU tier: 30/30 passing**, including the two new `resolve_credentials` checks. The
+  `smoke_test` bookkeeping check was made hermetic (it stubs `exclusive_owner`, so it no
+  longer fails just because the webui server is running).
+- **GPU tier: 6/6 passing** (`tests/smoke_test.py`): custom_voice, voice_design,
+  voice_clone, dialect, voice_library, media_pipeline. Loads 1.5–3.0s, generation
+  1.4–9.7s, every clip inside the RMS/peak/duration bounds.
+- **Whisper verified**: `media_pipeline` transcribed the mp4-derived clip as
+  "The quick brown fox jumps over the lazy dog near the riverbank." (3.2s).
+- **Auth verified live**: unauthenticated `/gradio_api/info` → 401, `gradio_client`
+  refuses without credentials and succeeds with them.
+- **Path guard verified live**: `/etc/passwd`, `../../etc/passwd`, `file:///etc/passwd`
+  and `~/.config/gh/hosts.yml` are all refused by `/import_media`.
+- **Sampling sliders are live, not inert**: `generation_config.json` in all three
+  checkpoints sets `do_sample: true` (top_k 50, temperature 0.9), which closes the open
+  question from the CPU-only run.
+- **Still unverified:** `--preload`, `--share`, HTTPS mic capture, and the
+  unauthenticated-bind warning (needs a real `--ip 0.0.0.0` bind, which was not done on a
+  networked box).
 
 ## Do-not-touch list
 

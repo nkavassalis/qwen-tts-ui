@@ -35,17 +35,19 @@ do in a text editor:
 
 ```bash
 ./run.sh                      # -> http://127.0.0.1:7860
-./run.sh --ip 0.0.0.0 --username you --password '…'   # expose on the LAN, with a login
+./run.sh --ip 0.0.0.0 --username you --password-file ~/tts.pw   # expose on the LAN, with a login
 ./run.sh --preload            # warm checkpoints into RAM at startup (bounded by --max-cpu-resident)
 ./run.sh --max-cpu-resident 1 # safest: pin only one 4.3GB copy at a time
-./run.sh --ssl-self-signed --ip 0.0.0.0 --username you --password '…'   # HTTPS; needed for browser mic on non-localhost
+./run.sh --ssl-self-signed --ip 0.0.0.0 --username you --password-file ~/tts.pw   # HTTPS; needed for browser mic on non-localhost
 ./run.sh --no-asr                # drop Whisper (frees ~3GB VRAM, disables the transcribe button)
 ./run.sh --asr-model openai/whisper-large-v3-turbo   # swap the transcription model
 ./run.sh --help                  # all flags
 ```
 
 Nothing binds beyond localhost unless you pass `--ip` or `--share`, and the server prints a
-loud warning if you do either without `--username/--password`. See
+loud warning if you do either without credentials. Give the password through
+`--password-file` or `QWEN_TTS_PASSWORD` (or let the app prompt for it) — `--password` still
+works but warns, because a command line is world-readable via `ps`. See
 [Exposure and safety](#exposure-and-safety) before sharing it.
 
 First request after a model switch pays ~2s of GPU upload; after that generation runs
@@ -66,7 +68,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (28 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (30 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -131,9 +133,11 @@ boundaries are worth stating:
 
 - **It binds to 127.0.0.1 unless you say otherwise.** `--ip 0.0.0.0` and `--share` (a
   public gradio.app tunnel) are conveniences, not defaults, and the server prints a warning
-  if you use either without `--username/--password`. That flag pair is one shared
+  if you use either without credentials. Those are one shared
   credential (Gradio's `auth=`), not per-user accounts — fine for a house LAN, not for the
-  internet.
+  internet. Supply them via `--password-file` (chmod 600) or `QWEN_TTS_PASSWORD`; the app
+  prompts for the secret if you gave a username but no password, and never prints it. The
+  legacy `--password` flag is visible to every local user through `ps`/`/proc` and warns.
 - **Uploads and reference clips are confined to the upload directories.** Anything the
   browser names is resolved and checked against `allowed_input_roots()` (Gradio's upload and
   component-cache dirs plus `tmp/media/`) before it is opened, so a client cannot point the
@@ -150,7 +154,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 28 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 30 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

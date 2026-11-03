@@ -813,8 +813,17 @@ def test_smoke_test_skips_are_not_passes() -> None:
 
     real_torch, real_run_case, real_hub = smoke_test.torch, smoke_test.run_case, webui.ModelHub
     real_argv = sys.argv
+    real_owner = smoke_test.webui.exclusive_owner
     smoke_test.torch = types.SimpleNamespace(cuda=FakeCuda, bfloat16=object(), __version__="0.0-test")
     smoke_test.webui.ModelHub = lambda *a, **kw: types.SimpleNamespace(lock=None, on_gpu={})
+
+    # The single-owner lock is production behaviour, not what this test is about: without
+    # stubbing it the test fails whenever the webui server happens to be running.
+    @contextlib.contextmanager
+    def fake_owner(_who):
+        yield
+
+    smoke_test.webui.exclusive_owner = fake_owner
     try:
         last_output = [""]
 
@@ -842,6 +851,7 @@ def test_smoke_test_skips_are_not_passes() -> None:
     finally:
         smoke_test.torch, smoke_test.run_case = real_torch, real_run_case
         smoke_test.webui.ModelHub = real_hub
+        smoke_test.webui.exclusive_owner = real_owner
         sys.argv = real_argv
         smoke_test.SKIPPED.clear()
 
@@ -856,6 +866,93 @@ def test_setup_sh_knows_every_capability() -> None:
     check("Qwen3-TTS-Tokenizer-12Hz" in body, "setup.sh downloads the 12Hz tokenizer")
     for needle in ("whisper-large-v3", '--exclude "*fp32*"'):
         check(needle in body, f"setup.sh is missing {needle!r} (README documents it)")
+
+
+def test_resolve_credentials() -> None:
+    """The UI password must never have to appear in argv (visible via ps/proc)."""
+    import contextlib
+    import io
+    import stat
+    import tempfile
+    from types import SimpleNamespace
+
+    def args(username=None, password=None, password_file=None):
+        return SimpleNamespace(username=username, password=password, password_file=password_file)
+
+    def write_secret(tmp, text="s3cr3t-pass\n", mode=0o600):
+        path = os.path.join(tmp, "pw")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(path, mode)
+        return path
+
+    def run(a, environ, prompted="from-prompt"):
+        out = io.StringIO()
+        asked = {}
+
+        def fake_prompt(label):
+            asked["label"] = label
+            return prompted
+
+        with contextlib.redirect_stdout(out):
+            result = webui.resolve_credentials(a, environ=environ, prompt=fake_prompt)
+        return result, out.getvalue(), asked
+
+    with tempfile.TemporaryDirectory() as tmp:
+        secret_file = write_secret(tmp, "from-file\n")
+
+        # no username -> no auth, whatever else was given
+        result, log, _ = run(args(password="x"), {})
+        check(result is None, "a password without a username does not enable auth")
+        check("UNAUTHENTICATED" in log, "and says so")
+
+        # priority: file > env > flag > prompt
+        result, log, _ = run(args(username="u", password="from-flag", password_file=secret_file),
+                             {"QWEN_TTS_PASSWORD": "from-env"})
+        check(result == ("u", "from-file"), f"password file must win: {result}")
+        check("from-flag" not in log and "from-env" not in log, "the secret is never logged")
+
+        result, log, _ = run(args(username="u", password="from-flag"), {"QWEN_TTS_PASSWORD": "from-env"})
+        check(result == ("u", "from-env"), f"env must beat the flag: {result}")
+
+        result, log, _ = run(args(username="u", password="from-flag"), {})
+        check(result == ("u", "from-flag"), f"flag still works as a last resort: {result}")
+        check("ps" in log and "DEPRECATED" not in log, "the argv warning fires only for the flag path")
+
+        result, log, asked = run(args(username="u"), {})
+        check(result == ("u", "from-prompt"), f"prompt fills in when nothing else is given: {result}")
+        check("u" in asked.get("label", "") and "hidden" in asked.get("label", ""),
+              f"prompt names the user and says input is hidden: {asked}")
+        check("from-prompt" not in log, "the prompted secret is not echoed")
+
+        # failure modes must fail closed (no auth) rather than half-working
+        empty = write_secret(tmp, "\n")
+        result, log, _ = run(args(username="u", password_file=empty), {})
+        check(result is None and "UNAUTHENTICATED" in log, "an empty secret file does not enable auth")
+
+        result, log, _ = run(args(username="u", password_file=os.path.join(tmp, "nope")), {})
+        check(result is None and "cannot read" in log, "a missing secret file is reported, not ignored")
+
+        loose = write_secret(tmp, "loose-secret\n", mode=0o644)
+        result, log, _ = run(args(username="u", password_file=loose), {})
+        check(result == ("u", "loose-secret"), "a loose file still works (usable default)")
+        check("chmod 600" in log, "but it is called out")
+
+        tight = write_secret(tmp, "tight\n", mode=0o600)
+        _, log, _ = run(args(username="u", password_file=tight), {})
+        check("chmod 600" not in log, "no warning when permissions are already tight")
+
+
+def test_credentials_come_from_argv_free_sources() -> None:
+    """Guard the point of the change: the docs/help steer to file/env, not argv."""
+    import inspect
+
+    source = inspect.getsource(webui.main)
+    check("--password-file" in source and "QWEN_TTS_PASSWORD" in source,
+          "main wires the argv-free sources")
+    check("resolve_credentials(args)" in source, "main resolves credentials through the helper")
+    check("[(args.username, args.password)]" not in source,
+          "the raw argv credential path is gone")
 
 
 if __name__ == "__main__":

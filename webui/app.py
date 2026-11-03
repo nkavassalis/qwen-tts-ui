@@ -20,11 +20,13 @@ from __future__ import annotations
 import argparse
 import fcntl
 import gc
+import getpass
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -1344,6 +1346,57 @@ after a model switch pays a few seconds of load time.
     return demo
 
 
+def resolve_credentials(args: Any, environ: Optional[Dict[str, str]] = None,
+                        prompt: Any = getpass.getpass) -> Optional[Tuple[str, str]]:
+    """Resolve the single shared UI credential without ever putting the secret in argv.
+
+    `--password` on the command line is readable by any local user through `ps`/`/proc`,
+    so it is the *last* resort and warns. Preferred sources, highest priority first:
+    `--password-file`, `QWEN_TTS_PASSWORD`, then the interactive prompt. The secret is
+    never printed. Returns None when no username was requested (or nothing usable was
+    supplied), which leaves the app unauthenticated — the caller still applies its
+    bind-scope warning in that case.
+    """
+    environ = os.environ if environ is None else environ
+    warnings: List[str] = []
+
+    username = args.username or environ.get("QWEN_TTS_USERNAME")
+    if not username:
+        if args.password or args.password_file or environ.get("QWEN_TTS_PASSWORD"):
+            warnings.append("a password was supplied without a username; starting UNAUTHENTICATED")
+        if warnings:
+            print(f"[webui] warning: {warnings[0]}.", flush=True)
+        return None
+
+    secret: Optional[str] = None
+    if args.password_file:
+        try:
+            with open(args.password_file, "r", encoding="utf-8") as fh:
+                secret = fh.read().rstrip("\r\n")
+        except OSError as e:
+            print(f"[webui] error: cannot read --password-file {args.password_file}: {e}", flush=True)
+            return None
+        try:
+            if stat.S_IMODE(os.stat(args.password_file).st_mode) & 0o077:
+                print(f"[webui] warning: {args.password_file} is readable by others — "
+                      f"chmod 600 it.", flush=True)
+        except OSError:
+            pass
+    elif environ.get("QWEN_TTS_PASSWORD"):
+        secret = environ["QWEN_TTS_PASSWORD"]
+    elif args.password:
+        print("[webui] warning: --password is visible to every local user via `ps`/proc. "
+              "Use --password-file or QWEN_TTS_PASSWORD instead.", flush=True)
+        secret = args.password
+    else:
+        secret = prompt(f"Qwen3-TTS password for user '{username}' (input hidden): ")
+
+    if not secret:
+        print("[webui] warning: no password could be resolved; starting UNAUTHENTICATED.", flush=True)
+        return None
+    return (username, secret)
+
+
 def main() -> int:
     global HUB, DEVICE
 
@@ -1377,10 +1430,15 @@ def main() -> int:
                              "kills itself: its startup self-check does an https request "
                              "to its own server and fails on the self-signed cert.")
     parser.add_argument("--username", default=None,
-                        help="Require this username to use the UI (with --password). Required in "
-                             "spirit for anything bound beyond localhost.")
+                        help="Require this username to use the UI. Also reads "
+                             "QWEN_TTS_USERNAME. Required in spirit for anything bound "
+                             "beyond localhost.")
     parser.add_argument("--password", default=None,
-                        help="Require this password to use the UI (with --username).")
+                        help="DEPRECATED: visible in `ps`. Prefer --password-file or "
+                             "QWEN_TTS_PASSWORD; with neither you are prompted.")
+    parser.add_argument("--password-file", default=None,
+                        help="File containing the UI password (chmod 600). Its contents "
+                             "never reach the command line or the logs.")
     parser.add_argument("--share", action="store_true", help="Create a public gradio.app link.")
     parser.add_argument("--asr-model", default=ASR_MODEL_ID,
                         help=f"Whisper model for reference transcription (default {ASR_MODEL_ID}); "
@@ -1418,12 +1476,9 @@ def main() -> int:
         demo = build_ui()
 
         auth = None
-        if args.username or args.password:
-            if not (args.username and args.password):
-                print("[webui] warning: --username and --password must be given together; "
-                      "starting UNAUTHENTICATED.", flush=True)
-            else:
-                auth = [(args.username, args.password)]
+        credentials = resolve_credentials(args)
+        if credentials:
+            auth = [credentials]
         reachable_beyond_localhost = bool(args.share) or args.ip not in ("127.0.0.1", "localhost", "::1")
         if reachable_beyond_localhost and auth is None:
             print("[webui] WARNING: serving unauthenticated on "
