@@ -1008,6 +1008,102 @@ def test_credentials_come_from_argv_free_sources() -> None:
           "the raw argv credential path is gone")
 
 
+def test_transcript_fit() -> None:
+    """The guard against the one failure mode that ruins a clone: transcript != clip.
+
+    Measured on the GPU box: ICL with a mismatched transcript gave 17.4s of audio for a
+    5s sentence and WER 1.000 (vs 0.000 matched). Everything else — sliders, temperature,
+    non-streaming mode — moved the metrics far less.
+    """
+    good = " ".join(f"word{i}" for i in range(15))          # 15 words ~ 6s at 2.5 w/s
+    check(webui.transcript_fit(6.0, good) == "", "a matching transcript is not flagged")
+    check(webui.transcript_fit(6.0, good, x_vector_only=True) == "",
+          "x-vector mode ignores the transcript, so nothing to check")
+    check(webui.transcript_fit(0.0, good) == "", "no selection yet, no complaint")
+
+    msg = webui.transcript_fit(6.0, "")
+    check("No transcript" in msg and "x-vector" in msg, f"empty transcript is flagged: {msg}")
+
+    msg = webui.transcript_fit(6.0, "hello there")
+    check("too short" in msg, f"a two-word transcript for 6s is flagged: {msg}")
+
+    msg = webui.transcript_fit(2.0, good)
+    check("too long" in msg, f"15 words cannot fit in 2s: {msg}")
+
+    # Boundaries are a factor of 2 either way, so a brisk or slow speaker is not nagged.
+    check(webui.transcript_fit(6.0, " ".join(f"w{i}" for i in range(8))) == "",
+          "8 words in 6s (1.3 w/s) is inside the window")
+    check(webui.transcript_fit(6.0, " ".join(f"w{i}" for i in range(29))) == "",
+          "29 words in 6s (4.8 w/s) is inside the window")
+    check(webui.transcript_fit(6.0, " ".join(f"w{i}" for i in range(31))) != "",
+          "31 words in 6s is past the window")
+
+    # CJK counts characters, not whitespace-separated words, or every Chinese clip would warn.
+    chinese = "我" * 20
+    check(webui.transcript_fit(5.0, chinese) == "", "20 Chinese characters in 5s reads as normal")
+    check("too short" in webui.transcript_fit(12.0, chinese), "the same 20 characters in 12s is thin")
+    mixed = good + " " + "我" * 12
+    check(webui.transcript_fit(6.0, mixed) == "", "mixed scripts take the better-fitting rate")
+
+    check(webui.speech_units("two words 你好") == (2, 2), "word/character counting splits scripts")
+    check(webui.speech_units("") == (0, 0), "empty text has no units")
+
+
+def test_word_error_rate() -> None:
+    """The scoring metric behind best-of-N; it has to behave like the usual WER."""
+    wer = webui.word_error_rate
+    check(wer("Hello there friend", "Hello there friend") == 0.0, "identical text scores 0")
+    check(abs(wer("Hello there mate", "Hello there friend") - 1 / 3) < 1e-9,
+          "one substitution in three words is 0.33")
+    check(abs(wer("hello THERE friend", "Hello there friend") - 0.0) < 1e-9,
+          "case is not an error")
+    check(abs(wer("Hello, there! friend.", "Hello there friend") - 0.0) < 1e-9,
+          "punctuation is not an error")
+    check(wer("", "Hello there friend") == 1.0, "nothing said is 100% wrong")
+    check(wer("extra words here that were never asked for", "Hello there friend") > 1.0,
+          "rambling exceeds 1.0, which is how the mismatch case shows up")
+    check(wer("", "") == 0.0, "two empties agree")
+    check(abs(wer("你好世界", "你好世界") - 0.0) < 1e-9, "CJK compares per character")
+
+
+def test_choose_best_candidate() -> None:
+    """Content fidelity wins over timbre; similarity breaks ties."""
+    check(webui.choose_best_candidate([{"wer": 0.2, "sim": 0.99},
+                                       {"wer": 0.0, "sim": 0.90}]) == 1,
+          "a clean take beats a closer-sounding one that mispronounces")
+    check(webui.choose_best_candidate([{"wer": 0.1, "sim": 0.95},
+                                       {"wer": 0.1, "sim": 0.98}]) == 1,
+          "equal WER breaks the tie on speaker similarity")
+    check(webui.choose_best_candidate([{"wer": None, "sim": 0.91},
+                                       {"wer": None, "sim": 0.97}]) == 1,
+          "with ASR off, similarity alone decides")
+    check(webui.choose_best_candidate([{"wer": None, "sim": None}]) == 0,
+          "a single unscored candidate is still chosen")
+    check(webui.choose_best_candidate([{"wer": 0.5, "sim": None},
+                                       {"wer": 0.1, "sim": None}]) == 1,
+          "WER still ranks when similarity is unavailable")
+    try:
+        webui.choose_best_candidate([])
+        check(False, "empty candidate list should raise")
+    except ValueError:
+        check(True, "empty candidate list raises instead of returning a bogus index")
+
+
+def test_clone_tab_wires_the_quality_controls() -> None:
+    """Drift guard: the fit check and best-of-N must stay wired to real components."""
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+    check("cl_fit" in source and "clip_fit_status" in source,
+          "the Fit check box exists and is driven by the live checker")
+    check("cl_candidates" in source and "cl_seed" in source,
+          "best-of-N and seed controls are in the Clone tab")
+    check("+ [cl_candidates, cl_seed]" in source,
+          "they are actually passed into generate_voice_clone")
+    check(source.count("clip_fit_status") >= 5,
+          "the fit check is wired to transcript, sliders, x-vector and the post-action chains")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

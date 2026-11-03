@@ -95,7 +95,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (31 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (35 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -181,7 +181,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 31 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 35 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -201,6 +201,66 @@ exits non-zero, because a skip is not a pass; pass `--allow-skip` when the skip 
 `smoke_test.py` writes the audio it produces to `tests/output/` and asserts each clip is
 non-silent, non-clipping and of plausible length, so a silently-broken pipeline (e.g. a
 model left on CPU) fails the test rather than just feeling slow.
+
+## Getting the best quality
+
+Measured on the 5070 Ti box rather than guessed, because the obvious knobs turned out not
+to matter. Both metrics are the ones upstream benchmarks with: **SIM** = cosine similarity
+of the model's own speaker encoder between reference and output; **WER** = Whisper
+large-v3 on the output against the text that was requested.
+
+**The decode sliders are not the lever.** Same reference, same text, two seeds each:
+
+| config | SIM | WER |
+|---|---|---|
+| current defaults (t=0.90, top-p 1.0, top-k 50, rep 1.05) | 0.9912 | 0.000 |
+| `non_streaming_mode=True`, t=0.90 | 0.9910 | 0.067 |
+| `non_streaming_mode=True`, t=0.70, top-p 0.95 | 0.9913 | 0.000 |
+| current defaults, t=0.70, top-p 0.95 | 0.9916 | 0.000 |
+
+All inside noise — leave the sliders alone unless a take rambles, and then lower
+temperature or raise the repetition penalty.
+
+**The reference is the lever.** Same target text, one speaker, varying the reference:
+
+| reference | SIM | WER | output length |
+|---|---|---|---|
+| 1.8s clean | 0.987 | 0.000 | 5.0s |
+| 4.5s clean | 0.992 | 0.000 | 5.5s |
+| 9s clean | 0.993 | 0.133 | 5.6s |
+| 9s + broadband noise (SNR 10 dB) | **0.973** | 0.133 | 5.4s |
+| 9s at 10% peak level | 0.991 | 0.133 | 5.7s |
+| 9s, x-vector only | 0.991 | 0.133 | 4.9s |
+| 9s, **transcript does not match the clip** | 0.978 | **1.000** | **17.4s** |
+
+In order of how much each one actually costs you:
+
+1. **The transcript must match the clip.** Not a polish issue: with a mismatched
+   transcript the model produced 17.4s of audio for a 5s sentence at WER 1.000. The
+   *Fit check* line warns before you generate, and the status line repeats it after — it is
+   a plausibility guard (words per second against the selection's length), which is how
+   mismatches almost always present: the transcript of the whole upload, or a stub left in
+   the box. It cannot tell that a right-length transcript has the wrong words, so still
+   read what Whisper wrote. If you cannot get it right, tick **x-vector only** — 0.991 SIM
+   vs 0.993 for ICL on a clean reference, and immune to this failure entirely.
+2. **Use a clean reference.** Noise was the largest similarity loss measured (−0.020).
+   Quiet room, one speaker, no music, no reverb.
+3. **Length 4–10s.** 1.8s → 9s bought +0.006 SIM, most of it in the first seconds; past
+   ~5s it flattens, and long references make ICL runs more likely to ramble.
+4. **Recording level does not matter.** A reference peaking at 0.1 scored 0.991 — don't
+   bother normalising.
+5. **Set the language explicitly** instead of Auto, and on the CustomVoice tab pick a
+   speaker whose native language matches the text (upstream's own recommendation).
+6. **Shape the text.** Prosody follows punctuation; spell out numbers; split long scripts
+   into sentences, which also keeps you inside the 2048-token budget.
+
+**Sampling variance is real, which is what *Candidates (best of N)* is for.** Four seeds on
+identical inputs: SIM spread only 0.001, but WER was 0.000 on one seed and 0.133 on the
+others — the model occasionally serves a dud take and no slider fixes that. Generating
+three and keeping the best does. Set a **Seed** to reproduce a take you liked.
+
+Method: one English target sentence, single speaker per sweep, n=2–4 per row, so anything
+under ~0.005 SIM should be read as noise. The two findings above are far outside it.
 
 ## Design notes
 

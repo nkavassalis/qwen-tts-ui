@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from typing import List, Tuple
 
 import numpy as np
@@ -66,6 +67,14 @@ CASES = {
         instruct="A dry, unhurried documentary narrator in his sixties, slightly amused.",
         language="Auto",
         clone_text="Same voice, second line, still unmistakably the same person.",
+    ),
+    # Best-of-N: the real Clone callback, scoring each take with Whisper WER then speaker
+    # similarity, plus the seed field's reproducibility promise.
+    "best_of_n": dict(
+        ref_audio="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
+        ref_text="Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you.",
+        text="Picking the best of several takes should never pick a worse one by accident.",
+        seed=7,
     ),
     # Video upload path: spoken by Ryan, wrapped into an mp4, then imported / trimmed /
     # transcribed / cloned — the whole new pipeline in one case.
@@ -229,6 +238,67 @@ def run_media_pipeline(hub: webui.ModelHub, use_asr: bool = True) -> None:
     check_audio(clone_path, outs[0], out_sr)
 
 
+def run_best_of_n(hub: webui.ModelHub) -> None:
+    """Exercise the Clone callback's candidate scoring and the seed field.
+
+    Goes through webui.generate_voice_clone rather than the model API, so the wiring
+    (inputs, scoring, the report the user reads) is what is under test.
+    """
+    cfg = CASES["best_of_n"]
+    os.makedirs(webui.MEDIA_DIR, exist_ok=True)
+    ref_path = os.path.join(webui.MEDIA_DIR, "best_of_n_ref.wav")
+    if not os.path.exists(ref_path):
+        urllib.request.urlretrieve(cfg["ref_audio"], ref_path)
+    ref_wav, ref_sr = sf.read(ref_path, dtype="float32")
+
+    webui.ASR = webui.Transcriber()
+    try:
+        t0 = time.time()
+        audio, status = webui.generate_voice_clone(
+            (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, candidates=3, seed=cfg["seed"])
+        took = time.time() - t0
+        assert audio is not None, f"best-of-N generation failed: {status}"
+        sr, wav = audio
+        assert "Best of 3" in status, f"no best-of-N report in the status:\n{status}"
+        assert status.count("WER") >= 3, f"candidates were not scored by WER:\n{status}"
+        assert "kept #" in status, f"no winner named in the status:\n{status}"
+        assert "WARNING" not in status, f"a correct transcript must not be flagged:\n{status}"
+        print(f"  [best_of_n] {took:.1f}s | {status.splitlines()[-1]}")
+        path = os.path.join(OUT_DIR, "best_of_n.wav")
+        sf.write(path, wav, sr)
+        check_audio(path, wav, sr)
+
+        # The seed field promises reproducibility; two identical calls must agree bitwise.
+        first, _ = webui.generate_voice_clone(
+            (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, candidates=1, seed=99)
+        second, _ = webui.generate_voice_clone(
+            (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, candidates=1, seed=99)
+        assert first[1].shape == second[1].shape, "same seed changed the clip length"
+        assert np.array_equal(first[1], second[1]), "same seed did not reproduce the same audio"
+        print("  [best_of_n] seed reproduced identical audio across two calls")
+
+        # The fit guard is a plausibility check on words-per-second, so it catches the
+        # failure that was actually measured (transcript of the whole upload, or a stub left
+        # in) — not a same-length text with the wrong words. Assert exactly that.
+        _, too_short = webui.generate_voice_clone(
+            (ref_sr, ref_wav), "No.", cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, candidates=1, seed=5)
+        assert "WARNING" in too_short and "too short" in too_short, \
+            f"a one-word transcript for a multi-second clip was not flagged:\n{too_short}"
+        _, too_long = webui.generate_voice_clone(
+            (ref_sr, ref_wav), " ".join(["padding"] * 160), cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, candidates=1, seed=5)
+        assert "too long" in too_long, \
+            f"a 160-word transcript for a short clip was not flagged:\n{too_long}"
+        print("  [best_of_n] fit guard flagged both implausible transcripts")
+    finally:
+        webui.ASR.unload()
+        webui.ASR = None
+
+
 def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
     if capability == "media_pipeline":
         run_media_pipeline(hub, use_asr)
@@ -242,6 +312,16 @@ def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool
 
     if capability == "voice_library":
         run_voice_library(hub)
+        if not keep_gpu:
+            with hub.lock:
+                while hub.on_gpu:
+                    _, resident = hub.on_gpu.popitem(last=False)
+                    hub._move(resident, torch.device("cpu"))
+                    torch.cuda.empty_cache()
+        return
+
+    if capability == "best_of_n":
+        run_best_of_n(hub)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:

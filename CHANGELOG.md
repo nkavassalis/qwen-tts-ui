@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — clone quality: measured, then two guards added
+
+Measured first (SIM = the model's own speaker-encoder cosine, WER = Whisper large-v3
+against the requested text). Temperature / top-p / `non_streaming_mode` moved both metrics
+inside noise, so nothing was changed there. What did matter: a transcript that does not
+match the clip (WER 1.000 and 17.4s of audio for a 5s sentence) and reference noise
+(−0.020 SIM). Reference length pays up to ~5s; recording level does not matter at all
+(0.991 at 10% peak).
+
+- **Fit check** (`transcript_fit`, `clip_fit_status`): a live, non-blocking line on the
+  Voice Clone tab plus a WARNING appended to the generate status, catching a transcript
+  that cannot be what the selection says. Coarse on purpose (factor-of-2 words-per-second,
+  CJK counted per character so Chinese/Japanese/Korean clips are not falsely flagged).
+- **Best of N** (`Candidates` slider + `Seed` field): generates up to 4 takes and keeps the
+  best, ranked by WER then speaker similarity, with every candidate's score reported so the
+  choice is auditable. Falls back to similarity-only when transcription is disabled, and
+  scoring failures never sink a generation. Same seed + same inputs reproduces bit-identical
+  audio (asserted in the GPU tier).
+- README gains *Getting the best quality* with both sweep tables and the ranked advice.
+- Tests: CPU tier 31 → 35 (fit boundaries, CJK counting, WER semantics, candidate ranking,
+  UI wiring drift check). GPU tier gains a `best_of_n` case that drives the real callback.
+
 ## 2026-11-03 — save a cloned reference; targets 16GB Blackwell, not one SKU
 
 - The Voice Clone tab could *load* and *delete* saved voices but had no Save, so a voice

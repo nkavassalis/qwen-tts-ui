@@ -246,6 +246,120 @@ def _sampling(temperature, top_p, top_k, repetition_penalty) -> Dict[str, Any]:
 
 
 # ============================================================================
+# Quality: transcript/clip fit, and scoring best-of-N candidates
+# ============================================================================
+#
+# Both exist because of what was measured on the 5070 Ti box (README "Getting the best
+# quality"): decode knobs barely move SIM/WER, but a transcript that does not match the
+# clip is catastrophic (WER 1.0 and 3x the expected length), and sampling variance alone
+# can turn a good take into a bad one (WER 0.000 vs 0.133 across seeds).
+
+WORDS_PER_SECOND = 2.5      # ~150 wpm narration; the fit check's English rate
+CHARS_PER_SECOND = 4.0      # CJK is counted per character, not per word
+FIT_RATIO_LOW = 0.5
+FIT_RATIO_HIGH = 2.0
+MAX_CANDIDATES = 4          # best-of-N ceiling; each candidate is a full generation
+
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
+_WORD_RE = re.compile(r"[0-9A-Za-z\u00c0-\u024f']+")
+
+
+def speech_units(text: str) -> Tuple[int, int]:
+    """(words, cjk_chars) actually present — the two scripts need different rates."""
+    if not text:
+        return 0, 0
+    cjk = len(_CJK_RE.findall(text))
+    words = len(_WORD_RE.findall(_CJK_RE.sub(" ", text)))
+    return words, cjk
+
+
+def transcript_fit(seconds: float, text: str, x_vector_only: bool = False) -> str:
+    """Non-blocking warning when the transcript cannot possibly be what the clip says.
+
+    ICL cloning conditions on the reference transcript, so a mismatch does not just sound
+    worse — the model keeps decoding (measured: 17.4s of audio for a 5s sentence, WER 1.0
+    against 0.0). The check is deliberately coarse: a factor-of-2 window on words-per-
+    second, because its job is to catch "transcript of the whole upload" and "left the
+    placeholder in", not to nitpick a fast speaker.
+    """
+    if x_vector_only or not seconds or seconds <= 0:
+        return ""
+    words, cjk = speech_units(text)
+    if not words and not cjk:
+        return ("No transcript — ICL cloning needs one. Transcribe the clip, or tick "
+                "'x-vector only' to clone from the speaker embedding alone.")
+    ratios = []
+    if words:
+        ratios.append(words / (seconds * WORDS_PER_SECOND))
+    if cjk:
+        ratios.append(cjk / (seconds * CHARS_PER_SECOND))
+    ratio = max(ratios)  # whichever script fits better, so mixed text is not punished
+    spoken = (words / WORDS_PER_SECOND) if words else (cjk / CHARS_PER_SECOND)
+    if ratio < FIT_RATIO_LOW:
+        return (f"Transcript looks too short for a {seconds:.1f}s clip: {words + cjk} word(s) "
+                f"is about {spoken:.1f}s of speech. A mismatched transcript makes the model "
+                f"ramble — transcribe the selection, or tick 'x-vector only'.")
+    if ratio > FIT_RATIO_HIGH:
+        return (f"Transcript looks too long for a {seconds:.1f}s clip: {words + cjk} word(s) "
+                f"is about {spoken:.1f}s of speech. It probably covers more than the shaded "
+                f"selection — cut it down to what that stretch actually says, or widen it.")
+    return ""
+
+
+def word_error_rate(hypothesis: str, reference: str) -> float:
+    """Word-level edit distance / reference length; case and punctuation insensitive."""
+    def tokens(text: str) -> List[str]:
+        return [t.lower() for t in _WORD_RE.findall(text or "")] + list(_CJK_RE.findall(text or ""))
+
+    hyp, ref = tokens(hypothesis), tokens(reference)
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    previous = list(range(len(ref) + 1))
+    for i, h in enumerate(hyp, start=1):
+        current = [i]
+        for j, r in enumerate(ref, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1,
+                               previous[j - 1] + (h != r)))
+        previous = current
+    return previous[-1] / float(len(ref))
+
+
+def choose_best_candidate(metrics: List[Dict[str, Optional[float]]]) -> int:
+    """Index of the best candidate: content fidelity first, then speaker similarity.
+
+    WER is the tie-breaker that matters — a candidate that says the wrong words is worse
+    no matter how close its timbre is. When ASR is disabled every WER is None and ranking
+    falls back to similarity alone.
+    """
+    if not metrics:
+        raise ValueError("no candidates to choose from")
+
+    def key(item: Tuple[int, Dict[str, Optional[float]]]):
+        index, m = item
+        wer = m.get("wer")
+        sim = m.get("sim")
+        return (float("inf") if wer is None else round(float(wer), 3),
+                -(float("inf") if sim is None else float(sim)), index)
+
+    return min(enumerate(metrics), key=key)[0]
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-12))
+
+
+def _to_24k(wav: np.ndarray, sr: int) -> np.ndarray:
+    """The speaker encoder only accepts 24kHz mono (it asserts)."""
+    wav = np.asarray(wav, dtype=np.float32)
+    if int(sr) == 24000:
+        return wav
+    import librosa
+    return np.asarray(librosa.resample(y=wav, orig_sr=int(sr), target_sr=24000), dtype=np.float32)
+
+
+# ============================================================================
 # Model loading + VRAM management
 # ============================================================================
 class ModelHub:
@@ -1087,6 +1201,7 @@ def _clone_cache_key(audio_tuple, ref_text, x_vector_only) -> str:
 
 def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector_only,
                          temperature, top_p, top_k, rep_penalty,
+                         candidates=1, seed="",
                          progress=gr.Progress(track_tqdm=True)):
     if not target_text or not target_text.strip():
         return None, "Error: Target text is required."
@@ -1095,6 +1210,21 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         return None, "Error: Reference audio is required."
     if not use_xvector_only and not (ref_text or "").strip():
         return None, "Error: Reference text is required when 'x-vector only' is off."
+    try:
+        n = max(1, min(int(candidates or 1), MAX_CANDIDATES))
+    except (TypeError, ValueError):
+        return None, "Error: Candidates must be a whole number."
+    seed_text = str(seed or "").strip()
+    if seed_text:
+        if not re.fullmatch(r"-?\d+", seed_text):
+            return None, "Error: Seed must be an integer (or blank for random)."
+        base_seed = int(seed_text) % (2 ** 31)
+    else:
+        base_seed = int(time.time() * 1000) % (2 ** 31)
+
+    ref_seconds = len(audio_tuple[0]) / float(audio_tuple[1])
+    fit = transcript_fit(ref_seconds, ref_text or "", bool(use_xvector_only))
+    asr_language = None if (not language or language == "Auto") else str(language)
     try:
         budget = _budget(target_text)
         with HUB.lock:
@@ -1109,14 +1239,64 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 )
                 _CLONE_PROMPTS.clear()
                 _CLONE_PROMPTS[key] = prompt
-            wavs, sr = tts.generate_voice_clone(
-                text=target_text.strip(),
-                language=language,
-                voice_clone_prompt=prompt,
-                max_new_tokens=budget,
-                **_sampling(temperature, top_p, top_k, rep_penalty),
-            )
-        return _ok((sr, wavs[0]), _report(wavs[0], sr, budget, "VoiceClone"))
+
+            ref_embedding = None
+            try:
+                ref_embedding = tts.model.extract_speaker_embedding(
+                    audio=_to_24k(audio_tuple[0], audio_tuple[1]), sr=24000)
+                ref_embedding = ref_embedding.float().cpu().numpy()
+            except Exception:  # noqa: BLE001 - similarity is a bonus, never a blocker
+                ref_embedding = None
+
+            results: List[Dict[str, Any]] = []
+            for i in range(n):
+                if n > 1:
+                    progress((i + 1) / (n + 2.0), desc=f"Candidate {i + 1} of {n}")
+                torch.manual_seed(base_seed + i)
+                wavs, sr = tts.generate_voice_clone(
+                    text=target_text.strip(),
+                    language=language,
+                    voice_clone_prompt=prompt,
+                    max_new_tokens=budget,
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+                wav = wavs[0]
+                sim = wer = None
+                if ref_embedding is not None:
+                    try:
+                        cand = tts.model.extract_speaker_embedding(
+                            audio=_to_24k(wav, sr), sr=24000).float().cpu().numpy()
+                        sim = _cosine(ref_embedding, cand)
+                    except Exception:  # noqa: BLE001
+                        sim = None
+                if n > 1 and ASR is not None and ASR.enabled:
+                    try:
+                        wer = word_error_rate(ASR.transcribe(wav, sr, asr_language), target_text)
+                    except Exception:  # noqa: BLE001 - scoring must not sink the generation
+                        wer = None
+                results.append({"index": i + 1, "wav": wav, "sr": int(sr), "sim": sim, "wer": wer})
+
+        best = choose_best_candidate(results)
+        chosen = results[best]
+        report = _report(chosen["wav"], chosen["sr"], budget, "VoiceClone")
+        notes: List[str] = []
+        if n > 1:
+            def fmt(m: Dict[str, Any]) -> str:
+                bits = []
+                if m["wer"] is not None:
+                    bits.append(f"WER {m['wer']:.2f}")
+                if m["sim"] is not None:
+                    bits.append(f"SIM {m['sim']:.3f}")
+                return f"#{m['index']} " + " ".join(bits)
+            scored_by = ("Whisper WER + speaker similarity"
+                         if any(m["wer"] is not None for m in results)
+                         else "speaker similarity (transcription off)")
+            notes.append(f"Best of {n}: kept #{results[best]['index']} ({scored_by}) — "
+                         + ", ".join(fmt(m) for m in results))
+        if fit:
+            notes.append("WARNING: " + fit)
+        status = report + (("\n" + "\n".join(notes)) if notes else "")
+        return _ok((chosen["sr"], chosen["wav"]), status)
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}"
 
@@ -1207,6 +1387,15 @@ def transcribe_reference(state: Any, start: Any, end: Any, language: Any) -> Tup
             f"check and edit the text before cloning.")
     except (MediaError, OSError, ValueError, RuntimeError) as e:
         return gr.update(), f"Error: {type(e).__name__}: {e}"
+
+
+def clip_fit_status(ref_text: Any, start: Any, end: Any, x_vector_only: Any = False) -> Any:
+    """Live transcript/clip sanity line for the Clone tab; it never blocks a generation."""
+    try:
+        seconds = max(0.0, float(end or 0.0) - float(start or 0.0))
+    except (TypeError, ValueError):
+        return gr.update()
+    return gr.update(value=transcript_fit(seconds, ref_text or "", bool(x_vector_only)))
 
 
 def refresh_status():
@@ -1303,7 +1492,8 @@ after a model switch pays a few seconds of load time.
                     "selection to the best stretch, transcribe it, then synthesize new text. "
                     "A clean 3–10s window clones best. **Keep things:** *Save to voice library* "
                     "stores the reference clip for reuse; every audio player has a download "
-                    "icon for the generated wav.")
+                    "icon for the generated wav. **Quality comes from the reference and its "
+                    "transcript**, not the sliders — see the README's quality section.")
                 cl_media_state = gr.State(value=None)
                 cl_upload = gr.File(label="Upload video or audio", file_types=MEDIA_SUFFIXES,
                                     type="filepath")
@@ -1333,6 +1523,7 @@ after a model switch pays a few seconds of load time.
                     placeholder="Exact text spoken in the selected clip. Transcribe it above, then fix anything Whisper got wrong.")
                 cl_xvector = gr.Checkbox(
                     label="x-vector only (no transcript needed, lower similarity)", value=False)
+                cl_fit = gr.Textbox(label="Fit check", lines=1, interactive=False)
 
                 with gr.Row():
                     cl_voice_name = gr.Textbox(
@@ -1349,6 +1540,14 @@ after a model switch pays a few seconds of load time.
                         cl_text = gr.Textbox(label="Target text", lines=4,
                                              placeholder="What the cloned voice should say...")
                         cl_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
+                        with gr.Row():
+                            cl_candidates = gr.Slider(1, MAX_CANDIDATES, value=1, step=1,
+                                                      label="Candidates (best of N)",
+                                                      info="Each extra take costs ~7s. Helps when the "
+                                                           "model flubs a take; scored by Whisper WER then "
+                                                           "speaker similarity.")
+                            cl_seed = gr.Textbox(label="Seed (blank = random)", value="", scale=1,
+                                                 info="Same seed + same inputs reproduces the same audio.")
                         cl_btn = gr.Button("Clone & generate", variant="primary")
 
                 with gr.Row():
@@ -1365,21 +1564,34 @@ after a model switch pays a few seconds of load time.
                     cl_audio = gr.Audio(label="Generated audio", type="numpy")
                     cl_status = gr.Textbox(label="Status", lines=2, interactive=False)
                 cl_btn.click(generate_voice_clone,
-                             inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling,
+                             inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling
+                                    + [cl_candidates, cl_seed],
                              outputs=[cl_audio, cl_status])
+
+                # Transcript/clip fit is a live, non-blocking check: a transcript that does not
+                # match the selection is the worst clone failure mode we measured, and it is
+                # invisible until the model has rambled for 17 seconds.
+                fit_inputs = [cl_ref_text, cl_start, cl_end, cl_xvector]
+                cl_ref_text.change(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
+                cl_xvector.change(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
+                cl_start.release(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
+                cl_end.release(clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
 
                 cl_import_btn.click(import_media, inputs=[cl_upload],
                                     outputs=[cl_media_state, cl_media_status, cl_wave,
-                                             cl_start, cl_end, cl_ref_audio, cl_clip_info])
+                                             cl_start, cl_end, cl_ref_audio, cl_clip_info]).then(
+                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
                 cl_start.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
                                  outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
                 cl_end.release(update_clip, inputs=[cl_media_state, cl_start, cl_end],
                                outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
                 cl_auto_btn.click(auto_pick_clip, inputs=[cl_media_state],
-                                  outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end])
+                                  outputs=[cl_wave, cl_ref_audio, cl_clip_info, cl_start, cl_end]).then(
+                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
                 cl_transcribe_btn.click(transcribe_reference,
                                         inputs=[cl_media_state, cl_start, cl_end, cl_asr_language],
-                                        outputs=[cl_ref_text, cl_media_status])
+                                        outputs=[cl_ref_text, cl_media_status]).then(
+                    clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
 
                 vd_save_btn.click(save_designed_voice,
                                   inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],

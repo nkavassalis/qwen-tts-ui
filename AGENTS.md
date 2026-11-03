@@ -30,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 31 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 35 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 31 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 35 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 31/31 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 35/35 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,11 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **Quality lives in the reference, not the sliders** (measured — see README *Getting the
+  best quality*). Decode knobs moved SIM/WER inside noise; a transcript that does not match
+  the clip cost WER 1.000 and 3x the output length. Hence `transcript_fit()` (a coarse
+  words-per-second guard, deliberately not blocking) and best-of-N scored by WER then
+  speaker similarity. Do not "optimise" by removing either to save a few seconds.
 - **`max_new_tokens` is bounded by prompt length** (`_budget()`, cap 2048). The checkpoint
   default is 8192 and ICL cloning sometimes never emits EOS: one run produced 163s of
   audio for one sentence.
