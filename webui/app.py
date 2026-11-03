@@ -2,8 +2,10 @@
 """
 qwen3-tts-ui — a local Qwen3-TTS Gradio web UI.
 
-Five tabs: preset voices, design-a-voice, clone-a-voice, a one-call **Speak** endpoint for
-scripts (`scripts/say.py`), and a **Chat** tab that streams a reply sentence by sentence.
+Four tabs: design-a-voice, clone-a-voice, a one-call **Speak** endpoint for scripts
+(`scripts/say.py`), and a **Chat** tab that streams a reply sentence by sentence. A saved
+voice is clip + transcript, or a description; `voice_kind` picks the route, and the
+description is the higher-fidelity one (see the measurement in that docstring).
 
 Adapted from the official Hugging Face Space (Qwen/Qwen3-TTS app.py) for a single
 local GPU. Differences from the Space version:
@@ -61,74 +63,22 @@ ROOT = os.path.dirname(HERE)
 MODELS_DIR = os.environ.get("QWEN_TTS_MODELS_DIR", os.path.join(ROOT, "models"))
 
 # (tab name, checkpoint dir name, model type)
+# Two checkpoints, two ways to make a voice: describe one, or clone one. The third
+# upstream capability (CustomVoice, nine preset speakers) is not shipped — see the
+# README: the product is your voices, not Alibaba's, and every preset was a path around
+# the thing this app is for.
 CAPABILITIES = OrderedDict(
     [
-        ("custom_voice", ("Qwen3-TTS-12Hz-1.7B-CustomVoice", "custom_voice")),
         ("voice_design", ("Qwen3-TTS-12Hz-1.7B-VoiceDesign", "voice_design")),
         ("voice_clone", ("Qwen3-TTS-12Hz-1.7B-Base", "base")),
     ]
 )
 
-# Speaker metadata from the model card, surfaced as dropdown labels. Dialect is a
-# property of the speaker, not a selectable language: the checkpoint carries
-# `talker_config.spk_is_dialect` (dylan -> beijing_dialect, eric -> sichuan_dialect)
-# and upstream deliberately strips the dialects from `get_supported_languages()`
-# (modeling_qwen3_tts.py:1831-1834). So you get the Beijing accent by picking Dylan, and
-# passing language="beijing_dialect" is rejected — do not re-add them to the list below.
-SPEAKER_INFO = {
-    "vivian":     ("Bright, slightly edgy young female voice", "Chinese"),
-    "serena":     ("Warm, gentle young female voice", "Chinese"),
-    "uncle_fu":   ("Seasoned male voice, low and mellow", "Chinese"),
-    "dylan":      ("Youthful Beijing male voice, clear and natural", "Chinese (Beijing dialect)"),
-    "eric":       ("Lively Chengdu male voice, slightly husky", "Chinese (Sichuan dialect)"),
-    "ryan":       ("Dynamic male voice, strong rhythmic drive", "English"),
-    "aiden":      ("Sunny American male voice, clear midrange", "English"),
-    "ono_anna":   ("Playful Japanese female voice, light and nimble", "Japanese"),
-    "sohee":      ("Warm Korean female voice, rich emotion", "Korean"),
-}
-
-SPEAKERS = ["Aiden", "Dylan", "Eric", "Ono_anna", "Ryan",
-            "Serena", "Sohee", "Uncle_fu", "Vivian"]
-
-
-def speaker_choices(models_dir: str = MODELS_DIR) -> List[Tuple[str, str]]:
-    """Speaker dropdown entries, driven by the checkpoint's own speaker table.
-
-    Reads `talker_config.spk_id` from the CustomVoice config (cheap JSON, no weights)
-    so the UI can never offer a speaker the checkpoint does not know.
-    """
-    config_path = os.path.join(models_dir, "Qwen3-TTS-12Hz-1.7B-CustomVoice", "config.json")
-    names = [s.lower() for s in SPEAKERS]
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, encoding="utf-8") as fh:
-                names = list(json.load(fh)["talker_config"]["spk_id"].keys())
-        except (OSError, ValueError, KeyError):
-            pass  # fall back to the hard-coded list if the checkpoint is absent/corrupt
-    choices = []
-    for name in names:
-        description, native = SPEAKER_INFO.get(name, ("", ""))
-        label = " — ".join(part for part in (name.replace("_", " ").title(), description, native) if part)
-        choices.append((label, name))
-    return choices
-
-
-def default_speaker(models_dir: str = MODELS_DIR) -> str:
-    """The speaker the dropdown preselects — always one the checkpoint actually has.
-
-    Hard-coding "ryan" broke silently whenever the checkpoint's own `spk_id` table
-    differed: Gradio accepted a value that was not in `choices`, the box came up empty,
-    and Generate died with "Speaker is required".
-    """
-    values = [value for _, value in speaker_choices(models_dir)]
-    if "ryan" in values:
-        return "ryan"
-    return values[0] if values else "ryan"
-
-
 # (UI label, value passed to the model). Values must match `talker_config.codec_language_id`
-# keys *and* upstream's supported-language filter, which excludes the dialect entries —
-# see the note above. The hosted Space also omits Italian, which the model does accept.
+# keys *and* upstream's supported-language filter, which excludes dialect values: dialects
+# were a property of the CustomVoice preset speakers (dylan -> beijing_dialect, eric ->
+# sichuan_dialect), and that capability is not shipped. Italian is included — the hosted
+# Space omits it by oversight, the checkpoint accepts it.
 LANGUAGE_CHOICES = [
     ("Auto (detect)", "Auto"),
     ("Chinese", "Chinese"),
@@ -1623,35 +1573,6 @@ ASR: Optional[Transcriber] = None
 # ============================================================================
 # Gradio callbacks
 # ============================================================================
-def generate_custom_voice(text, language, speaker, instruct, temperature, top_p, top_k, rep_penalty,
-                          postproc=POSTPROCESS_DEFAULT, progress=gr.Progress(track_tqdm=True)):
-    if not text or not text.strip():
-        return None, "Error: Text is required."
-    if not speaker:
-        return None, "Error: Speaker is required."
-    try:
-        budget = _budget(text)
-        with HUB.lock:
-            tts = HUB.acquire("custom_voice")
-
-            def one(chunk: str) -> Tuple[np.ndarray, int]:
-                wavs, rate = tts.generate_custom_voice(
-                    text=chunk,
-                    language=language,
-                    speaker=speaker.lower().replace(" ", "_"),
-                    instruct=(instruct or "").strip() or None,
-                    non_streaming_mode=True,
-                    max_new_tokens=_budget(chunk),
-                    **_sampling(temperature, top_p, top_k, rep_penalty),
-                )
-                return wavs[0], rate
-
-            wav, sr, chunk_notes = generate_chunked(text, language, one, progress)
-        return _ok(*_present(wav, sr, budget, "CustomVoice", postproc, chunk_notes))
-    except Exception as e:  # noqa: BLE001 - surface errors in the UI instead of killing the server
-        return None, f"Error: {type(e).__name__}: {e}"
-
-
 def generate_voice_design(text, language, voice_description, temperature, top_p, top_k, rep_penalty,
                           postproc=POSTPROCESS_DEFAULT, progress=gr.Progress(track_tqdm=True)):
     if not text or not text.strip():
@@ -2479,13 +2400,8 @@ def build_ui() -> gr.Blocks:
                                                               secondary_hue="slate")) as demo:
         gr.Markdown(
             """# qwen3-tts-ui
-Text to speech that runs entirely on this machine — no cloud, no API keys, nothing leaves
-the box. Nine preset voices, voices invented from a description, and cloning from a few
-seconds of audio.
-
-**Preset voices** pick a speaker and direct them in words · **Design a voice** invents one
-from a description · **Clone a voice** works from a ~3s clip · **Speak** and **Chat** are the
-same saved voices, reachable from a script or a chat box.
+**Design a voice** invents one from a description · **Clone a voice** works from a ~3s clip ·
+**Speak** and **Chat** talk as anything you have saved, from the browser or from a script.
 
 *Weights live in CPU RAM and move onto the GPU on demand, so the first request after you
 switch tabs pays a couple of seconds. Details in the Runtime line below.*
@@ -2517,29 +2433,6 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
         output_options = [s_postproc]
 
         with gr.Tabs():
-            with gr.Tab("Preset voices"):
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        cv_text = gr.Textbox(
-                            label="Text to synthesize", lines=4,
-                            value="Hello! Welcome to Qwen3-TTS. This runs entirely on my own GPU.",
-                            placeholder="Enter the text you want to convert to speech...",
-                        )
-                        with gr.Row():
-                            cv_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="English")
-                            cv_speaker = gr.Dropdown(label="Speaker", choices=speaker_choices(), value=default_speaker())
-                        cv_instruct = gr.Textbox(
-                            label="Style instruction (optional)", lines=2,
-                            placeholder="e.g. Speak in a cheerful, energetic tone / 用愤怒的语气说",
-                        )
-                        cv_btn = gr.Button("Generate speech", variant="primary")
-                    with gr.Column(scale=2):
-                        cv_audio = gr.Audio(label="Generated audio", type="numpy")
-                        cv_status = gr.Textbox(label="Status", lines=2, interactive=False)
-                cv_btn.click(generate_custom_voice,
-                             inputs=[cv_text, cv_language, cv_speaker, cv_instruct] + sampling + output_options,
-                             outputs=[cv_audio, cv_status])
-
             with gr.Tab("Design a voice"):
                 with gr.Row():
                     with gr.Column(scale=2):

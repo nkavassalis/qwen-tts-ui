@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — CustomVoice removed; voices can ship as descriptions
+
+### Removed
+
+- **The Preset voices tab, and the CustomVoice checkpoint with it.** Nine speakers of someone
+  else's, a second 4.3GB download, and a path around the thing this app is for. The product is
+  your voices: designed, cloned, saved, spoken. `CAPABILITIES` is now two entries, `SPEAKERS` /
+  `SPEAKER_INFO` / `speaker_choices()` / `default_speaker()` / `generate_custom_voice()` are
+  gone, `setup.sh` downloads ~9.3GB instead of ~14GB, and the smoke test drops `custom_voice`
+  and `dialect` (8 cases). The language dropdown keeps its dialect guard — re-adding a
+  `*_dialect` value still raises at generate time — and
+  `test_language_choices_match_checkpoint` now reads the VoiceDesign config, which is the
+  checkpoint that ships.
+- The header tagline. The tab names say what the app does.
+
+### Added
+
+- **A saved voice can be a description rather than a clip.** `voice_kind()` routes it: a
+  record with a description is spoken by Voice Design, one with a clip is cloned, and the
+  dropdown labels them `Fox (described)` vs `Booth (3.9s)`. Speak and Chat prefer the
+  description because it is measurably the fuller sound — energy above 9kHz on identical
+  lines: designed **2.67m**, clone of a real clip 0.89m, clone of a generated take **0.57m**.
+  The vocoder is not the cause (white noise crosses it at 95%, an output round-trips at 90%);
+  `generate_icl_prompt` prefixes the reference's own codec codes, so a clone inherits the
+  reference's spectrum, quantisation included. The clip is still kept and still what the Clone
+  tab loads, because a frozen clip is the steadier identity (pairwise 0.993 vs 0.974).
+- **`fox` ships as a paragraph, not a recording.** `scripts/make_voice.py` renders her at
+  `setup.sh` time (`--voices` re-runs it; `--no-clip` needs no GPU). No one's voice in the
+  repository, and the route that measures best.
+- `load_saved_voice` refuses a clip-less recipe and names the alternative instead of failing
+  with "missing its audio".
+- `speak_api` (GPU tier) also speaks a described voice, asserting it acquires `voice_design`
+  and never touches the clone path — the route `fox` depends on.
+
+### Tests
+
+- CPU tier 73/73 (two speaker tests went with the checkpoint, one recipe-routing case added);
+  GPU tier 8/8.
+- `long_text` re-baselined, and its docstring carries the reason: its pacing/WER constants came
+  from the `ryan` preset, and one pass with the shipped voice measured 3.39 words/s / WER 0.62
+  on one run and 1.40 words/s on another — without chunking this checkpoint either rushes or
+  rambles, so an in-run comparison against one pass failed by *beating* a degenerate single
+  pass. Absolute bands on the chunked output now carry it, with the measurements recorded.
+
 ## 2026-11-03 — the auto-pick now says which take it picked, and a saved take reaches every tab
 
 Two things Nick noticed by using it.

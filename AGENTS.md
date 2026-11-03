@@ -13,10 +13,14 @@ A local, offline deployment of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen
 (1.7B checkpoints) behind a Gradio UI, tuned for **one** 16GB Blackwell consumer GPU —
 RTX 5070 Ti, RTX 5080, anything in that class (the 5070 Ti is the SKU it is developed and
 tested on, not the only one it targets). The product name is **qwen3-tts-ui** (the repo, the
-browser tab title and the README H1 all agree). Five tabs: **Preset voices** (9 speakers),
-**Design a voice** (from a text description), **Clone a voice** (from a ~3-10s reference
-clip), **Speak** (the one-call endpoint `scripts/say.py` uses) and **Chat** (streams a reply
-sentence by sentence). Nick uses it at his desk; it is not a service.
+browser tab title and the README H1 all agree). Four tabs: **Design a voice** (from a text
+description), **Clone a voice** (from a ~3-10s reference clip), **Speak** (the one-call
+endpoint `scripts/say.py` uses) and **Chat** (streams a reply sentence by sentence). Nick uses
+it at his desk; it is not a service.
+
+Two checkpoints ship (`VoiceDesign` + `Base` + the tokenizer, ~9.3GB). The third upstream
+capability, CustomVoice with its nine preset speakers, was removed: the product is your
+voices, not Alibaba's, and every preset was a path around the thing the app is for.
 
 **Voice cloning is the harmful-use surface.** The README's *Ethical use* section and the Clone
 tab's own note are part of the product, not decoration: keep them, and keep any new cloning
@@ -46,14 +50,14 @@ README.md              human-facing docs, troubleshooting table
 CHANGELOG.md           one entry per change, newest first
 
 gitignored, created on demand:
-.venv/  models/ (~14GB weights)  repo/ (upstream checkout)  voices/  tmp/media/
+.venv/  models/ (~9.3GB weights)  repo/ (upstream checkout)  voices/  tmp/media/
 certs/  logs/  tests/output/  .qwen-tts.lock  .gradio/
 ```
 
 ## How to run
 
 ```bash
-./setup.sh                       # uv venv + torch cu128 + upstream + 14GB weights + Whisper
+./setup.sh                       # uv venv + torch cu128 + upstream + 9.3GB weights + Whisper + fox
 ./run.sh                         # -> http://127.0.0.1:7860, "Runtime:" line shows GPU/RAM
 ./run.sh --ip 0.0.0.0 --username u --password-file ~/tts.pw   # LAN, authenticated
 ./run.sh --ssl-self-signed --ip 0.0.0.0 --username u --password-file ~/tts.pw   # browser mic needs HTTPS
@@ -98,13 +102,26 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   LRU cap, and the `MemAvailable`/VRAM floors. Do not weaken any of them; verified live
   2026-11-02 that a second server refuses to start and names the holder.
 - **`sdpa`, not flash-attn.** flash-attn 2 ships no sm_120 (Blackwell) wheels.
-- **Dialect is a speaker trait, not a language.** The checkpoint carries
-  `talker_config.spk_is_dialect` (`dylan → beijing_dialect`, `eric → sichuan_dialect`) and
-  upstream filters dialects out of `supported_languages`
-  (`modeling_qwen3_tts.py:1831-1834`), so `language="beijing_dialect"` raises
-  `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
-  `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
-  omits it by oversight.
+- **Cloning keeps ~60% of its reference's top end, so a described voice is the higher-fidelity
+  form.** Measured on the same lines, raw 24kHz decode, energy above 9kHz: designed 2.67m,
+  clone of a real clip 0.89m, clone of a generated take 0.57m. The codec is not the cause —
+  white noise crosses it at 95% and an output round-trips at ~90% — the top end is missing in
+  the tokens the talker chose. `generate_icl_prompt` prefixes the reference's own codec codes,
+  so the clone inherits the reference's spectrum, quantisation included. Hence a voice record
+  carries a clip, a description, or both, and Speak/Chat prefer the description
+  (`voice_kind`, `_voice_synth`). The counterweight: a frozen clip is the steadier identity
+  (pairwise 0.993 vs 0.974), which is why the clip is kept and what the Clone tab loads.
+- **`fox` ships as words, not as a recording.** `setup.sh` creates her with
+  `scripts/make_voice.py`; the repository carries a paragraph, and your GPU renders the voice.
+  That keeps anyone's voice out of a public repo (see README → Ethical use) and takes the route
+  that measures best. The description is written before any GPU work so the voice exists even
+  where the clip cannot be rendered.
+- **Dialect is a speaker trait, not a language — and no longer exists here.** CustomVoice
+  carried `talker_config.spk_is_dialect` (`dylan → beijing_dialect`) and upstream filters those
+  out of `supported_languages` (`modeling_qwen3_tts.py:1831-1834`), so
+  `language="beijing_dialect"` raises `ValueError: Unsupported languages`. The capability is
+  removed; the guard stays in `test_language_choices_match_checkpoint` so the dropdown cannot
+  quietly grow a dialect back. Italian *is* selectable — the hosted Space omits it by oversight.
 - **The chat tab streams *sentences*, not samples — and says so.** There is no partial-audio
   API upstream; `non_streaming_mode` in the model code is about text going in, not audio coming
   out. `chat_say` is a **generator** over `iter_chunked` that yields each piece as it is
@@ -248,10 +265,11 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
    `Transcriber.load()`. Ad-hoc `from_pretrained` bypasses every floor. (not automated)
 3. `ModelHub._move()` moves the talker *and* every non-Module wrapper holding an
    `nn.Module`. `test_move_reaches_the_speech_tokenizer`.
-4. Language dropdown values ⊆ what the checkpoint accepts, dialects excluded, Italian
-   present. `test_language_choices_match_checkpoint`.
-5. Speakers come from the checkpoint's `spk_id` table, and the preselected default is one
-   of them. `test_speaker_choices_come_from_the_checkpoint`, `test_default_speaker_is_offered`.
+4. Language dropdown values ⊆ what the checkpoint accepts, no dialect values selectable,
+   Italian present. `test_language_choices_match_checkpoint`.
+5. A saved voice is spoken by the route its record implies: a description goes through Voice
+   Design, a clip through the clone path, and the dropdown labels which is which.
+   `test_a_described_voice_is_spoken_from_its_description`.
 6. Every generation path sets `max_new_tokens` from `_budget()`. `test_budget`, `test_report`.
 7. `gr.State` values are JSON-serialisable. `test_media_state_is_json_serialisable`.
 8. A browser-named path is only ever opened inside `allowed_input_roots()`.
@@ -355,7 +373,8 @@ tier the hardening pass could not execute:
 
 Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunking:
 
-- **CPU tier 74/74**, **GPU tier 10/10** (adds `long_text`, `speak_api`, `chat_stream`).
+- **CPU tier 73/73**, **GPU tier 8/8** (CustomVoice and the dialect case went with the
+  checkpoint; `speak_api` now also speaks a described voice).
 - **Chat streaming measured**: 60-word reply → **first audio at 12.6s**, whole reply 30.2s, 3
   pieces, 17.0s of speech, log text identical to the input.
 - **One GPU assertion was corrected, and it is on the record here because it touches the
@@ -368,6 +387,16 @@ Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunkin
   join behaviour remains pinned where seams are knowable: the CPU tier's
   `test_stitch_trims_and_crossfades`. The pacing, duration, level and WER assertions were not
   touched.
+- **`long_text`'s baselines were voice-dependent, and the voice changed.** Its pacing and WER
+  bounds were measured on the CustomVoice `ryan` preset (4.04 words/s, WER 0.68 one pass). On
+  the designed voice that now ships, one pass over the same 300 words measured 3.39 words/s /
+  WER 0.62 on one run and **1.40 words/s** on another: without chunking this checkpoint either
+  rushes or rambles, so an in-run "chunked must be slower than one pass" assertion failed by
+  beating a degenerate single pass. The case now asserts absolute bands on the chunked output
+  (0.6–3.6 words/s, WER < 0.85) and prints the one-pass figures, which are recorded in the
+  docstring. The WER instrument itself wanders ±0.15 on this corpus (one sentence × 10, hard
+  20s windows, Whisper hallucinating repeats — it measured 0.42, 0.47 and 0.77 for the same
+  route), which is why it carries a catastrophe bound and not the claim.
 - **Assistant API verified live**: `scripts/say.py --list` and a real `/speak` call over HTTP
   returned 3.68s @ 48kHz, peak 0.9999 with `clipped_fraction` 5.7e-6 (one sample in 176k — a
   graze, not clipping), RMS 0.144, no defect flags.
@@ -390,8 +419,9 @@ Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunkin
 - **The three memory guardrails** (lock, `max_cpu_resident`, RAM/VRAM floors) — they
   exist because the machine hard-locked. Nick's OK required.
 - **`ModelHub._move()`** — bypassing it costs 25x inference and produces no error.
-- **The dialect/language split** — re-adding `*_dialect` to the dropdown raises at
-  generate time.
+- **The dialect/language split** — CustomVoice is gone, but re-adding `*_dialect` to the
+  language dropdown raises at generate time (upstream filters them out of
+  `supported_languages`).
 - **`UPSTREAM_REF` in `setup.sh`** — moving it off the SHA Nick tested changes the model
   code under a "working" install; freeze deliberately, not casually.
 - **`tests/smoke_test.py`'s audio assertions** (rms/peak/duration) — they are what catch

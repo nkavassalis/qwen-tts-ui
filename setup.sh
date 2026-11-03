@@ -30,7 +30,6 @@ UPSTREAM_REF="${QWEN_TTS_UPSTREAM_REF:-main}"
 REPO_DIR="repo"
 MODELS_DIR="models"
 MODELS=(
-  Qwen3-TTS-12Hz-1.7B-CustomVoice
   Qwen3-TTS-12Hz-1.7B-Base
   Qwen3-TTS-12Hz-1.7B-VoiceDesign
   Qwen3-TTS-Tokenizer-12Hz

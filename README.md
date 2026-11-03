@@ -1,9 +1,8 @@
 # qwen3-tts-ui
 
-Text to speech that runs entirely on your own machine. Nine preset voices you can direct in
-words, voices invented from a description, and cloning from a few seconds of audio — behind a
-Gradio UI at **http://127.0.0.1:7860**, with no cloud calls, no API keys, and nothing leaving
-the box.
+Text to speech that runs entirely on your own machine. Invent a voice from a description, or
+clone one from a few seconds of audio — behind a Gradio UI at
+**http://127.0.0.1:7860**, with no cloud calls, no API keys, and nothing leaving the box.
 
 Built on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen) using the **1.7B**
 checkpoints, the best quality tier Qwen has released — the 0.6B variants score noticeably
@@ -11,24 +10,48 @@ worse on WER/speaker-similarity, and voice design is 1.7B-only.
 
 | Tab | Checkpoint | What it does |
 |---|---|---|
-| **Preset voices** | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 speakers (labels show each one's native language/dialect), 10 languages, style instructions in plain words ("用愤怒的语气说", "very happy") |
 | **Design a voice** | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Invent a brand-new voice from a text description of timbre/age/emotion/accent |
 | **Clone a voice** | `Qwen3-TTS-12Hz-1.7B-Base` | Clone from a ~3s reference clip — upload (video works too) or microphone, visual trimming, Whisper transcription of the clip |
-| **Speak** | `Qwen3-TTS-12Hz-1.7B-Base` | One call: name a saved voice, type what to say. Also the endpoint `scripts/say.py` uses, so a script or a coding assistant can talk to you |
-| **Chat** | `Qwen3-TTS-12Hz-1.7B-Base` | Type it, hear it — each sentence plays as soon as it exists, instead of after the whole reply |
+| **Speak** | either | One call: name a saved voice, type what to say. Also the endpoint `scripts/say.py` uses, so a script or a coding assistant can talk to you |
+| **Chat** | either | Type it, hear it — each sentence plays as soon as it exists, instead of after the whole reply |
+
+A saved voice is a clip plus its transcript, **or** a description. Speak and Chat use whichever
+the record carries, preferring the description; the Clone tab loads the clip. `setup.sh` ships
+one to start with — **fox**, an expressive adult female voice written as words rather than
+carried as a recording (see [Ethical use](#ethical-use)).
+
+Ten languages are selectable on every tab: Auto plus Chinese, English, Japanese, Korean,
+French, German, Portuguese, Russian, Italian and Spanish.
 
 **Hardware:** any single 16GB Blackwell card — RTX 5070 Ti, RTX 5080, anything in that class.
+The two checkpoints are ~9.3GB on disk.
 The VRAM budget, the LRU GPU slot and the memory guards are written for that card class, not
 for one specific SKU; the 5070 Ti is simply what it is developed and tested on (under WSL2).
 
-**Voice library**: the voice tabs can save a voice, and **Clone a voice** loads them back as
-a reusable reference — *Save as clone voice* keeps the clip voice design generated, *Save to
-voice library* keeps the trimmed reference clip plus its transcript, and *Save selected take*
-promotes any best-of-N candidate you preferred over the auto-pick. Each save is
-`voices/<slug>.wav` + a sidecar `.json`, so a voice survives requests and restarts — the
-hosted demo cannot, since it keeps nothing between sessions.
-Under the hood the saved clip + transcript feed `create_voice_clone_prompt`, so it clones
-with full ICL quality. The same library is what `scripts/say.py` speaks from.
+**Voice library**: the voice tabs save voices, and every tab reads them back. *Save as clone
+voice* keeps the clip voice design generated (and its description, which is the better route —
+see below), *Save to voice library* keeps the trimmed reference clip plus its transcript, and
+*Save selected take* promotes any best-of-N candidate you preferred over the auto-pick. Each
+save is `voices/<slug>.wav` + a sidecar `.json`, so a voice survives requests and restarts —
+the hosted demo cannot, since it keeps nothing between sessions.
+
+A record holds a **clip + transcript** or a **description**, and `voice_kind` decides how it is
+spoken: descriptions go through Voice Design, clips through `create_voice_clone_prompt` with
+full ICL quality. Speak and Chat prefer the description because it keeps measurably more of the
+voice ([Voice quality](#voice-quality)); the Clone tab loads the clip. The same library is what
+`scripts/say.py` speaks from.
+
+**The shipped voice, `fox`** — created by `setup.sh`, not downloaded. She is an expressive adult
+female voice defined by a paragraph of text, so the repository carries words rather than a
+recording of anyone. Speak her with `scripts/say.py --voice fox`, or make your own:
+
+```bash
+scripts/make_voice.py --name "Marlow" --no-clip \
+  --description "A low, unhurried male voice in his fifties, dry, a cigarette in every vowel."
+```
+
+Drop `--no-clip` (and pass `--line "…"`) to also freeze a clip for the Clone tab. `--force`
+regenerates; delete `voices/<slug>.json` to start over.
 
 **Reference-clip workshop** (**Clone a voice** tab) — the three things the hosted box makes you
 do in a text editor:
@@ -149,9 +172,10 @@ Rebuild the environment from scratch with `./setup.sh` — it creates `.venv` on
 (needs [uv](https://docs.astral.sh/uv/)), installs `torch==2.8.0` + `torchaudio` from the
 **cu128** index (the wheel line that covers sm_120 / RTX 50xx), installs
 `requirements.txt`, installs upstream `qwen-tts` editable from `./repo` (which pins
-`transformers==4.57.3`), downloads the checkpoints into `./models/`, and fetches Whisper
-into the Hugging Face cache. `./setup.sh --models` re-downloads weights only, `--asr` only
-Whisper. Pin the upstream checkout with `QWEN_TTS_UPSTREAM_REF=<sha-or-tag>`.
+`transformers==4.57.3`), downloads the two checkpoints + tokenizer into `./models/` (~9.3GB),
+fetches Whisper into the Hugging Face cache, and creates the shipped `fox` voice. `./setup.sh
+--models` re-downloads weights only, `--asr` only Whisper, `--voices` only the voices. Pin the
+upstream checkout with `QWEN_TTS_UPSTREAM_REF=<sha-or-tag>`.
 
 ## Layout
 
@@ -168,7 +192,7 @@ CLAUDE.md           pointer to AGENTS.md
 CHANGELOG.md        one entry per change
 LICENSE             Apache-2.0 (upstream Qwen3-TTS is Apache-2.0 too)
 repo/               upstream QwenLM/Qwen3-TTS checkout (installed editable, gitignored)
-models/             1.7B checkpoints + Qwen3-TTS-Tokenizer-12Hz (~14GB, gitignored)
+models/             1.7B checkpoints + Qwen3-TTS-Tokenizer-12Hz (~9.3GB, gitignored)
 voices/             saved designed voices: <slug>.wav + <slug>.json (gitignored)
 tmp/media/          extracted reference clips, pruned after 6h (gitignored)
 certs/              self-signed HTTPS key pair (gitignored)
@@ -202,8 +226,8 @@ This box is **WSL2 with dynamic memory** (`hv_balloon` is set to essentially the
 whole RAM).
 The VM is allowed to balloon to essentially your whole 32GB of host RAM, so over-committing
 inside WSL does not just OOM the distro — it can starve Windows and hard-lock the machine.
-That happened once: the server was started with `--preload` (three checkpoints, ~13GB) while
-`smoke_test.py` was running with its own three copies, ~26GB plus page cache.
+That happened once: the server was started with `--preload` (all three checkpoints then
+installed, ~13GB) while `smoke_test.py` was running with its own copies, ~26GB plus page cache.
 
 Three guardrails now make that impossible to repeat:
 
@@ -277,8 +301,8 @@ command — which is the shape a coding assistant actually wants:
 ```bash
 scripts/say.py --list
 scripts/say.py --voice fox_reference --text "Build finished. Three tests failed."
-echo "The migration is done." | scripts/say.py --voice ryan
-scripts/say.py --voice ryan --text "Coffee." --out kitchen.wav --no-play
+echo "The migration is done." | scripts/say.py --voice fox
+scripts/say.py --voice fox --text "Coffee." --out kitchen.wav --no-play
 ```
 
 (`.venv/bin/python scripts/say.py …` if you are outside the venv. `--url` points it at
@@ -355,9 +379,10 @@ The CPU tier still needs the venv (`torch`, `gradio`, `qwen_tts`, `soundfile`, `
 the whole Gradio UI (`test_build_ui_constructs`), which is what catches Gradio API drift
 before a human clicks it.
 
-The smoke test covers six flows: CustomVoice, VoiceDesign, Base clone, a dialect speaker
-(Dylan → Beijing dialect), the design→save→load→clone voice-library flow, and the media
-pipeline (synth speech → wrap in a real mp4 → ffmpeg import → auto-trim → Whisper → clone).
+The smoke test covers eight flows: VoiceDesign, Base clone, the design→save→load→clone
+voice-library flow, the one-call `/speak` endpoint (including a described voice), the chat
+stream, long-text chunking, best-of-N, and the media pipeline (synth speech → wrap in a real
+mp4 → ffmpeg import → auto-trim → Whisper → clone).
 It refuses to run while the web server holds the lock — stop the server first rather than
 using `--force`. A case that never ran (no ffmpeg, `--no-asr`) is reported as `SKIPPED` and
 exits non-zero, because a skip is not a pass; pass `--allow-skip` when the skip is intended.
@@ -413,8 +438,8 @@ In order of how much each one actually costs you:
    ~5s it flattens, and long references make ICL runs more likely to ramble.
 4. **Recording level does not matter.** A reference peaking at 0.1 scored 0.991 — don't
    bother normalising.
-5. **Set the language explicitly** instead of Auto, and on the **Preset voices** tab pick a
-   speaker whose native language matches the text (upstream's own recommendation).
+5. **Set the language explicitly** instead of Auto — upstream's own recommendation, and the
+   only way to be sure a short phrase is not guessed as another language.
 6. **Shape the text.** Prosody follows punctuation; spell out numbers; split long scripts
    into sentences, which also keeps you inside the 2048-token budget.
 
@@ -422,6 +447,38 @@ In order of how much each one actually costs you:
 identical inputs: SIM spread only 0.001, but WER was 0.000 on one seed and 0.133 on the
 others — the model occasionally serves a dud take and no slider fixes that. Generating
 three and keeping the best does. Set a **Seed** to reproduce a take you liked.
+
+### Where the thinness comes from: cloning keeps ~60% of your reference's top end
+
+Same three lines, raw 24kHz decode (before any post-processing), energy above 9kHz:
+
+| source | energy >9kHz | pairwise SIM (identity) |
+|---|---|---|
+| real reference clip (a broadcast sample) | 1.51m | — |
+| a take generated from it, by cloning | 0.89m | — |
+| a designed voice | **2.67m** | 0.974 |
+| clone of a generated take | 0.57m | **0.993** |
+| *the CustomVoice preset, before it was removed* | *1.08m* | *0.982* |
+
+Three things fall out of that table.
+
+**The vocoder is not the culprit.** White noise crosses the 12Hz codec at 95% fidelity and a
+generated output round-trips at ~90% — the top end is missing *before* decoding, in the tokens
+the talker chose. So no post-processing can recover information the model never emitted, which
+is why *Output post-processing* is a tonal preference and not a fix.
+
+**Cloning tracks its reference's spectrum.** A real clip clones to 0.89m; a generated take —
+already through the codec once — clones to 0.57m. `generate_icl_prompt` hands the talker the
+reference's own codec codes as a prefix, so it continues a quantised version of the clip and
+inherits its spectral character along with its pitch and timbre.
+
+**The two routes trade off, so a voice keeps both.** A frozen clip is the steadier identity
+(0.993 against 0.974 when the description is re-rolled); a description is the fuller sound
+(2.67m against 0.57m). Speak and Chat therefore speak the description when the record has one,
+and the Clone tab loads the clip.
+
+That is also why `fox` ships as a paragraph rather than a recording: no one's voice in the
+repository, and the route that measures best.
 
 ### Why it sounds a little "digital", and what *Output post-processing* does about it
 
@@ -530,13 +587,14 @@ is a `Qwen3TTSTokenizer` *wrapper*, not an `nn.Module`, so `model.to("cuda")` le
 `nn.Module`, and `tests/test_app_logic.py::test_move_reaches_the_speech_tokenizer`
 guards the regression.
 
-**Dialects are a speaker trait, not a language.** The checkpoint carries
+**Dialects are not selectable, and no longer exist here.** The CustomVoice checkpoint carries
 `talker_config.spk_is_dialect` (`dylan → beijing_dialect`, `eric → sichuan_dialect`) and
-upstream deliberately filters the dialect entries out of `get_supported_languages()`
-(modeling_qwen3_tts.py:1831-1834), so passing `language="beijing_dialect"` raises
-`ValueError: Unsupported languages`. You get an accent by picking the speaker; the UI labels
-the speaker dropdown accordingly and keeps dialects out of the language dropdown. Italian *is*
-selectable — the hosted Space omits it by oversight.
+upstream filters those values out of `get_supported_languages()`
+(modeling_qwen3_tts.py:1831-1834), so `language="beijing_dialect"` raises
+`ValueError: Unsupported languages` — an accent came from picking the speaker, never from the
+language field. That checkpoint is not shipped, so the only reason to know this is if you
+re-add the capability: keep dialects out of the language dropdown. `test_language_choices_match_checkpoint`
+keeps the guard. Italian *is* selectable — the hosted Space omits it by oversight.
 
 **Output length is bounded by prompt length.** The checkpoint ships
 `max_new_tokens=8192` and sampling defaults of `temperature=0.9, top_k=50,

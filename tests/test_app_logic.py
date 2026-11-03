@@ -55,8 +55,8 @@ def test_budget() -> None:
 
 def test_report() -> None:
     sr = 24000
-    ok = webui._report(np.zeros(sr * 3, dtype=np.float32), sr, 512, "CustomVoice")
-    check(ok.startswith("CustomVoice OK"), "normal generation reports OK without warnings")
+    ok = webui._report(np.zeros(sr * 3, dtype=np.float32), sr, 512, "VoiceDesign")
+    check(ok.startswith("VoiceDesign OK"), "normal generation reports OK without warnings")
     check("token cap" not in ok, "normal generation must not warn about the cap")
 
     runaway = webui._report(np.zeros(sr * 164, dtype=np.float32), sr, webui.MAX_NEW_TOKENS_CAP, "VoiceClone")
@@ -160,51 +160,26 @@ def test_move_reaches_the_speech_tokenizer() -> None:
 def test_language_choices_match_checkpoint() -> None:
     """Dropdown values must match what the model actually accepts.
 
-    Upstream builds `supported_languages` from codec_language_id but *skips* the
-    dialect entries (modeling_qwen3_tts.py:1832) — dialect is a speaker attribute
-    (`spk_is_dialect`), so offering 'beijing_dialect' would raise at generate time.
-    Skipped when the weights are not downloaded.
+    Upstream builds `supported_languages` from codec_language_id but *skips* any dialect
+    entry, so a dialect value would raise at generate time. (Dialects were a property of the
+    CustomVoice preset speakers, which this app no longer ships — the check stays so the
+    dropdown cannot quietly grow one back.) Skipped when the weights are not downloaded.
     """
     import json
 
-    cfg_path = os.path.join(webui.ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice", "config.json")
+    cfg_path = os.path.join(webui.ROOT, "models", "Qwen3-TTS-12Hz-1.7B-VoiceDesign", "config.json")
     if not os.path.exists(cfg_path):
         print(f"     (skipped: {cfg_path} not present)")
         return
     talker = json.load(open(cfg_path))["talker_config"]
     accepted = {"auto"} | {k for k in talker["codec_language_id"] if "dialect" not in k}
     # The model lowercases whatever it is given, so compare case-insensitively.
-    unknown = {v.lower() for v in webui.LANGUAGE_VALUES} - {"auto"} - accepted
+    offered = {v.lower() for v in webui.LANGUAGE_VALUES}
+    unknown = offered - {"auto"} - accepted
     check(not unknown, f"dropdown offers languages the model rejects: {sorted(unknown)}")
-    for dialect in ("beijing_dialect", "sichuan_dialect"):
-        check(dialect not in {v.lower() for v in webui.LANGUAGE_VALUES},
-              f"{dialect} is a speaker trait, not a language option")
-    check("italian" in {v.lower() for v in webui.LANGUAGE_VALUES}, "italian is supported and must stay selectable")
-
-
-def test_speaker_choices_come_from_the_checkpoint() -> None:
-    import json
-
-    choices = webui.speaker_choices(os.path.join(webui.ROOT, "models"))
-    values = [value for _, value in choices]
-    check("" not in [label for label, _ in choices], "every speaker has a description label")
-
-    by_name = dict((label.split(" — ")[0].lower().replace(" ", "_"), label) for label, _ in choices)
-    cfg_path = os.path.join(webui.ROOT, "models", "Qwen3-TTS-12Hz-1.7B-CustomVoice", "config.json")
-    if os.path.exists(cfg_path):
-        talker = json.load(open(cfg_path))["talker_config"]
-        check(set(values) == set(talker["spk_id"]), "dropdown speakers == checkpoint spk_id table")
-        for speaker, dialect in talker["spk_is_dialect"].items():
-            if dialect:
-                label = by_name[speaker]
-                check(dialect.replace("_", " ").lower() in label.lower(),
-                      f"{speaker} should advertise its dialect in the label: {label!r}")
-    else:
-        check(len(choices) == 9, "fallback list covers the 9 released speakers")
-
-    # A missing checkpoint must still yield a usable dropdown.
-    empty = webui.speaker_choices(os.path.join(webui.ROOT, "does-not-exist"))
-    check(len(empty) == 9 and empty[0][1] in webui.SPEAKER_INFO, "falls back to the static speaker list")
+    check(not [value for value in offered if "dialect" in value],
+          "no dialect value is selectable — upstream would reject it at generate time")
+    check("italian" in offered, "italian is supported and must stay selectable")
 
 
 def test_voice_library(tmp_dir=None) -> None:
@@ -367,7 +342,7 @@ def test_memory_guards() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         # A fake checkpoint: only the file sizes matter for the budget math.
-        cap_dir = os.path.join(tmp, "Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        cap_dir = os.path.join(tmp, "Qwen3-TTS-12Hz-1.7B-VoiceDesign")
         os.makedirs(cap_dir)
         with open(os.path.join(cap_dir, "model.safetensors"), "wb") as fh:
             fh.truncate(2 * 1024 ** 3)  # 2GB sparse
@@ -375,13 +350,13 @@ def test_memory_guards() -> None:
             open(os.path.join(cap_dir, name), "w").write("{}")
 
         hub = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=2)
-        check(1900 < hub.weight_mb("custom_voice") < 2100, f"size estimated from safetensors: {hub.weight_mb('custom_voice')}")
+        check(1900 < hub.weight_mb("voice_design") < 2100, f"size estimated from safetensors: {hub.weight_mb('voice_design')}")
 
         # Floor above what is available -> MemoryError before any weights are touched.
         guarded = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=2,
                                  ram_floor_mb=int(webui.mem_available_mb() + 100_000))
         try:
-            guarded._get_cpu("custom_voice")
+            guarded._get_cpu("voice_design")
             raise AssertionError("expected MemoryError, got a load")
         except MemoryError as e:
             check("floor" in str(e), f"refusal explains the floor: {e}")
@@ -790,9 +765,9 @@ def test_build_ui_constructs() -> None:
 
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
-    # CustomVoice + VoiceDesign + Clone output + Clone reference box + the four candidate
-    # players that make best-of-N auditionable + the Speak player. (The chat player is HTML.)
-    check(len(audios) == 9, f"three outputs, one reference input, four take players, one "
+    # VoiceDesign + Clone output + Clone reference box + the four candidate players that
+    # make best-of-N auditionable + the Speak player. (The chat player is HTML.)
+    check(len(audios) == 8, f"two outputs, one reference input, four take players, one "
                             f"speak player — found {len(audios)}")
     for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
         check(label in by_label, f"{label} exists")
@@ -820,9 +795,9 @@ def test_acquire_works_without_cuda() -> None:
     original = webui.DEVICE
     try:
         webui.DEVICE = torch.device("cpu")
-        got = hub.acquire("custom_voice")
+        got = hub.acquire("voice_design")
         check(isinstance(got, FakeTTS), "cpu target returns the model")
-        check("custom_voice" in hub.on_gpu, "cpu target is tracked as resident")
+        check("voice_design" in hub.on_gpu, "cpu target is tracked as resident")
 
         if not torch.cuda.is_available():
             # With the gate back on and no VRAM at all, it must still refuse loudly.
@@ -835,16 +810,6 @@ def test_acquire_works_without_cuda() -> None:
                 check("VRAM" in str(e), f"cuda target still enforces the margin: {e}")
     finally:
         webui.DEVICE = original
-
-
-def test_default_speaker_is_offered() -> None:
-    """The preselected speaker must be one the checkpoint actually has."""
-    values = {value for _, value in webui.speaker_choices(os.path.join(webui.ROOT, "does-not-exist"))}
-    check(webui.default_speaker(os.path.join(webui.ROOT, "does-not-exist")) in values,
-          "fallback default is in the fallback list")
-    real = webui.default_speaker(webui.ROOT)
-    check(real in {value for _, value in webui.speaker_choices(webui.ROOT)},
-          "default is offered by the checkpoint (or the fallback list)")
 
 
 def test_smoke_test_skips_are_not_passes() -> None:
@@ -892,7 +857,7 @@ def test_smoke_test_skips_are_not_passes() -> None:
             smoke_test.SKIPPED.clear()
             smoke_test.run_case = (lambda hub, cap, keep_gpu, use_asr=True:
                                    smoke_test.skip(cap, "stubbed") if skip_it else None)
-            sys.argv = ["smoke_test.py", "--only", "custom_voice"]
+            sys.argv = ["smoke_test.py", "--only", "voice_design"]
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 rc = smoke_test.main()
             last_output[0] = out.getvalue()
@@ -900,14 +865,14 @@ def test_smoke_test_skips_are_not_passes() -> None:
 
         check(run(skip_it=False) == 0, "a full run exits 0")
         check(run(skip_it=True) == 1, "a skipped case exits non-zero, not 0")
-        check("SKIPPED custom_voice" in last_output[0], "and it says which case was skipped")
+        check("SKIPPED voice_design" in last_output[0], "and it says which case was skipped")
 
         smoke_test.SKIPPED.clear()
         smoke_test.run_case = lambda hub, cap, keep_gpu, use_asr=True: smoke_test.skip(cap, "stubbed")
-        sys.argv = ["smoke_test.py", "--only", "custom_voice", "--allow-skip"]
+        sys.argv = ["smoke_test.py", "--only", "voice_design", "--allow-skip"]
         with contextlib.redirect_stdout(io.StringIO()):
             check(smoke_test.main() == 0, "--allow-skip is the explicit opt-out")
-        check(smoke_test.SKIPPED and smoke_test.SKIPPED[0][0] == "custom_voice",
+        check(smoke_test.SKIPPED and smoke_test.SKIPPED[0][0] == "voice_design",
               "the skip is recorded with its case name")
     finally:
         smoke_test.torch, smoke_test.run_case = real_torch, real_run_case
@@ -1185,8 +1150,8 @@ def test_output_options_are_wired() -> None:
 
     source = inspect.getsource(webui.build_ui)
     check("s_postproc" in source and "output_options" in source, "the dropdown exists")
-    check(source.count("+ output_options") == 5,
-          "every generation surface (CustomVoice, VoiceDesign, Clone, Speak, Chat) receives "
+    check(source.count("+ output_options") == 4,
+          "every generation surface (Design a voice, Clone a voice, Speak, Chat) receives "
           "the choice")
 
 
@@ -1701,7 +1666,7 @@ def test_callbacks_use_the_chunked_path() -> None:
     import inspect
 
     source = inspect.getsource(webui)
-    for capability in ("generate_custom_voice", "generate_voice_design", "generate_voice_clone"):
+    for capability in ("generate_voice_design", "generate_voice_clone"):
         start = source.index(f"def {capability}(")
         body = source[start:start + 6000]
         check("generate_chunked(" in body, f"{capability} does not use the chunked path")
@@ -1908,7 +1873,7 @@ def test_tabs_and_readme_agree() -> None:
     import re
 
     labels = re.findall(r'gr\.Tab\("([^"]+)"\)', inspect.getsource(webui.build_ui))
-    check(len(labels) == 5, f"five tabs are expected, found {labels}")
+    check(len(labels) == 4, f"four tabs are expected, found {labels}")
     with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
         readme = fh.read()
     missing = [label for label in labels if label not in readme]
