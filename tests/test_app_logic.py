@@ -786,8 +786,9 @@ def test_build_ui_constructs() -> None:
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
     # CustomVoice + VoiceDesign + Clone output + Clone reference box + the four candidate
-    # players that make best-of-N auditionable.
-    check(len(audios) == 8, f"three outputs, one reference input, four take players — found {len(audios)}")
+    # players that make best-of-N auditionable + the Speak tab's player.
+    check(len(audios) == 9, f"three outputs, one reference input, four take players, one "
+                            f"speak player — found {len(audios)}")
     for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
         check(label in by_label, f"{label} exists")
     # Anything we read back from the browser is filepath-typed so that we open it
@@ -1179,8 +1180,8 @@ def test_output_options_are_wired() -> None:
 
     source = inspect.getsource(webui.build_ui)
     check("s_postproc" in source and "output_options" in source, "the dropdown exists")
-    check(source.count("+ output_options") == 3,
-          "all three generation tabs (CustomVoice, VoiceDesign, Clone) receive the choice")
+    check(source.count("+ output_options") == 4,
+          "every generation surface (CustomVoice, VoiceDesign, Clone, Speak) receives the choice")
 
 
 def test_clone_tab_reads_top_to_bottom() -> None:
@@ -1699,6 +1700,91 @@ def test_callbacks_use_the_chunked_path() -> None:
         body = source[start:start + 6000]
         check("generate_chunked(" in body, f"{capability} does not use the chunked path")
         check("_budget(chunk)" in body, f"{capability} does not bound each chunk's tokens")
+
+
+def test_speak_validates_before_touching_the_gpu() -> None:
+    """A network caller gets a sentence it can act on, never a traceback."""
+    _, status = webui.speak("", "hello")
+    check("voice" in status.lower(), f"a missing voice is named: {status}")
+    _, status = webui.speak("someone", "   ")
+    check("text is required" in status.lower(), f"empty text is refused: {status}")
+    _, status = webui.speak("definitely-not-a-voice", "hello")
+    check(status.startswith("Error") and "available" in status.lower(),
+          f"an unknown voice says what exists instead of failing obscurely: {status}")
+
+
+def test_speak_resolves_voices_server_side() -> None:
+    """The client names a voice; it never names a path."""
+    sr = 24000
+    wav = (0.3 * np.sin(2 * np.pi * 160 * np.arange(sr * 3) / sr)).astype(np.float32)
+    with tempfile.TemporaryDirectory() as voices:
+        original, webui.VOICES_DIR = webui.VOICES_DIR, voices
+        try:
+            webui.save_voice(name="Ryan Narrator", wav=wav, sr=sr, text="A test line.",
+                             instruct="", language="English")
+            resolved, error = webui._resolve_voice("Ryan Narrator")
+            check(error is None and resolved is not None, f"display name resolves: {error}")
+            ref_wav, ref_sr, ref_text = resolved
+            check(ref_sr == sr and abs(len(ref_wav) / ref_sr - 3.0) < 0.1,
+                  "the clip comes back at its own rate")
+            check(ref_text == "A test line.", "the transcript comes from the sidecar")
+
+            resolved, error = webui._resolve_voice("ryan-narrator")
+            check(error is None, "the slug resolves too")
+            resolved, error = webui._resolve_voice("ryan_narrator")
+            check(error is None, "with either separator")
+
+            for hostile in ("../../etc/passwd", "/etc/passwd", "..%2f..%2fetc%2fpasswd",
+                            "~/.ssh/id_rsa"):
+                resolved, error = webui._resolve_voice(hostile)
+                check(resolved is None and error.startswith("Error"),
+                      f"a hostile voice name must not resolve: {hostile}")
+
+            listing = webui.voices_available()
+            check("ryan_narrator" in listing and "A test line." in listing,
+                  f"--list shows the slug and the transcript: {listing}")
+            webui.VOICES_DIR = os.path.join(voices, "empty")
+            check("no voices saved" in webui.voices_available(), "an empty library is stated")
+        finally:
+            webui.VOICES_DIR = original
+
+
+def test_speak_and_voice_list_are_api_endpoints() -> None:
+    """say.py calls these by name; if they stop being endpoints the CLI silently rots."""
+    class StubHub:
+        def status(self) -> str:
+            return "stub"
+
+    original_hub, webui.HUB = webui.HUB, StubHub()
+    try:
+        demo = webui.build_ui()
+        entries = demo.fns.values() if isinstance(demo.fns, dict) else demo.fns
+        exposed = {getattr(getattr(entry, "fn", None), "__name__", None) for entry in entries}
+        check("speak" in exposed, "speak is wired to a component, so it is a named endpoint")
+        check("voices_available" in exposed, "the voice list is callable too (--list)")
+    finally:
+        webui.HUB = original_hub
+
+    import inspect
+    source = inspect.getsource(webui.speak)
+    check("_resolve_voice(" in source, "speak resolves the voice server-side")
+    check("resolve_input_path" not in source,
+          "speak takes no client path at all — there is nothing to confine")
+    check("generate_chunked(" in source, "speak gets the chunked long-text path too")
+
+
+def test_say_py_is_a_thin_client() -> None:
+    """The CLI must stay a client of the two endpoints, not a second implementation."""
+    path = os.path.join(os.path.dirname(webui.__file__), "..", "scripts", "say.py")
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    check('api_name="/speak"' in source, "it calls the speak endpoint")
+    check('api_name="/voices_available"' in source, "and the voice list for --list")
+    check("--no-play" in source and "paplay" in source, "it can render without playing")
+    check("--password-file" in source and "QWEN_TTS_PASSWORD" in source,
+          "credentials follow the server's precedence")
+    check("--ref-audio" not in source and "--voice-path" not in source,
+          "the CLI must never be able to name a server path")
 
 
 if __name__ == "__main__":

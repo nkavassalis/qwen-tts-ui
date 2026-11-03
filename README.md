@@ -151,8 +151,9 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (61 cases) for UI helpers and guards
-tests/smoke_test.py       GPU end-to-end: 8 flows, generates audio and validates the wav
+scripts/say.py      CLI for the assistant API: render text in a saved voice and play it
+tests/test_app_logic.py   CPU-only unit tests (65 cases) for UI helpers and guards
+tests/smoke_test.py       GPU end-to-end: 9 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
 CHANGELOG.md        one entry per change
@@ -234,10 +235,46 @@ boundaries are worth stating:
   status boxes as user-visible output.
 - `certs/` holds a private key when you use `--ssl-self-signed`; it is gitignored.
 
+## Talking to it from elsewhere (assistant API)
+
+The **Speak (assistant API)** tab is one call: name a saved voice, type what to say. It is
+also what external tools hit, and `scripts/say.py` wraps it so the whole thing is a shell
+command — which is the shape a coding assistant actually wants:
+
+```bash
+scripts/say.py --list
+scripts/say.py --voice fox_reference --text "Build finished. Three tests failed."
+echo "The migration is done." | scripts/say.py --voice ryan
+scripts/say.py --voice ryan --text "Coffee." --out kitchen.wav --no-play
+```
+
+(`.venv/bin/python scripts/say.py …` if you are outside the venv. `--url` points it at
+another box; `--username/--password-file` or `QWEN_TTS_PASSWORD` match the server's own
+precedence; `--insecure` is for `--ssl-self-signed`.)
+
+Under the hood it is the `/speak` endpoint, taking `(voice, text, language, temperature,
+top_p, top_k, repetition_penalty, postproc)` and returning audio plus a status line, with
+`/voices_available` behind `--list`. Three properties worth knowing if you wire it into
+something:
+
+- **A caller names a voice, never a path.** The reference clip and its transcript are read
+  from `voices/<slug>.json` on the server, and the name is slugged to `[a-z0-9_]` before it
+  touches the filesystem. There is no argument to point at `/etc/passwd`, which is why the
+  CLI has no `--ref-audio`.
+- **No transcript in the sidecar → x-vector fallback** rather than a failure, and the status
+  says which path it took (`Speak (ICL)` / `Speak (x-vector)`).
+- **It shares the one GPU.** With `default_concurrency_limit=1`, a long line from the
+  assistant queues a UI generation behind it — by design (one process, one card), but
+  surprising the first time. Expect ~1.4× realtime, first audio after ~6–9s on long text.
+
+For an assistant, the useful pattern is fire-and-forget on things worth hearing: a build
+finishing, tests failing, a long job ending. Not narration — at 1.4× realtime, having it
+read everything aloud is a way to make your terminal slower.
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 61 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 65 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

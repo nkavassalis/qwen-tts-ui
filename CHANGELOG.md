@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — assistant API: one call to make a saved voice speak, plus `scripts/say.py`
+
+The Clone tab's flow (resolve a voice, upload its wav, supply the transcript) is three calls
+and a lot of client-side knowledge — fine for a person, wrong for a coding assistant that
+just wants to say something. So there is now one endpoint and one command:
+
+```bash
+scripts/say.py --list
+scripts/say.py --voice fox_reference --text "Build finished. Three tests failed."
+echo "The migration is done." | scripts/say.py --voice ryan
+```
+
+- **`speak(voice, text, language, temperature, top_p, top_k, repetition_penalty, postproc)`**
+  and **`voices_available()`**, both exposed as a visible **Speak (assistant API)** tab so they
+  are named endpoints rather than hidden plumbing.
+- **The caller names a voice; it never names a path.** `_resolve_voice` reads the clip and the
+  transcript from `voices/<slug>.json` server-side, slugging the name to `[a-z0-9_]` first, so
+  there is nothing to traverse — `say.py` has no `--ref-audio` on purpose, and a test asserts it
+  stays that way. Falls back to x-vector when the sidecar has no transcript instead of failing,
+  and the status reports which path it took.
+- It reuses everything: chunked long text, post-processing, the memory floors, the single-owner
+  lock. Consequences are documented rather than discovered: with `default_concurrency_limit=1`
+  a long line from an assistant queues a UI generation behind it.
+- `say.py` mirrors the server's credential precedence (`--password-file` > `QWEN_TTS_PASSWORD`
+  > `--password`, warned), supports `--url`/`--insecure`/`--out`/`--no-play`, and picks the
+  first available of paplay/ffplay/aplay/afplay.
+- Tests: CPU 61 -> 65 (validation before the GPU is touched, hostile voice names refused,
+  display-name and slug resolution, `--list` content, both functions really being endpoints,
+  and the CLI staying a thin client of those two endpoints). GPU 8 -> 9 flows with `speak_api`
+  covering ICL, x-vector fallback and the unknown-voice error. Verified live over HTTP: 3.68s @
+  48kHz, one sample in 176k grazing full scale (not clipping), RMS 0.144.
+
 ## 2026-11-03 — long text is chunked and stitched, because tempo is the real ceiling
 
 Started as a question: is `max_new_tokens=2048` costing us quality, and how far could this box

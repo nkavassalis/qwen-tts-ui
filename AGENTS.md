@@ -28,10 +28,12 @@ webui/app.py             the whole app: Gradio UI, ModelHub (CPU-RAM + LRU GPU s
 setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-tts) +
                        weight and Whisper downloads
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
+scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
+                           through paplay/ffplay/aplay/afplay
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 61 checks, no weights, ~10s with deps installed
-tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
+tests/test_app_logic.py  CPU tier: 65 checks, no weights, ~10s with deps installed
+tests/smoke_test.py      GPU tier: 9 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
 CHANGELOG.md           one entry per change, newest first
@@ -58,12 +60,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 61 checks, ~10s
-.venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~90s, needs weights
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 65 checks, ~10s
+.venv/bin/python tests/smoke_test.py       # GPU tier — 9 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 61/61 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 65/65 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +98,14 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **The assistant API takes a voice *name*, never a path** (`speak` + `scripts/say.py`). The
+  reference clip and its transcript are read from `voices/<slug>.json` server-side by
+  `_resolve_voice`, which slugs the name to `[a-z0-9_]` before touching the filesystem — so
+  there is no argument to point at `/etc/passwd` and `say.py` deliberately has no
+  `--ref-audio`. No transcript in the sidecar falls back to x-vector instead of failing, and
+  the status says which (`Speak (ICL)` / `Speak (x-vector)`). It shares the single GPU and
+  `default_concurrency_limit=1`, so a long line from an assistant queues UI generations —
+  by design, but worth knowing before wiring it into a hook that fires often.
 - **Long text is chunked because *tempo*, not tokens, is the limit.** Measured single-pass on
   this checkpoint: 3.05 words/s at 18 words rising to 4.04 at 300, WER 0.00 → 0.68, while peak
   VRAM stayed at 7.5-7.6 GB and 300 words used only 929 of the 2048 tokens (raising the cap to
@@ -325,7 +335,10 @@ tier the hardening pass could not execute:
 
 Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunking:
 
-- **CPU tier 61/61**, **GPU tier 8/8** (adds `long_text`).
+- **CPU tier 65/65**, **GPU tier 9/9** (adds `long_text`, `speak_api`).
+- **Assistant API verified live**: `scripts/say.py --list` and a real `/speak` call over HTTP
+  returned 3.68s @ 48kHz, peak 0.9999 with `clipped_fraction` 5.7e-6 (one sample in 176k — a
+  graze, not clipping), RMS 0.144, no defect flags.
 - **Length study** (single pass, same speaker, in the README): 18/60/150/300 words → 5.9/17.7/
   45.7/74.3s of audio; peak VRAM 4.36/7.52/7.58/7.58 GB; 1.32–1.50× realtime; words/s
   3.05/3.39/3.28/4.04; chunked-Whisper WER 0.00/0.62/0.55/0.68. Raising the cap from 2048 to

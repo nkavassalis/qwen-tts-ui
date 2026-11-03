@@ -70,6 +70,8 @@ CASES = {
         language="Auto",
         clone_text="Same voice, second line, still unmistakably the same person.",
     ),
+    # The one-call endpoint for external tools (scripts/say.py). Reads best_of_n's reference.
+    "speak_api": dict(),
     # Long-text chunking: the same 300 words that measured 4.04 words/s and WER 0.68 in one
     # pass, now through the splitter and the stitcher.
     "long_text": dict(
@@ -455,6 +457,55 @@ def run_long_text(hub: webui.ModelHub) -> None:
           f"(single pass: 0.68) | {status.splitlines()[1]}")
 
 
+def run_speak_api(hub: webui.ModelHub) -> None:
+    """The one-call endpoint an external tool uses: name a voice, get speech back."""
+    cfg = CASES["best_of_n"]
+    ref_path = os.path.join(webui.media_dir(), "best_of_n_ref.wav")
+    if not os.path.exists(ref_path):
+        urllib.request.urlretrieve(cfg["ref_audio"], ref_path)
+    ref_wav, ref_sr = sf.read(ref_path, dtype="float32")
+    if ref_wav.ndim > 1:
+        ref_wav = ref_wav.mean(axis=1)
+
+    with tempfile.TemporaryDirectory() as vdir:
+        original_voices, webui.VOICES_DIR = webui.VOICES_DIR, vdir
+        try:
+            webui.save_voice(name="Smoke Narrator", wav=ref_wav, sr=ref_sr,
+                             text=cfg["ref_text"], instruct="", language="English")
+            started = time.time()
+            audio, status = webui.speak("Smoke Narrator", "Short sentence, clearly spoken.",
+                                        "English")
+            took = time.time() - started
+            assert audio is not None, f"speak returned nothing:\n{status}"
+            sr, wav = audio
+            wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+            assert sr in (24000, 48000), f"unexpected sample rate {sr}"
+            assert 0.5 < len(wav) / sr < 12.0, f"implausible length: {len(wav)/sr:.1f}s"
+            assert float(np.max(np.abs(wav))) <= 1.0 and np.all(np.isfinite(wav)), "bad audio"
+            assert "Speak" in status, f"the status should name the path taken:\n{status}"
+            assert "ICL" in status, f"a voiced sidecar must select ICL cloning:\n{status}"
+            first_status, first_seconds = status, len(wav) / sr
+
+            # A caller that guesses a name gets the list, not a stack trace.
+            audio, status = webui.speak("no-such-voice", "hello")
+            assert audio is None and status.startswith("Error"), f"unknown voice: {status}"
+            assert "smoke_narrator" in status, f"the error should list what exists: {status}"
+
+            # A voice with no transcript must fall back to x-vector rather than fail.
+            webui.save_voice(name="Silent Ghost", wav=ref_wav, sr=ref_sr, text="",
+                             instruct="", language="English")
+            audio, status = webui.speak("Silent Ghost", "Hello there.", "English")
+            assert audio is not None and "x-vector" in status, \
+                f"a transcript-less voice should use x-vector:\n{status}"
+
+            listing = webui.voices_available()
+            assert "smoke_narrator" in listing and "silent_ghost" in listing, listing
+            print(f"  [speak_api] {took:.1f}s | one call, name only | "
+                  f"{first_status.splitlines()[0]} ({first_seconds:.1f}s)")
+        finally:
+            webui.VOICES_DIR = original_voices
+
+
 def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
     if capability == "media_pipeline":
         run_media_pipeline(hub, use_asr)
@@ -488,6 +539,16 @@ def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool
 
     if capability == "long_text":
         run_long_text(hub)
+        if not keep_gpu:
+            with hub.lock:
+                while hub.on_gpu:
+                    _, resident = hub.on_gpu.popitem(last=False)
+                    hub._move(resident, torch.device("cpu"))
+                    torch.cuda.empty_cache()
+        return
+
+    if capability == "speak_api":
+        run_speak_api(hub)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:

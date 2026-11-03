@@ -1892,6 +1892,109 @@ def refresh_voices() -> Any:
     return gr.update(choices=voice_choices())
 
 
+def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[str, int, str]], Optional[str]]:
+    """Turn a client-supplied voice *name* into a server-side (wav, sr, transcript).
+
+    The client never supplies a path: the name is slugged to [a-z0-9_] before it is joined
+    onto VOICES_DIR, so there is nothing left to traverse. If the exact slug is missing we
+    fall back to matching the display name, because the thing calling this is usually a
+    script that read the list once and typed it back.
+    """
+    if not (voice or "").strip():
+        return None, "Error: choose a saved voice first."
+    wanted = voice.strip()
+    slug = _slug(wanted)
+    wav_path, meta_path = _voice_paths(slug)
+    if not os.path.exists(wav_path):
+        needle = wanted.lower()
+        for record in list_voices():
+            if record.get("name", "").lower() == needle or record.get("slug") == slug:
+                slug = record["slug"]
+                wav_path, meta_path = _voice_paths(slug)
+                break
+        else:
+            known = ", ".join(r["slug"] for r in list_voices()[:12]) or "none saved yet"
+            return None, f"Error: no saved voice ‘{wanted}’. Available: {known}"
+    try:
+        ref_wav, ref_sr = sf.read(wav_path, dtype="float32")
+    except (OSError, ValueError) as e:
+        return None, f"Error: saved voice ‘{slug}’ could not be read: {type(e).__name__}: {e}"
+    if ref_wav.ndim > 1:
+        ref_wav = ref_wav.mean(axis=1)
+    ref_text = ""
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                ref_text = str(json.load(fh).get("text") or "").strip()
+        except (OSError, ValueError):
+            ref_text = ""
+    return (ref_wav, int(ref_sr), ref_text), None
+
+
+def speak(voice: str, text: str, language: str = "Auto",
+          temperature: float = SAMPLING_DEFAULTS["temperature"],
+          top_p: float = SAMPLING_DEFAULTS["top_p"],
+          top_k: int = SAMPLING_DEFAULTS["top_k"],
+          rep_penalty: float = SAMPLING_DEFAULTS["repetition_penalty"],
+          postproc: str = POSTPROCESS_DEFAULT) -> Tuple[Any, str]:
+    """Say `text` in a saved voice, in one call — the endpoint an external tool hits.
+
+    Everything the Clone tab needs (reference clip, transcript, x-vector fallback) is read
+    from the voice's own sidecar on the server, so a caller only has to know the voice's
+    name. That is what makes `scripts/say.py` a one-liner from a shell, which is the shape a
+    coding assistant actually wants. Same chunking, post-processing and memory floors as the
+    tabs; it shares the one GPU, so a long line here queues a UI generation behind it.
+    """
+    if not (text or "").strip():
+        return None, "Error: Text is required."
+    resolved, error = _resolve_voice(voice)
+    if error:
+        return None, error
+    ref_wav, ref_sr, ref_text = resolved
+    use_xvector = not ref_text
+    try:
+        budget = _budget(text)
+        with HUB.lock:
+            tts = HUB.acquire("voice_clone")
+            key = _clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)
+            prompt = _CLONE_PROMPTS.get(key)
+            if prompt is None:
+                prompt = tts.create_voice_clone_prompt(
+                    ref_audio=(ref_wav, ref_sr),
+                    ref_text=ref_text or None,
+                    x_vector_only_mode=use_xvector,
+                )
+                _CLONE_PROMPTS.clear()
+                _CLONE_PROMPTS[key] = prompt
+
+            def one(chunk: str) -> Tuple[np.ndarray, int]:
+                wavs, rate = tts.generate_voice_clone(
+                    text=chunk,
+                    language=language,
+                    voice_clone_prompt=prompt,
+                    max_new_tokens=_budget(chunk),
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+                return wavs[0], rate
+
+            wav, sr, chunk_notes = generate_chunked(text, language, one)
+        mode = "x-vector" if use_xvector else "ICL"
+        return _ok(*_present(wav, sr, budget, f"Speak ({mode})", postproc, chunk_notes))
+    except MediaError as e:
+        return None, f"Error: {e}"
+    except Exception as e:  # noqa: BLE001 - a caller over the network gets a message, not a traceback
+        return None, f"Error: {type(e).__name__}: {e}"
+
+
+def voices_available() -> str:
+    """Machine-readable voice list for `say.py --list`."""
+    records = list_voices()
+    if not records:
+        return "(no voices saved yet — use ‘Save to voice library’ or ‘Save selected take’)"
+    return "\n".join(
+        f"{r['slug']}\t{r.get('seconds', '?')}s\t{(r.get('text') or '')[:60]}" for r in records)
+
+
 
 def _clone_cache_key(audio_tuple, ref_text, x_vector_only) -> str:
     """Content hash of the reference clip + transcript + mode.
@@ -2416,6 +2519,42 @@ after a model switch pays a few seconds of load time.
                 cl_delete_btn.click(delete_saved_voice, inputs=[cl_voice],
                                     outputs=[cl_voice, cl_voice_status, cl_ref_audio])
                 cl_refresh_btn.click(refresh_voices, outputs=[cl_voice])
+
+            with gr.Tab("Speak (assistant API)"):
+                gr.Markdown(
+                    "One call: pick a saved voice, type what to say. This is also the endpoint "
+                    "external tools use — `scripts/say.py --voice <slug> --text \"...\"` renders it "
+                    "and plays it through your speakers, so a coding assistant can talk to you. "
+                    "It shares the one GPU with the other tabs, so a long line here queues a UI "
+                    "generation behind it. The reference clip and its transcript are read from "
+                    "`voices/` on the server — a caller only ever names the voice, never a path.")
+                with gr.Row():
+                    sp_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
+                                           scale=4, allow_custom_value=True,
+                                           info="Name or slug. Voices come from the library on the "
+                                                "Clone and Voice Design tabs.")
+                    sp_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
+                sp_text = gr.Textbox(
+                    label="What to say", lines=3,
+                    value="Build finished. Three tests failed, but I already fixed two of them.",
+                    placeholder="Type anything — long text is chunked and stitched automatically.")
+                with gr.Row():
+                    sp_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
+                    sp_btn = gr.Button("Speak", variant="primary")
+                with gr.Row():
+                    sp_audio = gr.Audio(label="Audio", type="numpy")
+                    sp_status = gr.Textbox(label="Status", lines=3, interactive=False)
+                sp_list = gr.Textbox(
+                    label="Voices on this server (slug · seconds · transcript)", lines=4,
+                    interactive=False,
+                    value=voices_available(),
+                    info="This box is also an API output — `scripts/say.py --list` reads it, "
+                         "which is how a script finds the slug to pass back.")
+                sp_refresh_btn.click(refresh_voices, outputs=[sp_voice]).then(
+                    voices_available, outputs=[sp_list])
+                sp_btn.click(speak,
+                             inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
+                             outputs=[sp_audio, sp_status])
 
         gr.Markdown(
             "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen). "
