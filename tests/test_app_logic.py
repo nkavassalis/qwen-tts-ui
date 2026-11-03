@@ -236,7 +236,7 @@ def test_voice_library(tmp_dir=None) -> None:
             check(webui.list_voices()[0]["seconds"] == 0.5, "overwrite updates the clip")
 
             _, _, msg = webui.load_saved_voice("does_not_exist")
-            check("missing" in msg, "loading an unknown voice errors instead of returning silence")
+            check("no saved voice" in msg, "loading an unknown voice errors instead of returning silence")
 
             _, msg, _ = webui.delete_saved_voice("sleepy_sea_captain")
             check("Deleted" in msg and webui.list_voices() == [], "delete removes both files")
@@ -1986,6 +1986,89 @@ def test_a_saved_voice_reaches_every_tab() -> None:
           "the refresh is chained onto every library-mutating action")
     check("library_outputs = [cl_voice, sp_voice, ch_voice, sp_list]" in source,
           "and it covers Clone, Speak, Chat and the API list box")
+
+
+def test_a_described_voice_is_spoken_from_its_description() -> None:
+    """The reason fox ships as words: cloning keeps ~60% of a reference's top end.
+
+    A voice that carries a description must be spoken by Voice Design, not by cloning its
+    frozen clip — 2.67m of energy above 9kHz against 0.57m measured. The clip still exists
+    for the Clone tab, so the two forms have to coexist without being confused.
+    """
+    import threading
+
+    sr = 24000
+    wav = (0.3 * np.sin(2 * np.pi * 150 * np.arange(sr * 3) / sr)).astype(np.float32)
+    calls: list = []
+
+    class FakeTTS:
+        def create_voice_clone_prompt(self, **kwargs):
+            calls.append(("prompt", kwargs.get("ref_text")))
+            return {"fake": "prompt"}
+
+        def generate_voice_clone(self, **kwargs):
+            calls.append(("clone", kwargs["text"]))
+            return [np.zeros(sr, dtype=np.float32)], sr
+
+        def generate_voice_design(self, **kwargs):
+            calls.append(("design", kwargs["instruct"], kwargs["text"]))
+            return [np.zeros(sr, dtype=np.float32)], sr
+
+    class FakeHub:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.tts = FakeTTS()
+
+        def acquire(self, capability):
+            calls.append(("acquire", capability))
+            return self.tts
+
+    original_voices, original_hub = webui.VOICES_DIR, webui.HUB
+    with tempfile.TemporaryDirectory() as vdir:
+        webui.VOICES_DIR, webui.HUB = vdir, FakeHub()
+        try:
+            webui.save_voice(name="Fox", wav=wav, sr=sr, text="a line", instruct="bright and wry",
+                             language="English", description="bright and wry", kind="design")
+            webui.save_voice(name="Booth", wav=wav, sr=sr, text="another line", instruct="",
+                             language="English")
+
+            labels = dict(webui.voice_choices())
+            check("Fox (described)" in [label for label, _ in webui.voice_choices()],
+                  f"a described voice says so in the dropdown: {list(labels)}")
+            check(webui.voice_kind(webui.list_voices()[0]) in ("design", "clip")
+                  and webui.voice_kind({"description": "x"}) == "design"
+                  and webui.voice_kind({"instruct": "y"}) == "design"
+                  and webui.voice_kind({"description": ""}) == "clip",
+                  "kind falls back to what the record actually carries")
+
+            calls.clear()
+            one, mode = webui._voice_synth("Fox", "English", 0.9, 1.0, 50, 1.05)
+            one("hello there")
+            check(mode == "described", f"a described voice reports itself: {mode}")
+            check(("acquire", "voice_design") in calls,
+                  f"described voices use the design checkpoint: {calls}")
+            check(any(c[0] == "design" and c[1] == "bright and wry" for c in calls),
+                  f"the description is what gets spoken: {calls}")
+            check(not any(c[0] == "clone" for c in calls),
+                  f"a described voice must not be cloned: {calls}")
+
+            calls.clear()
+            one, mode = webui._voice_synth("Booth", "English", 0.9, 1.0, 50, 1.05)
+            one("hello there")
+            check(mode == "ICL" and ("acquire", "voice_clone") in calls,
+                  f"a clip voice still goes the clone route: {mode} {calls}")
+
+            # A described voice with no clip must refuse to be loaded as a reference,
+            # with a message that says what to do instead.
+            webui.save_voice(name="Ghost", wav=None, sr=0, text="", instruct="low and slow",
+                             language="English", description="low and slow", kind="design")
+            _, _, msg = webui.load_saved_voice("ghost")
+            check(msg.startswith("Error") and "described" in msg and "Speak" in msg,
+                  f"loading a recipe as a reference explains the alternative: {msg}")
+            audio, status = webui.speak("ghost", "", "English")
+            check("text is required" in status.lower(), f"empty text is still refused: {status}")
+        finally:
+            webui.VOICES_DIR, webui.HUB = original_voices, original_hub
 
 
 if __name__ == "__main__":

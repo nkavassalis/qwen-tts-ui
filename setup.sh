@@ -8,15 +8,17 @@
 #   ./setup.sh              # everything (skips work already done)
 #   ./setup.sh --models     # only (re-)download the TTS checkpoints
 #   ./setup.sh --asr        # only (re-)fetch Whisper
+#   ./setup.sh --voices     # only (re-)create the shipped voices
 set -euo pipefail
 cd "$(dirname "$0")"
 
 ONLY=""
 case "${1:-}" in
-  --models) ONLY=models ;;
-  --asr)    ONLY=asr ;;
-  "")       ;;
-  *) echo "usage: $0 [--models|--asr]" >&2; exit 2 ;;
+  --models)  ONLY=models ;;
+  --asr)     ONLY=asr ;;
+  --voices)  ONLY=voices ;;
+  "")        ;;
+  *) echo "usage: $0 [--models|--asr|--voices]" >&2; exit 2 ;;
 esac
 
 # QwenLM/Qwen3-TTS ref to install. A branch or tag name is fetched shallowly; a full
@@ -102,6 +104,29 @@ if [[ -z $ONLY || $ONLY == asr ]]; then
   [[ -x .venv/bin/hf ]] || { echo "run ./setup.sh without --asr first (needs .venv)" >&2; exit 1; }
   echo "fetching $ASR_MODEL (2.9GB, into the Hugging Face cache)"
   .venv/bin/hf download "$ASR_MODEL" --exclude "*fp32*" "*.bin" "*.msgpack" "*.h5" "*.ot"
+fi
+
+# The shipped voice. Fox is a *description*, not a recording: this project does not
+# distribute anyone's voice (see README → Ethical use), so the repo carries the words and
+# your GPU renders the sound. The description is written first because it needs no GPU at
+# all — Speak and Chat work from it — and the frozen clip is a bonus for Voice Clone.
+FOX_DESCRIPTION="A bright, expressive adult female voice in her late twenties, slightly nasal, quick and emotional delivery that lifts at the end of phrases, casual American English, warm but sharp at the edges, a little breathless when she is excited."
+
+if [[ -z $ONLY || $ONLY == voices ]]; then
+  mkdir -p voices
+  if [[ ! -s voices/fox.json ]]; then
+    echo "creating the shipped voice 'Fox' (description)"
+    .venv/bin/python scripts/make_voice.py --name Fox --no-clip \
+      --description "$FOX_DESCRIPTION" || echo "WARNING: could not create Fox"
+  else
+    echo "have fox"
+  fi
+  if [[ -s voices/fox.json && ! -s voices/fox.wav ]]; then
+    echo "rendering Fox's frozen clip (needs the GPU and the weights)"
+    .venv/bin/python scripts/make_voice.py --name Fox --force \
+      --description "$FOX_DESCRIPTION" \
+      || echo "NOTE: no clip rendered — Fox stays description-only, which Speak and Chat still speak."
+  fi
 fi
 
 echo

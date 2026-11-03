@@ -1702,8 +1702,14 @@ def _voice_paths(slug: str) -> Tuple[str, str]:
     return f"{base}.wav", f"{base}.json"
 
 
-def save_voice(name: str, wav: np.ndarray, sr: int, text: str, instruct: str, language: str) -> Dict[str, Any]:
-    """Persist a generated clip as a named voice (wav + sidecar metadata)."""
+def save_voice(name: str, wav: Any = None, sr: int = 0, text: str = "", instruct: str = "",
+               language: str = "Auto", description: str = "", kind: str = "") -> Dict[str, Any]:
+    """Persist a named voice: a sidecar, plus the wav when there is a clip to keep.
+
+    `wav=None` is a *described* voice — a description and nothing else, which Speak and Chat
+    can still talk from. See `voice_kind` for why the description, not the clip, is the
+    higher-fidelity form.
+    """
     os.makedirs(VOICES_DIR, exist_ok=True)
     slug = _slug(name)
     wav_path, meta_path = _voice_paths(slug)
@@ -1713,14 +1719,35 @@ def save_voice(name: str, wav: np.ndarray, sr: int, text: str, instruct: str, la
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "language": language,
         "instruct": instruct,
+        "description": description,
+        "kind": kind or ("design" if (description or instruct).strip() else "clip"),
         "text": text,
         "sample_rate": int(sr),
-        "seconds": round(len(wav) / float(sr), 2),
+        "seconds": round(len(wav) / float(sr), 2) if wav is not None and sr else None,
     }
-    sf.write(wav_path, wav, sr)
+    if wav is not None:
+        sf.write(wav_path, wav, sr)
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(record, fh, indent=2, ensure_ascii=False)
     return record
+
+
+def voice_kind(record: Dict[str, Any]) -> str:
+    """'design' when the voice carries a description it can be spoken from, else 'clip'.
+
+    Two kinds of voice, one format. A **clip** voice is a reference recording + transcript and
+    is spoken by cloning it; a **design** voice carries the description that made it and is
+    spoken straight by Voice Design. Measured on the same three lines: speaking a description
+    keeps 2.67m of energy above 9kHz, cloning a saved take keeps 0.57m — cloning attenuates
+    whatever it is given to roughly 60% of the reference's top end, so when a description
+    exists it is the better route, and the clip stays there for the Clone tab and for
+    freezing into a fixed identity if you prefer one.
+    """
+    kind = str(record.get("kind") or "").strip().lower()
+    if kind in ("design", "clip"):
+        return kind
+    return "design" if (record.get("description") or record.get("instruct") or "").strip() \
+        else "clip"
 
 
 def list_voices() -> List[Dict[str, Any]]:
@@ -1742,7 +1769,31 @@ def list_voices() -> List[Dict[str, Any]]:
 
 
 def voice_choices() -> List[Tuple[str, str]]:
-    return [(f"{r['name']} ({r.get('seconds', '?')}s)", r["slug"]) for r in list_voices()]
+    entries = []
+    for record in list_voices():
+        if voice_kind(record) == "design":
+            entries.append((f"{record['name']} (described)", record["slug"]))
+        else:
+            entries.append((f"{record['name']} ({record.get('seconds', '?')}s)", record["slug"]))
+    return entries
+
+
+def _find_voice(voice: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Locate a saved voice *record* by display name or slug — never by a client path."""
+    if not (voice or "").strip():
+        return None, "Error: choose a saved voice first."
+    wanted = voice.strip()
+    slug = _slug(wanted)
+    records = list_voices()
+    for record in records:
+        if record.get("slug") == slug:
+            return record, None
+    needle = wanted.lower()
+    for record in records:
+        if record.get("name", "").lower() == needle:
+            return record, None
+    known = ", ".join(r["slug"] for r in records[:12]) or "none saved yet"
+    return None, f"Error: no saved voice ‘{wanted}’. Available: {known}"
 
 
 def save_designed_voice(name: str, audio: Any, text: str, voice_description: str,
@@ -1767,14 +1818,17 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
             wav=wav,
             sr=sr,
             text=text.strip(),
-            instruct=(voice_description or "").strip(),
+            instruct=(voice_description or ""),
             language=language,
+            description=(voice_description or "").strip(),
+            kind="design",
         )
     except (MediaError, OSError, ValueError) as e:
         return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
     return (
         gr.update(),
-        f"Saved ‘{record['name']}’ ({record['seconds']}s). Pick it under Voice Clone → Saved voices.",
+        f"Saved ‘{record['name']}’ ({record['seconds']}s) with its description — Speak and "
+        f"Chat will speak it from the description (brighter); Voice Clone can still load the clip.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -1891,15 +1945,21 @@ def load_saved_voice(slug: str) -> Tuple[Any, Any, str]:
     """Fill the Voice Clone reference fields from a saved voice."""
     if not slug:
         return None, gr.update(), "Error: choose a saved voice first."
-    wav_path, meta_path = _voice_paths(_slug(slug))
+    record, error = _find_voice(slug)
+    if error:
+        return None, gr.update(), error
+    wav_path = record.get("wav") or _voice_paths(record["slug"])[0]
+    meta_path = record.get("json") or _voice_paths(record["slug"])[1]
     if not os.path.exists(wav_path):
-        return None, gr.update(), f"Error: saved voice ‘{slug}’ is missing its audio."
+        return None, gr.update(), (
+            f"Error: ‘{record['name']}’ is a described voice — it has no clip to clone. Use it "
+            f"in Speak or Chat, or generate it on the Design a voice tab and save the clip.")
     wav, sr = sf.read(wav_path, dtype="float32")
     text = ""
     if os.path.exists(meta_path):
         with open(meta_path, encoding="utf-8") as fh:
             text = json.load(fh).get("text", "")
-    return (int(sr), wav), text, f"Loaded ‘{slug}’ — reference transcript filled in. Hit ‘Clone & generate’."
+    return (int(sr), wav), text, f"Loaded ‘{record['name']}’ — reference transcript filled in. Hit ‘Clone & generate’."
 
 
 def delete_saved_voice(slug: str) -> Tuple[Any, str, Any]:
@@ -1932,7 +1992,7 @@ def voice_library_updates() -> Tuple[Any, Any, Any, str]:
             gr.update(choices=choices), voices_available())
 
 
-def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[str, int, str]], Optional[str]]:
+def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[Any, int, str]], Optional[str]]:
     """Turn a client-supplied voice *name* into a server-side (wav, sr, transcript).
 
     The client never supplies a path: the name is slugged to [a-z0-9_] before it is joined
@@ -1940,34 +2000,21 @@ def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[str, int, str]], Optional
     fall back to matching the display name, because the thing calling this is usually a
     script that read the list once and typed it back.
     """
-    if not (voice or "").strip():
-        return None, "Error: choose a saved voice first."
-    wanted = voice.strip()
-    slug = _slug(wanted)
-    wav_path, meta_path = _voice_paths(slug)
+    record, error = _find_voice(voice)
+    if error:
+        return None, error
+    wav_path = record.get("wav") or _voice_paths(record["slug"])[0]
+    meta_path = record.get("json") or _voice_paths(record["slug"])[1]
     if not os.path.exists(wav_path):
-        needle = wanted.lower()
-        for record in list_voices():
-            if record.get("name", "").lower() == needle or record.get("slug") == slug:
-                slug = record["slug"]
-                wav_path, meta_path = _voice_paths(slug)
-                break
-        else:
-            known = ", ".join(r["slug"] for r in list_voices()[:12]) or "none saved yet"
-            return None, f"Error: no saved voice ‘{wanted}’. Available: {known}"
+        return None, (f"Error: ‘{record['name']}’ is a described voice with no clip. Speak and "
+                      f"Chat can talk from its description; Voice Clone needs a clip to clone.")
     try:
         ref_wav, ref_sr = sf.read(wav_path, dtype="float32")
     except (OSError, ValueError) as e:
-        return None, f"Error: saved voice ‘{slug}’ could not be read: {type(e).__name__}: {e}"
+        return None, f"Error: saved voice ‘{record['slug']}’ could not be read: {type(e).__name__}: {e}"
     if ref_wav.ndim > 1:
         ref_wav = ref_wav.mean(axis=1)
-    ref_text = ""
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, encoding="utf-8") as fh:
-                ref_text = str(json.load(fh).get("text") or "").strip()
-        except (OSError, ValueError):
-            ref_text = ""
+    ref_text = str(record.get("text") or "").strip()
     return (ref_wav, int(ref_sr), ref_text), None
 
 
@@ -1980,6 +2027,28 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
     held across yields could then be released late or not at all, and a stuck lock stops the
     whole app. Per-chunk acquisition costs an LRU check and cannot deadlock the box.
     """
+    resolved, error = _find_voice(voice)
+    if error:
+        raise MediaError(error)
+    record = resolved
+    description = str(record.get("description") or record.get("instruct") or "").strip()
+    if voice_kind(record) == "design" and description:
+        # Speak the description straight: measured 2.67m of energy above 9kHz against 0.57m
+        # for cloning a saved take, because cloning keeps only ~60% of whatever reference it
+        # is handed. The clip in the sidecar is still what Voice Clone loads.
+        def one(chunk: str) -> Tuple[np.ndarray, int]:
+            with HUB.lock:
+                tts = HUB.acquire("voice_design")
+                wavs, rate = tts.generate_voice_design(
+                    text=chunk,
+                    language=language,
+                    instruct=description,
+                    max_new_tokens=_budget(chunk),
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+            return wavs[0], int(rate)
+        return one, "described"
+
     resolved, error = _resolve_voice(voice)
     if error:
         raise MediaError(error)
@@ -2676,7 +2745,10 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                 with gr.Row():
                     sp_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
                                            scale=4, allow_custom_value=True,
-                                           info="Name or slug. Voices come from the library on the "
+                                           info="Name or slug. A ‘(described)’ voice is spoken from "
+                                                "its description, which keeps the most top end; a "
+                                                "voice showing seconds is spoken by cloning its "
+                                                "saved clip. Voices come from the library on the "
                                                 "Clone a voice and Design a voice tabs.")
                     sp_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
                 sp_text = gr.Textbox(
