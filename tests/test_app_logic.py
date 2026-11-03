@@ -791,9 +791,9 @@ def test_build_ui_constructs() -> None:
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
     # CustomVoice + VoiceDesign + Clone output + Clone reference box + the four candidate
-    # players that make best-of-N auditionable + the Speak player + the chat player.
-    check(len(audios) == 10, f"three outputs, one reference input, four take players, one "
-                            f"speak player, one chat player — found {len(audios)}")
+    # players that make best-of-N auditionable + the Speak player. (The chat player is HTML.)
+    check(len(audios) == 9, f"three outputs, one reference input, four take players, one "
+                            f"speak player — found {len(audios)}")
     for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
         check(label in by_label, f"{label} exists")
     # Anything we read back from the browser is filepath-typed so that we open it
@@ -1813,13 +1813,26 @@ def test_chat_say_streams_one_piece_at_a_time() -> None:
 
     check(len(turns) >= 4, f"a reply should arrive in several updates, got {len(turns)}")
     check(len(calls) >= 2, f"the text should have been chunked, got {len(calls)} calls")
-    streamed = [t for t in turns if isinstance(t[1], tuple)]
+    streamed = [t for t in turns if isinstance(t[1], str) and t[1].startswith("<audio")]
     check(len(streamed) == len(calls),
           f"one audio hand-off per piece ({len(streamed)} vs {len(calls)})")
-    waves = [t[1][1] for t in streamed]
-    check(all(len(w) for w in waves), "every hand-off carries audio")
-    check(all(float(np.max(np.abs(w))) <= 1.0 for w in waves),
+    # Decode what the browser would actually receive, rather than trusting the wrapper.
+    import base64 as _b64
+    import io as _io
+    import re as _re
+
+    decoded = []
+    for turn in streamed:
+        match = _re.search(r'src="data:audio/wav;base64,([^"]+)"', turn[1])
+        check(match is not None, "the player carries an embedded wav, not a server path")
+        decoded.append(sf.read(_io.BytesIO(_b64.b64decode(match.group(1))), dtype="float32"))
+    check(all(len(w) for w, _ in decoded), "every hand-off carries audio")
+    check(all(float(np.max(np.abs(w))) <= 1.0 for w, _ in decoded),
           "streamed audio stays inside full scale")
+    check(all(sr == 48000 for _, sr in decoded),
+          f"the listening copy is the post-processed one, got {set(sr for _, sr in decoded)}")
+    check(all("autoplay" in t[1] and "controls" in t[1] for t in streamed),
+          "each element autoplays and still offers a manual play button")
 
     final_messages = turns[-1][0]
     check(final_messages[0]["role"] == "user" and final_messages[1]["role"] == "assistant",
@@ -1859,7 +1872,12 @@ def test_chat_path_shares_the_chunker_and_locks_per_chunk() -> None:
           "reply can strand the app if the client walks away")
 
     demo_source = inspect.getsource(webui.build_ui)
-    check("autoplay=True" in demo_source, "the chat player actually plays without a click")
+    check("ch_player = gr.HTML" in demo_source,
+          "the chat player is our own element — Gradio's Audio reuses one <audio> tag and "
+          "only autoplays on the first source load, which is what silenced a streamed reply")
+    player_source = inspect.getsource(webui._audio_html)
+    check("autoplay" in player_source and "controls" in player_source,
+          "it autoplays, and a blocked browser is one click away from playing it")
     check("ch_text.submit(chat_say" in demo_source,
           "Enter submits, not just the button")
 

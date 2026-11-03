@@ -312,7 +312,11 @@ What it can stream is **sentences**, which is the only granularity that exists h
 on a 60-word reply: **first audio at 12.6s, whole reply at 30.2s**, three pieces, 17s of speech.
 
 So: good for "read this to me" where you want to start hearing it now, not a conversation
-partner. The player is `autoplay=True`, so each piece starts on arrival without a click.
+partner. Each piece is rendered as its **own** `<audio controls autoplay>` element rather than
+reusing Gradio's player — its component swaps the `src` on one element and only autoplays on
+the first load, which is what made a streamed reply fall silent after a few pieces. `controls`
+stays on, so if your browser blocks autoplay outright (Safari is the strict one) each piece is
+one click away rather than lost.
 
 ## Environment variables
 
@@ -554,6 +558,7 @@ reference doesn't re-encode it.
 | Generation takes minutes, GPU ~35% | Speech tokenizer stuck on CPU — you bypassed `ModelHub._move()` (see design note above) |
 | `Torch has no CUDA` / `no kernel image available` | torch wheel predates sm_120; need `torch>=2.7` built with cu128 (`setup.sh` pins 2.8.0+cu128) |
 | Mic record button does nothing on a LAN URL | Browsers only allow mic on localhost or HTTPS — use `./run.sh --ssl-self-signed --ip 0.0.0.0` |
+| Chat reply plays a piece or two, then goes quiet | The browser blocked autoplay (Safari is strict). Each piece has its own play control — click it; nothing is lost |
 | Clone rambles / never stops | Hit the token cap; raise repetition penalty, lower temperature, or use a cleaner reference clip |
 | `Model not found at models/...` | `./setup.sh --models` (or `.venv/bin/hf download Qwen/<name> --local-dir models/<name>`) |
 | Two people at once | Requests are queued (`default_concurrency_limit=1`); raise `--max-resident` and the queue limit only if VRAM allows |

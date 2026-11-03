@@ -26,10 +26,12 @@ Run:  ./run.sh            (or)  .venv/bin/python webui/app.py --ip 127.0.0.1 --p
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import gc
 import getpass
 import hashlib
+import io
 import json
 import os
 import re
@@ -2025,6 +2027,23 @@ def speak(voice: str, text: str, language: str = "Auto",
         return None, f"Error: {type(e).__name__}: {e}"
 
 
+def _audio_html(wav: np.ndarray, sr: int) -> str:
+    """A self-contained <audio> element for one streamed piece.
+
+    Gradio's Audio component keeps a single <audio> element and, on a value update, swaps
+    the src — its autoplay fires on the first source load and not on the ones after, which
+    is exactly the "first few pieces play, then it goes quiet" failure on a streamed reply.
+    A brand-new element per yield is what the browser needs to honour autoplay again, and a
+    data: URI keeps playback independent of Gradio's temp-file serving and its cleanup.
+    `controls` stays on so a browser that blocks autoplay is one click away from playing it.
+    """
+    buffer = io.BytesIO()
+    sf.write(buffer, np.asarray(wav, dtype=np.float32), int(sr), format="WAV", subtype="PCM_16")
+    payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return (f'<audio controls autoplay playsinline style="width:100%" '
+            f'src="data:audio/wav;base64,{payload}"></audio>')
+
+
 def chat_say(text: str, history: Any, voice: str, language: str = "Auto",
              temperature: float = SAMPLING_DEFAULTS["temperature"],
              top_p: float = SAMPLING_DEFAULTS["top_p"],
@@ -2068,7 +2087,7 @@ def chat_say(text: str, history: Any, voice: str, language: str = "Auto",
             pieces += 1
             messages[-1]["content"] = (piece["text"] if pieces == 1
                                        else f"{messages[-1]['content']} {piece['text']}")
-            yield (snapshot(), (listen_sr, listen_wav),
+            yield (snapshot(), _audio_html(listen_wav, listen_sr),
                    f"Speaking piece {pieces}/{piece['total']} — {spoken:.1f}s so far "
                    f"({mode}, {listen_sr}Hz)")
         yield snapshot(), gr.update(), (f"Said {pieces} piece{'s' if pieces != 1 else ''}, "
@@ -2681,15 +2700,17 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                                               value="Auto", scale=2)
                     ch_send = gr.Button("Speak", variant="primary", scale=1)
                     ch_clear = gr.Button("Clear", size="sm", scale=1)
-                ch_audio = gr.Audio(label="Now playing", type="numpy", autoplay=True)
+                ch_player = gr.HTML(label="Now playing",
+                                    value="<em style='opacity:.6'>Each sentence appears here and "
+                                          "starts playing on its own — no click needed.</em>")
                 ch_status = gr.Textbox(label="Status", lines=1, interactive=False)
                 chat_inputs = [ch_text, ch_log, ch_voice, ch_language] + sampling + output_options
                 ch_send.click(chat_say, inputs=chat_inputs,
-                              outputs=[ch_log, ch_audio, ch_status])
+                              outputs=[ch_log, ch_player, ch_status])
                 ch_text.submit(chat_say, inputs=chat_inputs,
-                               outputs=[ch_log, ch_audio, ch_status])
-                ch_clear.click(lambda: ([], None, "Cleared."),
-                               outputs=[ch_log, ch_audio, ch_status])
+                               outputs=[ch_log, ch_player, ch_status])
+                ch_clear.click(lambda: ([], "", "Cleared."),
+                               outputs=[ch_log, ch_player, ch_status])
 
         gr.Markdown(
             "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen), "

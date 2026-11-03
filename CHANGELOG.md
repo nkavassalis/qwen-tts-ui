@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — Chat audio stopped autoplaying after the first few pieces
+
+Nick hit it while testing: the first three pieces played, then the chat went silent.
+
+The cause is in Gradio's own player, not in the streaming path. Reading the compiled Audio
+component, it keeps **one** `<audio>` element and on a value update swaps the `src`; `play()` is
+called on the first source load, guarded by a flag that stays set — so every later piece
+arrives in the same element and never plays again. That is exactly "plays a few, then quiet"
+on a streamed reply, where each yield changes the value.
+
+- The chat player is now **our own element, one per piece**: `_audio_html()` renders a fresh
+  `<audio controls autoplay playsinline>` with the wav embedded as a `data:` URI. A new element
+  is what the browser needs to honour `autoplay` again, and embedding the audio removes the
+  dependency on Gradio's temp-file serving and its cleanup from the playback path entirely.
+- `controls` stays on deliberately: if a browser blocks autoplay outright (Safari is the strict
+  one), each piece is one click away instead of silently lost. A troubleshooting row says so.
+- Verified at the wire, not just in process: an SSE call to `/gradio_api/call/chat_say` delivered
+  **3 separate `data:audio/wav;base64` elements, each with `autoplay` and `controls`**, one per
+  piece. `chat_stream` (GPU) still asserts time-to-first-audio — 13.6s of a 31.3s reply.
+- Tests updated to assert the payload the browser actually receives: the CPU chat test now
+  **decodes the base64** and checks rate, peak and length, instead of trusting a tuple that
+  never crossed a network.
+
 ## 2026-11-03 — named qwen3-tts-ui, polished the UI, added an ethical-use statement, QA pass
 
 The header read `Qwen3-TTS — local (1.7B, 16GB Blackwell)`, which is a commit message, not a

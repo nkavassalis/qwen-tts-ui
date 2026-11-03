@@ -544,15 +544,27 @@ def run_chat_stream(hub: webui.ModelHub) -> None:
             first_audio = None
             turns = []
             for turn in webui.chat_say(text, [], "Smoke Narrator", "English"):
-                if first_audio is None and isinstance(turn[1], tuple):
+                if first_audio is None and str(turn[1]).startswith("<audio"):
                     first_audio = time.time() - started
                 turns.append(turn)
             total = time.time() - started
 
-            streamed = [t for t in turns if isinstance(t[1], tuple)]
+            import base64 as _b64
+            import io as _io
+            import re as _re
+
+            streamed = []
+            for turn in turns:
+                match = _re.search(r'src="data:audio/wav;base64,([^"]+)"', str(turn[1]))
+                if match:
+                    streamed.append(sf.read(_io.BytesIO(_b64.b64decode(match.group(1))),
+                                             dtype="float32")[0])
             assert len(streamed) >= 2, f"a 60-word reply should arrive in pieces: {len(streamed)}"
-            assert all(len(t[1][1]) > 0 for t in streamed), "a hand-off carried no audio"
-            assert all(float(np.max(np.abs(t[1][1]))) <= 1.0 for t in streamed), "streamed audio clipped"
+            assert all(len(w) > 0 for w in streamed), "a hand-off carried no audio"
+            assert all(float(np.max(np.abs(w))) <= 1.0 for w in streamed), "streamed audio clipped"
+            assert all("autoplay" in str(t[1]) and "controls" in str(t[1])
+                       for t in turns if str(t[1]).startswith("<audio")), \
+                "each piece must autoplay and still offer a manual play button"
             assert first_audio is not None and first_audio < total - 1.0, \
                 f"first audio must land well before the end (ttfb {first_audio:.1f}s of {total:.1f}s)"
             said = turns[-1][0][-1]["content"]
