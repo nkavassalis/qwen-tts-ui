@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — output post-processing: the "digital" edge is imaging, not sample rate
+
+The vocoder is fixed at 24kHz (`output_sample_rate: 24000`), so no post-filter can add
+bandwidth above 12kHz. Measured instead: the raw decode carries 0.155% of its energy in
+the top 5% of the band against 0.036% for the same signal resampled properly — a 4x excess
+of near-Nyquist imaging from the decoder's transposed-convolution upsampling, which is
+what listeners call digital/harsh. A cheap linear resampler (what a browser may do for
+you) cost 20% of the high-band energy, so the 24->48kHz step is done here with soxr HQ.
+
+- `postprocess_output()` + an **Output post-processing** dropdown on all three tabs:
+  Off (raw 24kHz) / Clean (HQ 48kHz) / Warm (48kHz + lowpass 11.5k + small high-shelf +
+  mild tanh), default Warm. Warm cuts near-Nyquist energy ~6x and ends up brighter than
+  raw (centroid 2164 vs 2044 Hz), because the lowpass is followed by the shelf.
+- Likeness is not the price: speaker-encoder SIM went 0.9900 (raw) -> 0.9893 (clean) ->
+  0.9879 (warm), inside the 0.001 seed-to-seed spread. Both metrics are in the README.
+- Runs after `_report()` and after candidate scoring, so durations/WER/SIM still describe
+  the model's own decode; falls back to the raw signal on any failure (missing soxr/scipy,
+  a clip too short for the filter padding) because polish must never break a generation.
+- Tests: CPU tier 35 -> 37 (mode fallbacks, duration, full scale, and a functional
+  assertion that Warm really reduces near-Nyquist energy). GPU tier asserts 48kHz out and
+  24kHz when Off. The new tests caught a real bug: a sub-50-sample clip raised inside
+  `sosfiltfilt`, now guarded.
+
 ## 2026-11-03 — clone quality: measured, then two guards added
 
 Measured first (SIM = the model's own speaker-encoder cosine, WER = Whisper large-v3

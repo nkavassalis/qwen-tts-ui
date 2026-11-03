@@ -259,6 +259,35 @@ identical inputs: SIM spread only 0.001, but WER was 0.000 on one seed and 0.133
 others — the model occasionally serves a dud take and no slider fixes that. Generating
 three and keeping the best does. Set a **Seed** to reproduce a take you liked.
 
+### Why it sounds a little "digital", and what *Output post-processing* does about it
+
+The vocoder is fixed at 24kHz (tokenizer config: `output_sample_rate: 24000`,
+`decode_upsample_rate: 1920`), so **nothing can add real bandwidth above 12kHz** — the
+"air" simply isn't in the signal and any filter that claims to put it back is inventing it.
+What *is* fixable is the fizz. The raw decode measured 0.155% of its energy in the top 5%
+of the band (11.4–12kHz) where a properly band-limited signal has 0.036% — a **4× excess of
+near-Nyquist imaging** from the decoder's transposed-convolution upsampling, which is
+exactly what people describe as digital/harsh. Doing the 24→48kHz step here with soxr HQ
+also stops your browser guessing at it: a cheap linear resampler cost 20% of the high-band
+energy in the same measurement.
+
+| Output post-processing | SIM | centroid | HF energy | near-Nyquist |
+|---|---|---|---|---|
+| Off — raw 24kHz from the vocoder | 0.9900 | 2044 Hz | 3.26% | 0.155% |
+| Clean — soxr HQ → 48kHz | 0.9893 | 2029 Hz | 3.11% | 0.036% |
+| *(a cheap linear resampler, for scale)* | 0.9884 | 1898 Hz | 2.17% | 0.038% |
+| **Warm** — 48kHz + de-image + gentle air (default) | 0.9879 | 2164 Hz | 3.83% | 0.027% |
+
+SIM is the model's own speaker encoder against the reference, so the right-hand columns
+cannot be paid for with likeness: 0.9900 → 0.9879 is inside the 0.001 seed-to-seed spread
+measured above. **Warm** cuts the near-Nyquist energy ~6× and ends up *brighter* than raw
+(centroid 2164 vs 2044) because the lowpass is followed by a small high-shelf, which is
+what makes it read as open rather than dull.
+
+Pick **Off** to hear the untouched decode — useful for A/B, and worth using when you save a
+Voice Design clip into the library, since that clip becomes the clone reference and is
+better coming straight from the model than from an EQ curve.
+
 Method: one English target sentence, single speaker per sweep, n=2–4 per row, so anything
 under ~0.005 SIM should be read as noise. The two findings above are far outside it.
 

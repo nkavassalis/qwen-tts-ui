@@ -264,6 +264,16 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         assert status.count("WER") >= 3, f"candidates were not scored by WER:\n{status}"
         assert "kept #" in status, f"no winner named in the status:\n{status}"
         assert "WARNING" not in status, f"a correct transcript must not be flagged:\n{status}"
+        assert sr == webui.POSTPROCESS_SR, \
+            f"the listening copy should come back at {webui.POSTPROCESS_SR}Hz, got {sr}Hz"
+        assert "Post-processing" in status, f"the status should say what was applied:\n{status}"
+        raw_pair, _ = webui.generate_voice_clone(
+            (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
+            0.9, 1.0, 50, 1.05, postproc="off", candidates=1, seed=cfg["seed"])
+        raw_sr, raw = raw_pair
+        assert raw_sr == 24000, f"'off' must hand back the vocoder's own 24kHz, got {raw_sr}"
+        assert np.all(np.isfinite(raw)) and float(np.max(np.abs(raw))) <= 1.0, \
+            "post-processed audio must stay finite and inside full scale"
         print(f"  [best_of_n] {took:.1f}s | {status.splitlines()[-1]}")
         path = os.path.join(OUT_DIR, "best_of_n.wav")
         sf.write(path, wav, sr)

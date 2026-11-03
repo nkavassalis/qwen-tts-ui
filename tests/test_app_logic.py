@@ -1104,6 +1104,83 @@ def test_clone_tab_wires_the_quality_controls() -> None:
           "the fit check is wired to transcript, sliders, x-vector and the post-action chains")
 
 
+def test_postprocess_output() -> None:
+    """The 'digital' fix: less near-Nyquist imaging, same length, same likeness.
+
+    The likeness half of that claim is measured in the GPU tier (speaker-encoder cosine);
+    here we pin the signal-shape guarantees that make the claim meaningful.
+    """
+    rng = np.random.default_rng(1)
+    sr = 24000
+    t = np.arange(int(1.5 * sr)) / sr
+    tone = (0.3 * np.sin(2 * np.pi * 1000 * t)).astype(np.float32)
+    hiss = (0.05 * rng.standard_normal(len(t))).astype(np.float32)   # energy up to Nyquist
+    wav = np.clip(tone + hiss, -1, 1).astype(np.float32)
+
+    def near_nyquist(x, rate):
+        s = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+        f = np.fft.rfftfreq(len(x), 1.0 / rate)
+        top = f > 0.95 * (rate / 2.0)
+        return float(s[top].sum() / (s[f > 0].sum() + 1e-12))
+
+    raw, raw_sr = webui.postprocess_output(wav, sr, "off")
+    check(raw_sr == sr and np.array_equal(raw, wav), "off returns the vocoder signal untouched")
+
+    clean, clean_sr = webui.postprocess_output(wav, sr, "clean")
+    check(clean_sr == webui.POSTPROCESS_SR, "clean resamples to 48kHz")
+    check(abs(len(clean) / clean_sr - len(wav) / sr) < 0.01, "clean preserves duration")
+    check(np.all(np.isfinite(clean)) and float(np.max(np.abs(clean))) <= 1.0,
+          "clean stays finite and inside full scale")
+
+    warm, warm_sr = webui.postprocess_output(wav, sr, " Warm ")
+    check(warm_sr == webui.POSTPROCESS_SR, "warm outputs 48kHz")
+    check(abs(len(warm) / warm_sr - len(wav) / sr) < 0.02, "warm preserves duration")
+    check(np.all(np.isfinite(warm)) and float(np.max(np.abs(warm))) <= 1.0,
+          "warm stays finite and inside full scale")
+    check(near_nyquist(warm, warm_sr) < near_nyquist(raw, raw_sr) * 0.5,
+          f"warm must actually cut the near-Nyquist imaging "
+          f"({near_nyquist(warm, warm_sr):.4f} vs {near_nyquist(raw, raw_sr):.4f})")
+
+    # Robustness: this is polish, so nothing here may be able to break a generation.
+    # Blank means "not specified" -> the default; unrecognised -> the raw signal, because
+    # applying filters nobody asked for is the worse mistake.
+    for mode in ("", None):
+        out, out_sr = webui.postprocess_output(wav, sr, mode)
+        check(out_sr in (sr, webui.POSTPROCESS_SR) and np.all(np.isfinite(out)),
+              f"blank mode '{mode}' falls back to the default without raising")
+    for mode in ("nonsense", "loud", "0"):
+        out, out_sr = webui.postprocess_output(wav, sr, mode)
+        check(out.shape == wav.shape and out_sr == sr,
+              f"unrecognised mode '{mode}' returns the raw signal rather than guessing")
+    off_upper, off_sr = webui.postprocess_output(wav, sr, " OFF ")
+    check(off_sr == sr and np.array_equal(off_upper, wav), "mode matching ignores case and spaces")
+    empty, empty_sr = webui.postprocess_output(np.zeros(0, dtype=np.float32), sr, "warm")
+    check(empty.size == 0 and empty_sr == sr, "an empty clip passes through")
+    tiny, tiny_sr = webui.postprocess_output(np.array([0.1], dtype=np.float32), sr, "warm")
+    check(np.all(np.isfinite(tiny)) and tiny_sr in (sr, webui.POSTPROCESS_SR),
+          "a one-sample clip does not blow up the filters")
+
+    hot = np.full(sr, 0.99, dtype=np.float32)
+    hot_out, _ = webui.postprocess_output(hot, sr, "warm")
+    check(float(np.max(np.abs(hot_out))) <= 1.0, "a hot input is never left clipping")
+
+    check(set(webui.POSTPROCESS_MODES) == set(webui.POSTPROCESS_LABELS),
+          "every mode has a label for the dropdown")
+    check(webui.POSTPROCESS_DEFAULT in webui.POSTPROCESS_MODES, "the default is a real mode")
+    check("off" in webui.POSTPROCESS_MODES, "the raw signal stays reachable for A/B and for "
+                                            "saving library voices off the model's own decode")
+
+
+def test_output_options_are_wired() -> None:
+    """All three tabs must offer the post-processing choice, not just one."""
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+    check("s_postproc" in source and "output_options" in source, "the dropdown exists")
+    check(source.count("+ output_options") == 3,
+          "all three generation tabs (CustomVoice, VoiceDesign, Clone) receive the choice")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -30,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 35 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 37 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 35 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 37 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 35/35 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 37/37 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,15 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **Output post-processing is listening-only** (`postprocess_output`). The vocoder is fixed
+  at 24kHz, so the "digital" character is near-Nyquist imaging (measured 4x excess), not
+  missing bandwidth — nothing here can add air above 12kHz, and anything that appears to is
+  inventing it. Modes: off / clean (soxr HQ 48k) / warm (48k + lowpass 11.5k + small
+  high-shelf + mild tanh). It runs *after* `_report()` and after candidate scoring, so
+  durations, WER and SIM all describe the model's own decode; it falls back to the raw
+  signal on any failure, including missing soxr/scipy, because polish must not be able to
+  break a generation. `Off` is the mode to use when saving a Voice Design clip into the
+  library, since that clip becomes a clone reference.
 - **Quality lives in the reference, not the sliders** (measured — see README *Getting the
   best quality*). Decode knobs moved SIM/WER inside noise; a transcript that does not match
   the clip cost WER 1.000 and 3x the output length. Hence `transcript_fit()` (a coarse
