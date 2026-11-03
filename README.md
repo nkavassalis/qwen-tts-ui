@@ -151,8 +151,8 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (49 cases) for UI helpers and guards
-tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
+tests/test_app_logic.py   CPU-only unit tests (61 cases) for UI helpers and guards
+tests/smoke_test.py       GPU end-to-end: 8 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
 CHANGELOG.md        one entry per change
@@ -237,7 +237,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 49 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 61 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -346,6 +346,57 @@ better coming straight from the model than from an EQ curve.
 
 Method: one English target sentence, single speaker per sweep, n=2–4 per row, so anything
 under ~0.005 SIM should be read as noise. The two findings above are far outside it.
+
+### Long text: the 2048-token cap is not the limit — tempo is
+
+Every generation is bounded by `max_new_tokens`, scaled to the text (`_budget()`, capped at
+2048). That cap is a **runaway guard**, not a quality limit, and it is worth being precise
+about why, because both obvious guesses are wrong.
+
+Measured on the 1.7B checkpoint, single pass, same speaker:
+
+| words | audio | tokens | wall time | peak VRAM | words/sec | Whisper WER |
+|---|---|---|---|---|---|---|
+| 18 | 5.9s | 74 | 8.7s | 4.36 GB | 3.05 | 0.00 |
+| 60 | 17.7s | 221 | 23.3s | 7.52 GB | 3.39 | 0.62 |
+| 150 | 45.7s | 571 | 60.5s | 7.58 GB | 3.28 | 0.55 |
+| 300 | 74.3s | 929 | 100.7s | 7.58 GB | **4.04** | **0.68** |
+| 300, cap raised to 4096 | 74.3s | 929 | 111.4s | 7.58 GB | 4.04 | 0.68 |
+
+- **Not VRAM.** 7.52 GB at 221 tokens, 7.58 GB at 929. The talker's KV cache is ~112 KB per
+  token (28 layers × 8 KV heads × 128 head_dim × K and V × bf16), so even the checkpoint's own
+  8192 default fits comfortably on a 16 GB card.
+- **Not the token budget.** 300 words needs 929 of the 2048 tokens allowed, and raising the cap
+  to 4096 produced *identical* audio — EOS arrives on its own. The cap only matters when the
+  model fails to stop, which ICL cloning does occasionally.
+- **It is tempo.** The model accelerates as the sequence grows — 3.05 words/s at 18 words, 4.04
+  at 300 — and intelligibility goes with it. The usable ceiling on this checkpoint is roughly
+  **30–45 seconds of audio per pass**, whether the cap says 2048 or 8192.
+
+So long text is split and stitched automatically (above ~25 words): `split_for_tts` then
+`stitch_clips`.
+
+- **Split on real sentence boundaries only**, after protecting the dots that are not full
+  stops: `Mr.` `Dr.` `St.`, decimals (`3.5`), initials (`J. R. R. Tolkien`), ellipses, URLs,
+  emails, list markers (`1.`). A false boundary is not cosmetic — the model reads each one with
+  sentence-final intonation.
+- **Then fit the measured band** (12–26 words, or 20–42 CJK characters): fragments are merged so
+  nothing arrives clipped and toneless, over-long sentences are cut at the clause boundary
+  nearest their middle, and the separator stays with the left piece so the model does not use
+  falling intonation in the middle of a thought.
+- **Lossless.** Concatenating the chunks reproduces the input with whitespace ignored. That is
+  the invariant the tests hammer, because the failure mode is silently dropped words.
+- **Stitched, not appended.** Each piece's leading/trailing padding is trimmed and the joins get
+  a 15 ms equal-power crossfade; naive concatenation gives you a stutter of gaps and a click at
+  every seam.
+- A piece that comes out at an implausible rate is **re-rolled once** — about 10s, against
+  re-running the whole document.
+
+The same 300 words after chunking: **92.6s of audio at 2.48 words/s, WER 0.42** — from 4.04 and
+0.68. The cost is 16 separate decodes: 131s instead of 101s, still ~1.4× realtime.
+
+Past ~40 chunks a request is refused with a `MediaError` rather than quietly running for an
+hour. One GPU, one process.
 
 ## Design notes
 

@@ -378,7 +378,10 @@ CLIP_FRACTION = 0.001      # share of samples at full scale before it counts as 
 def _rms_windows(wav: np.ndarray, sr: int, window: int) -> np.ndarray:
     if wav.size == 0:
         return np.zeros(0, dtype=np.float32)
-    frames = max(1, wav.size // window)
+    # ceil, not floor: the last partial window still counts as a window. With floor the pad
+    # width went negative for any length that was not an exact multiple of `window`, which
+    # numpy rejects — it hid for as long as every caller passed round-number clip lengths.
+    frames = int(np.ceil(wav.size / window))
     padded = np.pad(wav, (0, frames * window - wav.size))
     return np.sqrt(np.mean(padded.reshape(frames, window).astype(np.float64) ** 2, axis=1))
 
@@ -569,6 +572,291 @@ def postprocess_output(wav: np.ndarray, sr: int, mode: str = POSTPROCESS_DEFAULT
 
 
 # ============================================================================
+# Long-text chunking
+# ============================================================================
+# Measured on this checkpoint: a single pass keeps its timbre (SIM 0.981 and first-vs-last
+# 0.986 at 74s of audio) but its **tempo accelerates** — 3.05 words/s at 18 words, 3.39 at
+# 60, 3.28 at 150, 4.04 at 300 — and Whisper WER follows it from 0.00 to 0.68. So the limit
+# is roughly 30-45 seconds of audio, not the token cap (300 words needs 929 of 2048 tokens;
+# raising the cap to 4096 changed nothing, because EOS arrives on its own) and not VRAM
+# (7.52GB at 221 tokens vs 7.58GB at 929). Long text is therefore synthesised in
+# sentence-sized pieces and stitched: same total tokens, same ~1.35x realtime.
+
+CHUNK_MIN_WORDS, CHUNK_TARGET_WORDS, CHUNK_MAX_WORDS = 12, 18, 26
+CHUNK_MIN_CJK, CHUNK_TARGET_CJK, CHUNK_MAX_CJK = 20, 30, 42
+CHUNK_THRESHOLD = 25      # at or below this many units: one pass, the measured safe zone
+MAX_CHUNKS = 40           # one GPU, one request — ask for a shorter script instead
+CROSSFADE_MS = 15         # equal-power join; a hard splice clicks
+SILENCE_KEEP_MS = 60      # trim the decode's edge padding, keep consonant air
+
+# Dots that do not end a sentence. Replacing them with placeholders before scanning is what
+# stops "Mr. Smith drove 3.5 miles to St. John's at 1. Main St." from becoming four chunks
+# that the model then reads with sentence-final intonation at every false boundary.
+_PROTECT_PATTERNS = (
+    r"https?://\S+|\bwww\.\S+",                 # urls
+    r"\b[\w.+-]+@[\w.-]+\.\w+",                 # emails
+    r"\b(?:[A-Z]\.)+",                           # initials: J. R. R.
+    r"\b\d+(?:\.\d+)+\b",                        # decimals, versions, ip-ish
+    r"\b(?:Mr|Mrs|Ms|Messrs|Dr|Prof|St|vs|etc|approx|Inc|Ltd|Co|Fig|Jr|Sr|al|No|Dept|Ave|Rd|"
+    r"p\.ex|e\.g|i\.e)\.(?=\s|$)",               # abbreviations (incl. common Italian)
+    r"\.{3,}|…",                                 # an ellipsis is not a full stop
+    r"(?m)^[ \t]*\d+\.(?=\s)",                   # a list marker: "1. first item"
+)
+# Full-width ！？ and 。 are terminators too — omitting them makes a page of Chinese arrive
+# as one enormous chunk, since the ASCII set never matches.
+# Full-width ideographic terminators are included by escape, not by literal: typing them
+# risks a lookalike (an ASCII '.' silently stood in for U+3002 once), and omitting them makes
+# a page of Chinese arrive as one enormous chunk because nothing ever matched.
+_TERMINATORS = ".!?…\u3002\uff01\uff1f"
+_CLOSERS = "\"'”»’)}]"
+_OPENERS = "\"'“«([{（《"
+_CLAUSE_RE = re.compile(r"[,;:—–]| and | but | which | that | where | when | perché | ma ")
+
+
+def _units(text: str) -> int:
+    """How long this is *to speak*: words for spaced scripts, characters for CJK."""
+    words, cjk = speech_units(text)
+    return cjk if cjk > words else words
+
+
+def _protect(text: str) -> Tuple[str, List[str]]:
+    """Blank out dots that must not split; the saved list puts them back verbatim."""
+    saved: List[str] = []
+
+    def keep(match: "re.Match[str]") -> str:
+        saved.append(match.group(0))
+        return f"\x00{len(saved) - 1}\x00"
+
+    protected = text
+    for pattern in _PROTECT_PATTERNS:
+        protected = re.sub(pattern, keep, protected)
+    return protected, saved
+
+
+def _restore(text: str, saved: List[str]) -> str:
+    return re.sub(r"\x00(\d+)\x00", lambda m: saved[int(m.group(1))], text)
+
+
+def _is_cjk(ch: str) -> bool:
+    return bool(ch) and bool(_CJK_RE.match(ch))
+
+
+def _join(left: str, right: str) -> str:
+    """Glue two pieces back together — no space across a CJK boundary."""
+    if not left.strip():
+        return right
+    if not right.strip():
+        return left
+    if _is_cjk(left[-1]) or _is_cjk(right[0]):
+        return left + right
+    return f"{left} {right}"
+
+
+def _boundary_ahead(prot: str, index: int) -> bool:
+    """Does a real sentence follow this terminator? Uppercase, a digit, or CJK."""
+    k = index
+    while k < len(prot) and prot[k] == " ":
+        k += 1
+    if k >= len(prot):
+        return True
+    nxt = prot[k]
+    return nxt.isupper() or nxt.isdigit() or _is_cjk(nxt) or nxt in _OPENERS
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split on true sentence terminators only, keeping every character."""
+    prot, saved = _protect(text)
+    sentences: List[str] = []
+    buffer: List[str] = []
+    i, n = 0, len(prot)
+    while i < n:
+        char = prot[i]
+        buffer.append(char)
+        i += 1
+        if char not in _TERMINATORS:
+            continue
+        while i < n and prot[i] in _CLOSERS:      # close the quote before the break
+            buffer.append(prot[i])
+            i += 1
+        if _boundary_ahead(prot, i):
+            sentence = _restore("".join(buffer), saved).strip()
+            if sentence:
+                sentences.append(sentence)
+            buffer = []
+            while i < n and prot[i] == " ":
+                i += 1
+    tail = _restore("".join(buffer), saved).strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _split_clauses(sentence: str, ceiling: int, depth: int = 0) -> List[str]:
+    """Cut an over-long sentence at the clause boundary nearest its middle."""
+    if _units(sentence) <= ceiling or depth > 6:
+        return [sentence]
+    best: Optional[Tuple[str, str]] = None
+    best_cost: Optional[int] = None
+    for match in _CLAUSE_RE.finditer(sentence):
+        left, right = sentence[:match.end()], sentence[match.end():]
+        if not left.strip() or not right.strip():
+            continue
+        cost = abs(_units(left) - _units(right))
+        if best_cost is None or cost < best_cost:
+            best, best_cost = (left, right), cost
+    if best is None:                              # no punctuation to lean on: cut mid-phrase
+        words = sentence.split()
+        if len(words) < 2:
+            return [sentence]
+        middle = len(words) // 2
+        return (_split_clauses(" ".join(words[:middle]), ceiling, depth + 1)
+                + _split_clauses(" ".join(words[middle:]), ceiling, depth + 1))
+    # The separator stays with the left piece: a trailing comma keeps the model from using
+    # sentence-final intonation in the middle of a thought.
+    return (_split_clauses(best[0].strip(), ceiling, depth + 1)
+            + _split_clauses(best[1].strip(), ceiling, depth + 1))
+
+
+def split_for_tts(text: str, language: Optional[str] = None) -> List[str]:
+    """Slice text into pieces the model speaks without rushing. Lossless.
+
+    Sentences first, then the measured length band in both directions: fragments are merged
+    (a two-word chunk arrives clipped and toneless — prosody needs context) and over-long
+    sentences are cut at their middlest clause boundary. Concatenating the result reproduces
+    the input with whitespace ignored; nothing is reworded, reordered or dropped.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if _units(text) <= CHUNK_THRESHOLD:
+        return [text]
+    if _is_cjk(text.lstrip()[0]):
+        low, target, ceiling = CHUNK_MIN_CJK, CHUNK_TARGET_CJK, CHUNK_MAX_CJK
+    else:
+        low, target, ceiling = CHUNK_MIN_WORDS, CHUNK_TARGET_WORDS, CHUNK_MAX_WORDS
+
+    pieces: List[str] = []
+    for sentence in _split_sentences(text):
+        pieces.extend(_split_clauses(sentence, ceiling))
+
+    chunks: List[str] = []
+    current = ""
+    for piece in pieces:
+        if not current:
+            current = piece
+            continue
+        combined = _units(current) + _units(piece)
+        if combined <= target or (combined <= ceiling and _units(current) < low):
+            current = _join(current, piece)
+        else:
+            chunks.append(current)
+            current = piece
+    if current:
+        chunks.append(current)
+
+    # A stub tail is worse than a slightly long chunk: it sounds truncated.
+    if len(chunks) > 1 and _units(chunks[-1]) < low:
+        if _units(chunks[-2]) + _units(chunks[-1]) <= int(ceiling * 1.35):
+            chunks[-2] = _join(chunks[-2], chunks[-1])
+            chunks.pop()
+    chunks = [c.strip() for c in chunks if c.strip()]
+    if len(chunks) > MAX_CHUNKS:
+        raise MediaError(
+            f"That is {len(chunks)} chunks — over the {MAX_CHUNKS} allowed in one request on "
+            f"one GPU. Split the script into shorter passages and generate them one at a time.")
+    return chunks
+
+
+def trim_edges(wav: np.ndarray, sr: int, keep_ms: int = SILENCE_KEEP_MS) -> np.ndarray:
+    """Drop a decode's leading/trailing padding, keeping a little air either side."""
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    window = max(1, int(0.02 * sr))
+    rms = _rms_windows(wav, sr, window)
+    if not rms.size:
+        return wav
+    loud = np.flatnonzero(rms >= SILENCE_RMS)
+    if not loud.size:
+        return wav
+    keep = int(keep_ms / 1000.0 * sr)
+    start = max(0, int(loud[0]) * window - keep)
+    end = min(wav.size, (int(loud[-1]) + 1) * window + keep)
+    return wav[start:end]
+
+
+def stitch_clips(clips: List[np.ndarray], sr: int,
+                 crossfade_ms: int = CROSSFADE_MS) -> np.ndarray:
+    """Trim each piece and join them with an equal-power crossfade.
+
+    Naive concatenation of per-chunk decodes gives you the padding of each take as a stutter
+    of gaps, and a hard splice clicks because two waveforms rarely agree at the seam.
+    """
+    pieces = [np.asarray(c, dtype=np.float32).reshape(-1) for c in clips]
+    pieces = [trim_edges(c, sr) for c in pieces if c.size]
+    if not pieces:
+        return np.zeros(0, dtype=np.float32)
+    fade = int(crossfade_ms / 1000.0 * sr)
+    if fade <= 0 or len(pieces) == 1:
+        return np.concatenate(pieces)
+    out = pieces[0]
+    for nxt in pieces[1:]:
+        overlap = min(fade, out.size // 2, nxt.size // 2)
+        if overlap <= 0:
+            out = np.concatenate([out, nxt])
+            continue
+        ramp = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
+        joined = out[-overlap:] * np.sqrt(1.0 - ramp) + nxt[:overlap] * np.sqrt(ramp)
+        out = np.concatenate([out[:-overlap], joined, nxt[overlap:]])
+    peak = float(np.max(np.abs(out))) if out.size else 0.0
+    if peak > 1.0:                      # the crossfade can sum two peaks together
+        out = out / peak
+    return out.astype(np.float32)
+
+
+def generate_chunked(text: str, language: Optional[str], generate_one: Any,
+                     progress: Any = None) -> Tuple[np.ndarray, int, List[str]]:
+    """Synthesise `text`, in pieces when it is long enough to rush.
+
+    `generate_one(chunk_text) -> (wav, sr)` is the model call, injected so this works for all
+    three capabilities and can be tested without weights. A piece whose speaking rate lands
+    out of band is re-rolled once — that is the failure this whole path exists to avoid, and
+    one retry costs ~10s against re-running the whole document.
+    """
+    text = (text or "").strip()
+    chunks = split_for_tts(text, language)
+    notes: List[str] = []
+    if len(chunks) <= 1:
+        wav, sr = generate_one(text)
+        return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr), notes
+
+    pieces: List[np.ndarray] = []
+    seconds: List[str] = []
+    sr = REF_SAMPLE_RATE
+    for index, chunk in enumerate(chunks):
+        if progress is not None:
+            try:
+                progress((index + 1) / (len(chunks) + 1.0),
+                         desc=f"Chunk {index + 1} of {len(chunks)}")
+            except Exception:  # noqa: BLE001 - a progress bar is never a reason to fail
+                pass
+        wav, sr = generate_one(chunk)
+        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+        report = defect_report(wav, sr, chunk)
+        if any(flag.startswith("rate") for flag in defect_flags(report)):
+            retry, retry_sr = generate_one(chunk)
+            retry = np.asarray(retry, dtype=np.float32).reshape(-1)
+            second = defect_report(retry, retry_sr, chunk)
+            if abs(second["rate_ratio"] - 1.0) < abs(report["rate_ratio"] - 1.0):
+                wav, sr, report = retry, retry_sr, second
+                notes.append(f"chunk {index + 1} re-rolled to {report['rate_ratio']:.2f}x speed")
+        pieces.append(wav)
+        seconds.append(f"{len(wav) / sr:.1f}")
+    out = stitch_clips(pieces, sr)
+    notes.append(f"Chunked: {len(chunks)} pieces ({'+'.join(seconds)}s) stitched with a "
+                 f"{CROSSFADE_MS}ms crossfade")
+    return out, int(sr), notes
+
+
+# ============================================================================
 # Model loading + VRAM management
 # ============================================================================
 class ModelHub:
@@ -754,10 +1042,12 @@ def _post_note(mode: str) -> str:
     return "" if mode == "off" else f"\nPost-processing: {POSTPROCESS_LABELS[mode]}"
 
 
-def _present(wav: np.ndarray, sr: int, budget: int, label: str,
-             mode: str) -> Tuple[Tuple[int, np.ndarray], str]:
+def _present(wav: np.ndarray, sr: int, budget: int, label: str, mode: str,
+             extra: Optional[List[str]] = None) -> Tuple[Tuple[int, np.ndarray], str]:
     """Report on the model's own decode; hand back the post-processed listening copy."""
     report = _report(wav, sr, budget, label)
+    if extra:
+        report += "\n" + "\n".join(extra)
     out_wav, out_sr = postprocess_output(wav, sr, mode)
     return (out_sr, out_wav), report + _post_note(mode)
 
@@ -1317,16 +1607,21 @@ def generate_custom_voice(text, language, speaker, instruct, temperature, top_p,
         budget = _budget(text)
         with HUB.lock:
             tts = HUB.acquire("custom_voice")
-            wavs, sr = tts.generate_custom_voice(
-                text=text.strip(),
-                language=language,
-                speaker=speaker.lower().replace(" ", "_"),
-                instruct=(instruct or "").strip() or None,
-                non_streaming_mode=True,
-                max_new_tokens=budget,
-                **_sampling(temperature, top_p, top_k, rep_penalty),
-            )
-        return _ok(*_present(wavs[0], sr, budget, "CustomVoice", postproc))
+
+            def one(chunk: str) -> Tuple[np.ndarray, int]:
+                wavs, rate = tts.generate_custom_voice(
+                    text=chunk,
+                    language=language,
+                    speaker=speaker.lower().replace(" ", "_"),
+                    instruct=(instruct or "").strip() or None,
+                    non_streaming_mode=True,
+                    max_new_tokens=_budget(chunk),
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+                return wavs[0], rate
+
+            wav, sr, chunk_notes = generate_chunked(text, language, one, progress)
+        return _ok(*_present(wav, sr, budget, "CustomVoice", postproc, chunk_notes))
     except Exception as e:  # noqa: BLE001 - surface errors in the UI instead of killing the server
         return None, f"Error: {type(e).__name__}: {e}"
 
@@ -1341,15 +1636,20 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
         budget = _budget(text)
         with HUB.lock:
             tts = HUB.acquire("voice_design")
-            wavs, sr = tts.generate_voice_design(
-                text=text.strip(),
-                language=language,
-                instruct=voice_description.strip(),
-                non_streaming_mode=True,
-                max_new_tokens=budget,
-                **_sampling(temperature, top_p, top_k, rep_penalty),
-            )
-        return _ok(*_present(wavs[0], sr, budget, "VoiceDesign", postproc))
+
+            def one(chunk: str) -> Tuple[np.ndarray, int]:
+                wavs, rate = tts.generate_voice_design(
+                    text=chunk,
+                    language=language,
+                    instruct=voice_description.strip(),
+                    non_streaming_mode=True,
+                    max_new_tokens=_budget(chunk),
+                    **_sampling(temperature, top_p, top_k, rep_penalty),
+                )
+                return wavs[0], rate
+
+            wav, sr, chunk_notes = generate_chunked(text, language, one, progress)
+        return _ok(*_present(wav, sr, budget, "VoiceDesign", postproc, chunk_notes))
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}"
 
@@ -1661,14 +1961,18 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 if n > 1:
                     progress((i + 1) / (n + 2.0), desc=f"Candidate {i + 1} of {n}")
                 torch.manual_seed(base_seed + i)
-                wavs, sr = tts.generate_voice_clone(
-                    text=target_text.strip(),
-                    language=language,
-                    voice_clone_prompt=prompt,
-                    max_new_tokens=budget,
-                    **_sampling(temperature, top_p, top_k, rep_penalty),
-                )
-                wav = wavs[0]
+
+                def one(chunk: str) -> Tuple[np.ndarray, int]:
+                    wavs, rate = tts.generate_voice_clone(
+                        text=chunk,
+                        language=language,
+                        voice_clone_prompt=prompt,
+                        max_new_tokens=_budget(chunk),
+                        **_sampling(temperature, top_p, top_k, rep_penalty),
+                    )
+                    return wavs[0], rate
+
+                wav, sr, chunk_notes = generate_chunked(target_text, language, one, progress)
                 sim = wer = confidence = None
                 # Defects are measured whether or not Whisper is available: they are the
                 # signals that survive a disabled ASR, and they cost microseconds.
@@ -1691,7 +1995,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                         wer = confidence = None
                 metrics: Dict[str, Any] = {"index": i + 1, "wav": wav, "sr": int(sr),
                                             "sim": sim, "wer": wer, "confidence": confidence,
-                                            "defects": defects}
+                                            "defects": defects, "chunks": chunk_notes}
                 metrics["penalty"] = candidate_penalty(wer, confidence, defects)
                 results.append(metrics)
 
@@ -1724,6 +2028,8 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                              " — the clip is worth a listen before you keep it")
         if fit:
             notes.append("WARNING: " + fit)
+        if chosen.get("chunks"):
+            notes.extend(chosen["chunks"])
         status = report + (("\n" + "\n".join(notes)) if notes else "")
         out_wav, out_sr = postprocess_output(chosen["wav"], chosen["sr"], postproc)
         # Hand back every take, not just the winner: the auto-pick is a first opinion, and

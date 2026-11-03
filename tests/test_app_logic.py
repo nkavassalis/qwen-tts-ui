@@ -1474,6 +1474,233 @@ def test_candidate_players_are_wired() -> None:
     check("cl_takes_note" in source, "the row that explains the auto-pick exists")
 
 
+# ---------------------------------------------------------------------------
+# Long-text chunking
+# ---------------------------------------------------------------------------
+
+CHUNK_CORPUS = (
+    "Mr. E. Smith drove 3.5 miles to St. John's office (e.g. vs. the old route) at 1. Main "
+    "St. and then left. He arrived at 4:30 p.m. sharp, which surprised everyone there. "
+    "Professor Li, Ph.D. said it was fine, and Dr. Brown agreed. Visit https://example.com/a.b "
+    "or mail someone@example.co.uk for details. J. R. R. Tolkien wrote it. Wait... really? "
+    "Yes! And then nothing happened at all, which was the point of the whole exercise. "
+    "1. First item 2. Second item 3. Third item, all of which were read aloud by the "
+    "presenter who had prepared them carefully the night before the meeting. "
+    "La dott. Rossi ha detto che p.es. il treno delle 7.15 parte in ritardo di venti minuti "
+    "e che dobbiamo aspettare alla stazione centrale senza lamentarci troppo. "
+    "今天天气很好，我们一起去公园散步吧。他看了看表，说时间还早，可以先喝一杯咖啡再出发也不迟。"
+)
+
+
+def test_chunking_is_lossless() -> None:
+    """The one failure a TTS splitter must never have: silently losing words."""
+    chunks = webui.split_for_tts(CHUNK_CORPUS)
+    check(len(chunks) > 3, f"a long corpus should split into pieces, got {len(chunks)}")
+    joined = "".join(chunks).replace(" ", "")
+    check(joined == CHUNK_CORPUS.replace(" ", ""),
+          "concatenating the chunks must reproduce the input, character for character")
+    for chunk in chunks:
+        check(chunk.strip() == chunk, "chunks are trimmed")
+        check(_has_no_placeholder(chunk), f"placeholders must never leak to the model: {chunk}")
+
+
+def _has_no_placeholder(chunk: str) -> bool:
+    return "\x00" not in chunk
+
+
+def test_chunking_protects_false_boundaries() -> None:
+    """A dot that is not a full stop must not become a chunk boundary."""
+    tricky = ("Mr. E. Smith drove 3.5 miles to St. John's office at 1. Main St. and then left "
+              "the building slowly because his knee was hurting again today. Professor Li "
+              "(Ph.D. and very proud of it) waited outside with Dr. Brown and Mrs. Clark, who "
+              "had brought the coffee and the biscuits for everyone.")
+    chunks = webui.split_for_tts(tricky)
+    for chunk in chunks:
+        for bad in ("Mr", "St", "Dr", "Mrs", "Prof", "Ph.D"):
+            check(not chunk.rstrip().endswith(bad + "."),
+                  f"a chunk ends on the abbreviation {bad}. — it would be spoken with final "
+                  f"intonation: {chunk!r}")
+    check(not any(c.rstrip().endswith("3") for c in chunks), "3.5 was not cut in half")
+    ellipsis = ("He said wait... really? yes and then left the room without another word to "
+                "anyone there at all that evening after the meeting ended quite abruptly.")
+    for chunk in webui.split_for_tts(ellipsis):
+        check(not chunk.strip().endswith("..."), "an ellipsis is not a sentence end")
+    listing = ("1. First item is quite long indeed and needs to be read carefully 2. Second "
+               "item follows it and is also long enough to matter 3. Third item closes the list "
+               "that the presenter prepared the night before the meeting.")
+    check("".join(webui.split_for_tts(listing)).replace(" ", "") == listing.replace(" ", ""),
+          "numbered list markers survive")
+
+
+def test_chunking_respects_the_measured_band() -> None:
+    """Chunks exist to stay inside the region where the model does not rush."""
+    chunks = webui.split_for_tts(CHUNK_CORPUS)
+    for chunk in chunks:
+        units = webui._units(chunk)
+        check(units <= int(max(webui.CHUNK_MAX_WORDS, webui.CHUNK_MAX_CJK) * 1.35),
+              f"chunk is longer than the band allows ({units}): {chunk[:60]}...")
+    short = " ".join(f"word{i}" for i in range(24))
+    check(len(webui.split_for_tts(short)) <= 3, "a 24-word run does not shatter")
+    tiny = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew " \
+           "it! And thanks to you for everything you have done for us this year."
+    for chunk in webui.split_for_tts(tiny):
+        check(webui._units(chunk) >= 4,
+              f"a two-word chunk arrives clipped and toneless: {chunk!r}")
+
+
+def test_chunking_leaves_short_text_alone() -> None:
+    """Below the measured safe zone, chunking must change nothing at all."""
+    short = "Picking the best of several takes should never pick a worse one by accident."
+    check(webui.split_for_tts(short) == [short.strip()], "short text is one pass")
+    check(webui.split_for_tts("") == [], "empty text yields no chunks")
+    check(webui.split_for_tts("   ") == [], "whitespace yields no chunks")
+
+
+def test_chunking_handles_cjk() -> None:
+    check("\u3002" in webui._TERMINATORS and "\uff01" in webui._TERMINATORS
+          and "\uff1f" in webui._TERMINATORS,
+          f"ideographic terminators must be matched by codepoint, not lookalikes: "
+          f"{[hex(ord(c)) for c in webui._TERMINATORS]}")
+    text = "今天天气很好，我们一起去公园散步吧。他看了看表，说时间还早，可以先喝一杯咖啡再出发也不迟。" \
+           "路上的行人很多，每个人都在赶自己的路，没有人注意到那只坐在长椅上的猫。"
+    chunks = webui.split_for_tts(text)
+    check(len(chunks) >= 2, f"CJK must split by character budget, got {len(chunks)}")
+    check("".join(chunks).replace(" ", "") == text.replace(" ", ""), "CJK slicing is lossless")
+    for chunk in chunks:
+        check(webui._units(chunk) <= int(webui.CHUNK_MAX_CJK * 1.35),
+              f"CJK chunk over the band: {webui._units(chunk)}")
+
+
+def test_chunking_is_deterministic() -> None:
+    """The seed field promises reproducibility, which needs identical chunking."""
+    first = webui.split_for_tts(CHUNK_CORPUS)
+    second = webui.split_for_tts(CHUNK_CORPUS)
+    check(first == second, "same input must produce the same chunks")
+
+
+def test_chunking_refuses_an_unbounded_request() -> None:
+    """One GPU, one request: a whole novel must fail loudly, not run for hours."""
+    huge = "This is a sentence with a reasonable number of words in it. " * 3000
+    try:
+        webui.split_for_tts(huge)
+    except webui.MediaError as e:
+        check("chunk" in str(e).lower(), f"the error should say why: {e}")
+    else:
+        check(False, "an over-long script must raise MediaError rather than be attempted")
+
+
+def _tone(seconds, sr=24000, amp=0.3, freq=180, phase=0.0):
+    t = np.arange(int(seconds * sr)) / sr
+    return (amp * np.sin(2 * np.pi * freq * t + phase)).astype(np.float32)
+
+
+def test_stitch_trims_and_crossfades() -> None:
+    sr = 24000
+    pad = int(0.5 * sr)
+    pieces = [np.concatenate([np.zeros(pad, np.float32), _tone(2.0), np.zeros(pad, np.float32)])
+              for _ in range(3)]
+    joined = webui.stitch_clips(pieces, sr)
+    naive = np.concatenate(pieces)
+    check(len(joined) < len(naive) - sr,
+          f"the padding between pieces must be trimmed ({len(joined)/sr:.2f}s vs "
+          f"{len(naive)/sr:.2f}s)")
+    check(len(joined) > 3 * 2.0 * sr - sr, "but the speech must not be eaten")
+    rms = webui._rms_windows(joined, sr, int(0.02 * sr))
+    silent = np.flatnonzero(rms < webui.SILENCE_RMS)
+    longest = 0
+    run = 0
+    previous = None
+    for index in silent:
+        run = run + 1 if previous == index - 1 else 1
+        longest = max(longest, run)
+        previous = index
+    check(longest * 0.02 < 0.35,
+          f"a {longest * 0.02:.2f}s gap inside the stitch reads as a stutter")
+    check(float(np.max(np.abs(joined))) <= 1.0, "stitching must stay inside full scale")
+
+    # Clicks are asserted here rather than in the GPU tier: only here do we know where the
+    # joins are and what a clean waveform looks like. Unpadded tones at different frequencies
+    # and phases put the seam at a loud part of the waveform, which is where a hard splice
+    # audibly pops; an equal-power crossfade must not.
+    pieces_phased = [_tone(1.0, amp=0.3, freq=f, phase=p)
+                     for f, p in ((180.0, 0.0), (311.0, np.pi / 2), (233.0, np.pi))]
+    hard = np.concatenate(pieces_phased)
+    smooth = webui.stitch_clips(pieces_phased, sr)
+    hard_jump = float(np.max(np.abs(np.diff(hard))))
+    smooth_jump = float(np.max(np.abs(np.diff(smooth))))
+    check(hard_jump > 0.15, f"this fixture should make a hard splice click, got {hard_jump:.3f}")
+    check(smooth_jump < hard_jump / 3,
+          f"crossfade did not smooth the seam ({smooth_jump:.3f} vs {hard_jump:.3f})")
+
+
+def test_stitch_edge_cases() -> None:
+    sr = 24000
+    check(webui.stitch_clips([], sr).size == 0, "no clips, no audio")
+    single = webui.stitch_clips([_tone(1.0)], sr)
+    check(0.8 * sr < len(single) < 1.1 * sr, f"one clip passes through: {len(single)/sr:.2f}s")
+    tiny = webui.stitch_clips([_tone(0.005), _tone(0.005)], sr)
+    check(tiny.size > 0 and np.all(np.isfinite(tiny)), "clips shorter than the crossfade survive")
+    loud = webui.stitch_clips([_tone(0.5, amp=0.9), _tone(0.5, amp=0.9)], sr)
+    check(float(np.max(np.abs(loud))) <= 1.0, "a hot crossfade is scaled, not clipped")
+
+
+def test_generate_chunked_calls_the_model_the_right_number_of_times() -> None:
+    sr = 24000
+    calls = []
+
+    def fake(chunk: str):
+        calls.append(chunk)
+        words, _ = webui.speech_units(chunk)
+        return _tone(max(0.4, words / 2.5)), sr
+
+    short = "This is only one sentence and should not be chunked at all."
+    wav, rate, notes = webui.generate_chunked(short, "English", fake)
+    check(len(calls) == 1, f"short text must be one pass, got {len(calls)}")
+    check(notes == [], "and no chunking note")
+    check(abs(len(wav) / sr - len(webui.trim_edges(fake(short)[0], sr)) / sr) < 1.0,
+          "the single pass returns the model's audio")
+
+    calls.clear()
+    long_text = "This is a sentence with a reasonable number of words in it. " * 12
+    wav, rate, notes = webui.generate_chunked(long_text, "English", fake)
+    check(len(calls) > 3, f"long text must be synthesised in pieces, got {len(calls)}")
+    check(any("Chunked" in n for n in notes), f"the status should say so: {notes}")
+    check("".join(calls).replace(" ", "") == long_text.strip().replace(" ", ""),
+          "every word of the request reaches the model exactly once")
+    check(len(wav) / sr > 20.0, f"stitched audio should cover the text: {len(wav)/sr:.1f}s")
+
+
+def test_generate_chunked_rerolls_a_rushed_chunk() -> None:
+    """Tempo acceleration is the failure this path exists to avoid — so retry it once."""
+    sr = 24000
+    seen = {}
+
+    def fake(chunk: str):
+        seen[chunk] = seen.get(chunk, 0) + 1
+        words, _ = webui.speech_units(chunk)
+        # First take rushes (5 words/s), the retry speaks normally (2.5 words/s).
+        rate = 5.0 if seen[chunk] == 1 and words > 10 else 2.5
+        return _tone(max(0.4, words / rate)), sr
+
+    long_text = "This is a sentence with a reasonable number of words in it. " * 12
+    wav, _, notes = webui.generate_chunked(long_text, "English", fake)
+    check(any("re-rolled" in n for n in notes), f"the rushed take should be replaced: {notes}")
+    report = webui.defect_report(wav, sr, long_text)
+    check(report["rate_ratio"] < 1.8, f"stitched result still rushes: {report}")
+
+
+def test_callbacks_use_the_chunked_path() -> None:
+    """All three capabilities must go through it, or long text still rushes somewhere."""
+    import inspect
+
+    source = inspect.getsource(webui)
+    for capability in ("generate_custom_voice", "generate_voice_design", "generate_voice_clone"):
+        start = source.index(f"def {capability}(")
+        body = source[start:start + 6000]
+        check("generate_chunked(" in body, f"{capability} does not use the chunked path")
+        check("_budget(chunk)" in body, f"{capability} does not bound each chunk's tokens")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

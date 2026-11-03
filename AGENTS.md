@@ -30,8 +30,8 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 49 checks, no weights, ~10s with deps installed
-tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
+tests/test_app_logic.py  CPU tier: 61 checks, no weights, ~10s with deps installed
+tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
 CHANGELOG.md           one entry per change, newest first
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 49 checks, ~10s
-.venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 61 checks, ~10s
+.venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 49/49 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 61/61 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,27 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **Long text is chunked because *tempo*, not tokens, is the limit.** Measured single-pass on
+  this checkpoint: 3.05 words/s at 18 words rising to 4.04 at 300, WER 0.00 → 0.68, while peak
+  VRAM stayed at 7.5-7.6 GB and 300 words used only 929 of the 2048 tokens (raising the cap to
+  4096 produced identical audio — EOS arrives on its own). So `MAX_NEW_TOKENS_CAP` is a runaway
+  guard and nothing more; do not raise it hoping for quality, and do not remove it — ICL
+  cloning sometimes never stops. The real ceiling is ~30-45s of audio per pass, which is why
+  `split_for_tts` + `stitch_clips` run automatically above `CHUNK_THRESHOLD` units.
+- **The splitter's one unforgivable failure is losing words**, so `split_for_tts` is lossless
+  by construction (whitespace-insensitive equality is asserted over a corpus). Dots that are
+  not full stops are placeholdered before scanning — abbreviations, decimals, initials,
+  ellipses, URLs, emails, list markers — because a false boundary is spoken with sentence-final
+  intonation, which is a quality bug, not a cosmetic one. Ideographic terminators are matched
+  by **escape** (`\u3002\uff01\uff1f`), not literal: a typed `。` silently came out as an ASCII
+  `.` and Chinese collapsed into one giant chunk.
+- **Stitching trims then crossfades** (`trim_edges` + `stitch_clips`, 15 ms equal-power). Click
+  behaviour is asserted in the **CPU** tier where the seam locations and the expected waveform
+  are known; a global max-diff threshold on real speech is meaningless (measured 0.76 on clean
+  stitched audio), so the GPU tier asserts gaps and levels instead.
+- **`_rms_windows` pads with `ceil`, not `floor`** — with `floor` the pad width went negative
+  for any length that was not an exact multiple of the window and numpy raised. It hid because
+  every earlier caller passed round-number clip lengths.
 - **A preferred take can be kept as a voice** (`save_generated_voice`). The library used to
   hold only *references*, so the take you actually liked could only leave the browser as a
   download. Each candidate is written to `tmp/media/` at generation time and its **path**
@@ -301,6 +322,23 @@ tier the hardening pass could not execute:
 - **Still unverified:** `--preload`, `--share`, HTTPS mic capture, and the
   unauthenticated-bind warning (needs a real `--ip 0.0.0.0` bind, which was not done on a
   networked box).
+
+Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunking:
+
+- **CPU tier 61/61**, **GPU tier 8/8** (adds `long_text`).
+- **Length study** (single pass, same speaker, in the README): 18/60/150/300 words → 5.9/17.7/
+  45.7/74.3s of audio; peak VRAM 4.36/7.52/7.58/7.58 GB; 1.32–1.50× realtime; words/s
+  3.05/3.39/3.28/4.04; chunked-Whisper WER 0.00/0.62/0.55/0.68. Raising the cap from 2048 to
+  4096 on the 300-word case produced **identical** audio (929 tokens, EOS reached), which is how
+  we know the cap is not the constraint.
+- **Chunking verified**: same 300 words → 16 pieces, 92.6s audio, **2.48 words/s**, WER **0.42**,
+  no internal gap over 1s, no gap-induced stutter. Wall time 131s vs 101s single pass.
+- **Instrument caveat, recorded so nobody over-reads it**: the long-text WER comes from hard
+  20s Whisper windows over a text that is one sentence repeated ten times. That floor is why
+  the GPU bound is 0.55 rather than something tight; the pacing assertion is the strong one.
+- **Latent bug found and fixed while building this**: `_rms_windows` padded with a negative
+  width for any clip length that was not an exact multiple of the window (numpy raised). It had
+  survived every earlier test because they all used round-number lengths.
 
 ## Do-not-touch list
 

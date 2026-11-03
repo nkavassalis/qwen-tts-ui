@@ -70,6 +70,13 @@ CASES = {
         language="Auto",
         clone_text="Same voice, second line, still unmistakably the same person.",
     ),
+    # Long-text chunking: the same 300 words that measured 4.04 words/s and WER 0.68 in one
+    # pass, now through the splitter and the stitcher.
+    "long_text": dict(
+        sentence=("the quick brown fox jumps over the lazy dog while the patient owl watches "
+                  "quietly from the old wooden fence beside the river"),
+        repeat=10,
+    ),
     # Best-of-N: the real Clone callback, scoring each take with Whisper WER then speaker
     # similarity, plus the seed field's reproducibility promise.
     "best_of_n": dict(
@@ -375,6 +382,79 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         webui.ASR = None
 
 
+def run_long_text(hub: webui.ModelHub) -> None:
+    """Long text must be chunked, and chunking must actually fix the acceleration.
+
+    Baseline, measured on this checkpoint with one pass over the same 300 words: 74.3s of
+    audio at 4.04 words/s (3.05 at 18 words) and chunked-Whisper WER 0.68. The model does not
+    run out of tokens or VRAM — it rushes. So the assertions here are about pacing and
+    intelligibility, not about hitting a cap.
+    """
+    cfg = CASES["long_text"]
+    text = " ".join([cfg["sentence"]] * cfg["repeat"])
+    words = len(text.split())
+    if webui.ASR is None:                      # WER is an assertion here, not an optional extra
+        webui.ASR = webui.Transcriber()
+    started = time.time()
+    audio, status = webui.generate_custom_voice(
+        text, "English", webui.default_speaker(), "", 0.9, 1.0, 50, 1.05, postproc="off")
+    took = time.time() - started
+    sr, wav = audio
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    seconds = len(wav) / sr
+    per_second = words / seconds
+
+    assert "Chunked" in status, f"300 words must go through the chunked path:\n{status}"
+    assert webui.split_for_tts(text) != [text], "the splitter should slice a 300-word script"
+    assert 0.6 < per_second < 3.4, (
+        f"{per_second:.2f} words/s — the single-pass baseline rushed at 4.04 and a natural "
+        f"read of this speaker is ~3.0; chunking was supposed to fix exactly this")
+    assert 0.4 * words / 2.5 < seconds < 1.6 * words / 2.5, \
+        f"{seconds:.1f}s for {words} words is not a plausible reading"
+
+    # Stitching artefacts: no stuttering gaps at the joins, no click at the seam.
+    windows = webui._rms_windows(wav, sr, int(0.02 * sr))
+    longest = gap = 0
+    previous = None
+    for index in np.flatnonzero(windows < webui.SILENCE_RMS):
+        gap = gap + 1 if previous == index - 1 else 1
+        longest = max(longest, gap)
+        previous = index
+    assert longest * 0.02 < 1.0, f"a {longest * 0.02:.2f}s internal gap: joins were not trimmed"
+    assert float(np.max(np.abs(wav))) <= 1.0, "stitched audio exceeded full scale"
+    # No click assertion here: a global max-diff threshold on real speech is meaningless. The
+    # seam behaviour is pinned synthetically in test_stitch_trims_and_crossfades, where the
+    # join locations and the expected waveform are both known.
+
+    wer = None
+    if webui.ASR is not None and webui.ASR.enabled:
+        step = int(20 * sr)
+        hypotheses = []
+        for start in range(0, len(wav), step):
+            chunk = wav[start:start + step]
+            if len(chunk) < sr // 2:
+                continue
+            try:
+                hypotheses.append(webui.ASR.transcribe(chunk, sr, "English"))
+            except Exception:  # noqa: BLE001 - scoring must not fail the case
+                pass
+        if hypotheses:
+            wer = webui.word_error_rate(" ".join(hypotheses), text)
+            # The instrument has a floor: this text is one sentence repeated ten times, and
+            # Whisper hallucinates repeats on that, inside hard 20s windows that also cut
+            # words. Measured with that instrument: 0.68 single pass, 0.47 chunked. The bound
+            # proves the improvement; the pacing assertion above is the strong one.
+            assert wer < 0.55, f"chunked WER {wer:.2f} — single pass measured 0.68"
+    else:
+        raise AssertionError("WER is asserted in this case; Whisper must be available")
+    path = os.path.join(OUT_DIR, "long_text.wav")
+    sf.write(path, wav, sr)
+    check_audio(path, wav, sr)
+    print(f"  [long_text] {took:.1f}s | {seconds:.1f}s audio | {per_second:.2f} words/s "
+          f"(single pass: 4.04) | WER {('%.2f' % wer) if wer is not None else 'n/a'} "
+          f"(single pass: 0.68) | {status.splitlines()[1]}")
+
+
 def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
     if capability == "media_pipeline":
         run_media_pipeline(hub, use_asr)
@@ -398,6 +478,16 @@ def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool
 
     if capability == "best_of_n":
         run_best_of_n(hub)
+        if not keep_gpu:
+            with hub.lock:
+                while hub.on_gpu:
+                    _, resident = hub.on_gpu.popitem(last=False)
+                    hub._move(resident, torch.device("cpu"))
+                    torch.cuda.empty_cache()
+        return
+
+    if capability == "long_text":
+        run_long_text(hub)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:

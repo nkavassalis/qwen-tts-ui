@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — long text is chunked and stitched, because tempo is the real ceiling
+
+Started as a question: is `max_new_tokens=2048` costing us quality, and how far could this box
+actually go? Measured single-pass on the 1.7B checkpoint (full table in the README):
+
+| words | audio | tokens | wall | peak VRAM | words/s | WER |
+|---|---|---|---|---|---|---|
+| 18 | 5.9s | 74 | 8.7s | 4.36 GB | 3.05 | 0.00 |
+| 300 | 74.3s | 929 | 100.7s | 7.58 GB | **4.04** | **0.68** |
+
+The cap is not the limit and neither is VRAM: 300 words needs 929 of 2048 tokens, and raising
+the cap to 4096 produced *identical* audio because EOS arrives on its own. VRAM sat at 7.5-7.6 GB
+across 221–929 tokens (~112 KB/token of KV cache). What degrades is **pacing** — 3.05 → 4.04
+words/s — and intelligibility with it. Usable ceiling: ~30-45s of audio per pass.
+
+- **`split_for_tts`**: real sentence boundaries only, after protecting the dots that are not full
+  stops (`Mr.`, `3.5`, `J. R. R.`, `...`, URLs, emails, `1.` list markers), then the measured
+  band — 12–26 words or 20–42 CJK characters — merging fragments and cutting over-long sentences
+  at the clause boundary nearest their middle, separator kept with the left piece so intonation
+  stays non-final. Lossless by construction; deterministic, so the seed promise survives.
+- **`stitch_clips`**: trim each piece's edge padding, join with a 15 ms equal-power crossfade.
+  Naive concatenation stutters and clicks.
+- **`generate_chunked`** wraps all three capabilities, re-rolls a chunk whose speaking rate lands
+  out of band, reports the piece list in the status, and refuses >40 chunks with a `MediaError`
+  instead of running for an hour. `max_new_tokens` is now budgeted per chunk.
+- Same 300 words after: **2.48 words/s, WER 0.42** (from 4.04 and 0.68), 92.6s of audio in 16
+  pieces, 131s wall against 101s single-pass.
+- Two bugs found on the way. `_rms_windows` padded with a **negative** width for any length that
+  was not an exact multiple of the window — latent because every earlier caller passed round
+  numbers. And ideographic terminators had to be written by escape: the typed `。` had come out as
+  an ASCII `.`, so Chinese never split at all.
+- Tests: CPU tier 49 -> 61 (losslessness over a corpus of traps, false-boundary protection, band
+  limits, CJK by codepoint, determinism, the 40-chunk refusal, trim/crossfade/click behaviour on
+  phase-shifted tones, re-roll logic, all three callbacks wired). GPU tier 6 -> 8 flows with a
+  `long_text` case asserting pacing, gaps and levels. Clicks are asserted in the CPU tier, where
+  the seams are knowable — a global max-diff bound on real speech is meaningless.
+
 ## 2026-11-03 — keep the take you preferred, not just the one the scorer picked
 
 The voice library held only *references* — the clip a voice was taken from. So the take you
