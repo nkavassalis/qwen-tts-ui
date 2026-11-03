@@ -4,7 +4,8 @@
 #   ./run.sh                     -> http://127.0.0.1:7860  (localhost only)
 #   ./run.sh --ip 0.0.0.0        -> expose on the LAN (pass --username/--password!)
 #   ./run.sh --preload           -> load up to --max-cpu-resident checkpoints into RAM at
-#                                   startup (default 2, not all three)
+#                                   startup (default 2 = both shipped checkpoints, ~8.6GB;
+#                                   the memory floor refuses rather than swapping)
 #   ./run.sh --ssl-self-signed --ip 0.0.0.0 --port 7860
 #                                -> HTTPS, needed for browser mic access on non-localhost
 #   ./run.sh --no-asr            -> skip Whisper entirely (frees ~3GB of VRAM when loaded)
