@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — save a cloned reference; targets 16GB Blackwell, not one SKU
+
+- The Voice Clone tab could *load* and *delete* saved voices but had no Save, so a voice
+  you built from a video or an upload — trimmed waveform, Whisper transcript and all —
+  could not be kept. `save_reference_voice()` + a *Save to voice library* button store the
+  reference clip and its transcript in the same `voices/` format a designed voice uses.
+  A sub-minimum clip is refused; a transcript-less save is allowed but says it will need
+  *x-vector only*. Generated output is unchanged: download it from its player.
+- README gains a *Cloning a voice, start to finish* walkthrough, which is what the missing
+  button was hiding.
+- Positioning: this targets the **16GB Blackwell class** (RTX 5070 Ti, RTX 5080, …), not
+  the 5070 Ti specifically — that is just the SKU it is developed and tested on. Title,
+  UI header, module docstring and AGENTS.md updated; the dated test records still name the
+  5070 Ti, because that is what ran them.
+- Tests: CPU tier 30 → 31.
+
 ## 2026-11-03 — argv-free credentials, GPU tier verified
 
 - `resolve_credentials()` takes the UI password from `--password-file` (contents never

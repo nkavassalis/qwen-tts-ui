@@ -287,6 +287,59 @@ def test_save_designed_voice_uses_the_audio_box() -> None:
             webui.MEDIA_DIR = original_media
 
 
+def test_save_reference_voice_from_the_clone_tab() -> None:
+    """A voice built from an upload/video must be saveable, not just loadable.
+
+    The Clone tab had Load and Delete but no Save, so a reference you trimmed and
+    transcribed could not be kept — only designed voices could be saved.
+    """
+    wav = (np.sin(np.linspace(0, 200, 24000 * 5)) * 0.3).astype(np.float32)
+    with tempfile.TemporaryDirectory() as tmp:
+        original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
+        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
+        try:
+            clip_path = os.path.join(tmp, "reference.wav")
+            sf.write(clip_path, wav, 24000)
+            short_path = os.path.join(tmp, "short.wav")
+            sf.write(short_path, wav[:int(24000 * (webui.REF_MIN_SECONDS - 0.5))], 24000)
+
+            _, msg, _ = webui.save_reference_voice("nobody", None, "text", "English")
+            check("Nothing to save" in msg, "cannot save without a reference clip")
+
+            _, msg, _ = webui.save_reference_voice("  ", clip_path, "text", "English")
+            check("name" in msg.lower(), "blank name rejected")
+
+            _, msg, _ = webui.save_reference_voice("tiny", short_path, "text", "English")
+            check("too short" in msg, f"a sub-minimum clip is refused: {msg}")
+            check(webui.list_voices() == [], "rejected saves write nothing")
+
+            _, msg, update = webui.save_reference_voice("Phone Memo", clip_path,
+                                                        "the quick brown fox", "English")
+            check("Saved" in msg and "5" in msg, f"saving the reference clip works: {msg}")
+            check(update["choices"][0][1] == "phone_memo", "dropdown refreshed with the new voice")
+            saved = webui.list_voices()[0]
+            check(saved["text"] == "the quick brown fox" and saved["language"] == "English",
+                  "the transcript and language are persisted with the clip")
+            check(saved["instruct"] == "", "a cloned reference has no voice description")
+
+            # A reference with no transcript is still worth keeping, but say what it costs.
+            _, msg, _ = webui.save_reference_voice("No Words", clip_path, "", "Auto")
+            check("x-vector only" in msg, f"a transcript-less save explains the consequence: {msg}")
+
+            _, msg, _ = webui.save_reference_voice("spy", "/opt/recordings/take.wav",
+                                                   "hello", "English")
+            check("outside the upload directory" in msg, f"foreign path refused: {msg}")
+            check(len(webui.list_voices()) == 2, "the refused save added nothing")
+
+            # Round trip: what the Clone tab saved, the Clone tab can load back.
+            clip, text, status = webui.load_saved_voice("phone_memo")
+            check(text == "the quick brown fox", "loading it back restores the transcript")
+            check(isinstance(clip, tuple) and clip[0] == 24000, "and the clip at its sample rate")
+        finally:
+            webui.VOICES_DIR = original
+            webui.MEDIA_DIR = original_media
+
+
 def test_slug_rejects_junk() -> None:
     check(webui._slug("  Two  Words!! ") == "two_words", "punctuation and spacing collapse to underscores")
     for bad in ("", "   ", "!!!", "///"):

@@ -10,7 +10,9 @@ green before any push or handoff (the GPU tier cannot run on a box without a GPU
 ## Purpose
 
 A local, offline deployment of [QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
-(1.7B checkpoints) behind a Gradio UI, tuned for **one** 16GB consumer GPU. Three modes:
+(1.7B checkpoints) behind a Gradio UI, tuned for **one** 16GB Blackwell consumer GPU —
+RTX 5070 Ti, RTX 5080, anything in that class (the 5070 Ti is the SKU it is developed and
+tested on, not the only one it targets). Three modes:
 CustomVoice (9 preset speakers), Voice Design (voice from a text description), Voice
 Clone (from a ~3-10s reference clip). Nick uses it at his desk; it is not a service.
 
@@ -28,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 30 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 31 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -56,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 30 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 31 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 30/30 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 31/31 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -226,7 +228,8 @@ Run on 2026-11-02 on a **CPU-only Linux box with no GPU and no weights**:
 Run on 2026-11-03 on the **real GPU box** (RTX 5070 Ti, 16GB, CUDA, 14GB of weights) — the
 tier the hardening pass could not execute:
 
-- **CPU tier: 30/30 passing**, including the two new `resolve_credentials` checks. The
+- **CPU tier: 31/31 passing**, including the two new `resolve_credentials` checks and
+  `test_save_reference_voice_from_the_clone_tab`. The
   `smoke_test` bookkeeping check was made hermetic (it stubs `exclusive_owner`, so it no
   longer fails just because the webui server is running).
 - **GPU tier: 6/6 passing** (`tests/smoke_test.py`): custom_voice, voice_design,

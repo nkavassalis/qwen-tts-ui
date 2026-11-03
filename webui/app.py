@@ -7,8 +7,8 @@ local GPU. Differences from the Space version:
 
   * Loads the 1.7B checkpoints (the best quality tier) from a local directory.
   * The Space keeps all 5 models resident on the GPU at once (~20GB VRAM). A 16GB
-    RTX 5070 Ti cannot do that, so models live in CPU RAM and an LRU "GPU slot"
-    moves at most `--max-resident` models onto the GPU on demand (~1-3s swap).
+    Blackwell card (RTX 5070 Ti / 5080) cannot do that, so models live in CPU RAM and an
+    LRU "GPU slot" moves at most `--max-resident` models onto the GPU on demand (~1-3s swap).
   * No `spaces` (Zero-GPU) dependency, no model-size dropdown, attn_implementation
     is `sdpa` (flash-attn 2 has no sm_120/Blackwell wheels; the Space uses sdpa too).
 
@@ -1002,6 +1002,43 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
     )
 
 
+def save_reference_voice(name: str, audio: Any, ref_text: str, language: str) -> Tuple[Any, str, Any]:
+    """Save the clip in the Voice Clone reference box as a reusable voice.
+
+    Voice Design could save a voice; the Clone tab could only load and delete. So a voice
+    you assembled from a video or an upload — trimmed waveform, Whisper transcript and all
+    — had nowhere to go, and the next session meant uploading it again. Same on-disk
+    format as a designed voice, so both show up in one list.
+    """
+    if not (name or "").strip():
+        return gr.update(), "Error: give the voice a name first.", gr.update()
+    try:
+        parsed = _audio_to_tuple(audio)
+        if parsed is None:
+            return (gr.update(),
+                    "Nothing to save — hit ‘Extract audio & show waveform’ first, or upload a "
+                    "reference into the clip box.",
+                    gr.update())
+        wav, sr = parsed
+        seconds = len(wav) / float(sr)
+        if seconds < REF_MIN_SECONDS:
+            return (gr.update(),
+                    f"Error: the reference clip is {seconds:.1f}s — too short to clone from "
+                    f"(need {REF_MIN_SECONDS}s). Widen the selection on the waveform.",
+                    gr.update())
+        record = save_voice(name=name, wav=wav, sr=sr, text=(ref_text or "").strip(),
+                            instruct="", language=language)
+    except (MediaError, OSError, ValueError) as e:
+        return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
+    note = "" if record["text"] else " (no transcript — you will need ‘x-vector only’ to clone from it)"
+    return (
+        gr.update(),
+        f"Saved ‘{record['name']}’ ({record['seconds']}s) from the reference clip{note}. "
+        f"It is in the Saved voices list below.",
+        gr.update(choices=voice_choices(), value=record["slug"]),
+    )
+
+
 def load_saved_voice(slug: str) -> Tuple[Any, Any, str]:
     """Fill the Voice Clone reference fields from a saved voice."""
     if not slug:
@@ -1182,7 +1219,7 @@ def refresh_status():
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="Qwen3-TTS") as demo:
         gr.Markdown(
-            """# Qwen3-TTS — local (1.7B, RTX 5070 Ti)
+            """# Qwen3-TTS — local (1.7B, 16GB Blackwell)
 **TTS (CustomVoice)**: 9 preset speakers + natural-language style instructions ·
 **Voice Design**: invent a voice from a text description ·
 **Voice Clone (Base)**: clone any voice from a ~3s reference clip.
@@ -1264,7 +1301,9 @@ after a model switch pays a few seconds of load time.
                 gr.Markdown(
                     "Upload a clip — **video works**, only the audio track is used — drag the "
                     "selection to the best stretch, transcribe it, then synthesize new text. "
-                    "A clean 3–10s window clones best.")
+                    "A clean 3–10s window clones best. **Keep things:** *Save to voice library* "
+                    "stores the reference clip for reuse; every audio player has a download "
+                    "icon for the generated wav.")
                 cl_media_state = gr.State(value=None)
                 cl_upload = gr.File(label="Upload video or audio", file_types=MEDIA_SUFFIXES,
                                     type="filepath")
@@ -1296,6 +1335,16 @@ after a model switch pays a few seconds of load time.
                     label="x-vector only (no transcript needed, lower similarity)", value=False)
 
                 with gr.Row():
+                    cl_voice_name = gr.Textbox(
+                        label="Save this reference as a voice (name)", scale=3,
+                        placeholder="e.g. phone voice memo",
+                        info="Stores the trimmed clip plus its transcript in voices/ — reuse it "
+                             "later without re-uploading. Does not save the generated output; "
+                             "use the download icon on its player for that.")
+                    cl_save_btn = gr.Button("Save to voice library", size="sm", scale=1)
+                cl_save_status = gr.Textbox(label="Save status", lines=1, interactive=False)
+
+                with gr.Row():
                     with gr.Column(scale=2):
                         cl_text = gr.Textbox(label="Target text", lines=4,
                                              placeholder="What the cloned voice should say...")
@@ -1303,9 +1352,11 @@ after a model switch pays a few seconds of load time.
                         cl_btn = gr.Button("Clone & generate", variant="primary")
 
                 with gr.Row():
-                    cl_voice = gr.Dropdown(label="Saved voices (designed earlier)", choices=voice_choices(),
+                    cl_voice = gr.Dropdown(label="Saved voices (designed or saved from a clip)",
+                                           choices=voice_choices(),
                                            value=None, scale=4, allow_custom_value=False,
-                                           info="Saving happens in the Voice Design tab; loading fills in the reference clip and its transcript.")
+                                           info="Load fills in the reference clip and its transcript; "
+                                                "saving happens above, or in the Voice Design tab.")
                     cl_load_btn = gr.Button("Load", size="sm", scale=1)
                     cl_delete_btn = gr.Button("Delete", size="sm", scale=1, variant="stop")
                     cl_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
@@ -1333,6 +1384,9 @@ after a model switch pays a few seconds of load time.
                 vd_save_btn.click(save_designed_voice,
                                   inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
                                   outputs=[vd_voice_name, vd_save_status, cl_voice])
+                cl_save_btn.click(save_reference_voice,
+                                  inputs=[cl_voice_name, cl_ref_audio, cl_ref_text, cl_language],
+                                  outputs=[cl_voice_name, cl_save_status, cl_voice])
                 cl_load_btn.click(load_saved_voice, inputs=[cl_voice],
                                   outputs=[cl_ref_audio, cl_ref_text, cl_voice_status])
                 cl_delete_btn.click(delete_saved_voice, inputs=[cl_voice],

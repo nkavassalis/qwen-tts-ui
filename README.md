@@ -1,7 +1,12 @@
-# Qwen3-TTS — local deployment (RTX 5070 Ti)
+# Qwen3-TTS — local deployment (16GB Blackwell: RTX 5070 Ti / 5080)
 
 [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) running fully offline on this machine,
 behind a Gradio web UI at **http://127.0.0.1:7860**.
+
+**Target hardware is any single 16GB Blackwell card** — RTX 5070 Ti, RTX 5080, anything in
+that class. The VRAM budget, the LRU GPU slot and the memory guards are all written for
+that card class, not for one specific SKU; the 5070 Ti is simply what it is developed and
+tested on (under WSL2).
 
 Three modes, all on the **1.7B** checkpoints (the best quality tier Qwen has released —
 the 0.6B variants score noticeably worse on WER/speaker-similarity and VoiceDesign is
@@ -13,11 +18,13 @@ the 0.6B variants score noticeably worse on WER/speaker-similarity and VoiceDesi
 | Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Invent a brand-new voice from a text description of timbre/age/emotion/accent |
 | Voice Clone (Base) | `Qwen3-TTS-12Hz-1.7B-Base` | Clone a voice from a ~3s reference clip (upload or microphone) |
 
-**Voice library**: the Voice Design tab can *save* a designed voice (`voices/*.wav` + a
-sidecar with its transcript), and the Voice Clone tab can load it back as a reusable
-reference. That makes a designed voice persistent across requests and restarts — the
-hosted demo cannot, since it keeps nothing between sessions. Under the hood the saved
-clip + transcript feed `create_voice_clone_prompt`, so it clones with full ICL quality.
+**Voice library**: both generation tabs can save a voice, and the Voice Clone tab loads
+them back as a reusable reference — Voice Design's *Save as clone voice* keeps the clip it
+generated, Voice Clone's *Save to voice library* keeps the trimmed reference clip plus its
+transcript. Each save is `voices/<slug>.wav` + a sidecar `.json`, so a voice survives
+requests and restarts — the hosted demo cannot, since it keeps nothing between sessions.
+Under the hood the saved clip + transcript feed `create_voice_clone_prompt`, so it clones
+with full ICL quality.
 
 **Reference-clip workshop** (Voice Clone tab) — the three things the hosted box makes you
 do in a text editor:
@@ -30,6 +37,26 @@ do in a text editor:
 - **Transcription you can edit.** *Transcribe selected clip* runs **Whisper large-v3** on
   the selected window only and drops the text into an editable box — because ICL cloning
   needs the transcript to match the clip, not the whole upload.
+
+### Cloning a voice, start to finish
+
+1. **Voice Clone (Base)** tab → *Upload video or audio*. Video is fine; only its audio
+   track is used.
+2. **Extract audio & show waveform**. The whole upload is drawn and the first ~6s lands in
+   *Reference clip*.
+3. Drag **Start (s)** / **End (s)** so the shaded region covers the cleanest stretch
+   (3–10s, one speaker, no music) — or press **Auto-pick best clip** for the loudest 6s.
+4. **Transcribe selected clip**, then fix anything Whisper got wrong in *Reference
+   transcript*. This step matters: ICL cloning conditions on the transcript matching the
+   clip. Skip it only with *x-vector only* (lower similarity).
+5. Type the **Target text**, set **Language**, press **Clone & generate**.
+6. Keep what you want — these are two different buttons:
+   - the **generated audio**: the download icon on the *Generated audio* player. Files
+     under `/tmp/gradio/` are ephemeral, so download rather than pathing to them.
+   - the **voice itself**: name it in *Save this reference as a voice (name)* and press
+     **Save to voice library**. It goes to `voices/<slug>.wav` + `.json` and appears in
+     *Saved voices* on this and every later run. **Load** restores clip + transcript,
+     **Delete** removes both files.
 
 ## Quick start
 
@@ -68,7 +95,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (30 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (31 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -154,7 +181,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 30 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 31 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -179,7 +206,7 @@ model left on CPU) fails the test rather than just feeling slow.
 
 **Why CPU-resident weights with an LRU GPU slot.** The official Hugging Face Space keeps
 five checkpoints (both 0.6B and both 1.7B sizes, plus VoiceDesign) permanently on the
-GPU — roughly 20GB. A 16GB 5070 Ti can't hold that. Instead each 1.7B model (~4.3GB)
+GPU — roughly 20GB. A 16GB Blackwell card (5070 Ti, 5080) can't hold that. Instead each 1.7B model (~4.3GB)
 lives in host RAM and a small LRU ("GPU slot", `--max-resident`) promotes the one you're
 actually using, evicting the least recently used model to RAM otherwise. Switching tabs
 costs ~2s; nothing is re-read from disk. With `--max-resident 2` two models stay on the
