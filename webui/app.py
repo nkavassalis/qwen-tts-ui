@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import gc
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -60,7 +61,7 @@ CAPABILITIES = OrderedDict(
 # property of the speaker, not a selectable language: the checkpoint carries
 # `talker_config.spk_is_dialect` (dylan -> beijing_dialect, eric -> sichuan_dialect)
 # and upstream deliberately strips the dialects from `get_supported_languages()`
-# (modeling_qwen3_tts.py:1832). So you get the Beijing accent by picking Dylan, and
+# (modeling_qwen3_tts.py:1831-1834). So you get the Beijing accent by picking Dylan, and
 # passing language="beijing_dialect" is rejected — do not re-add them to the list below.
 SPEAKER_INFO = {
     "vivian":     ("Bright, slightly edgy young female voice", "Chinese"),
@@ -100,6 +101,19 @@ def speaker_choices(models_dir: str = MODELS_DIR) -> List[Tuple[str, str]]:
     return choices
 
 
+def default_speaker(models_dir: str = MODELS_DIR) -> str:
+    """The speaker the dropdown preselects — always one the checkpoint actually has.
+
+    Hard-coding "ryan" broke silently whenever the checkpoint's own `spk_id` table
+    differed: Gradio accepted a value that was not in `choices`, the box came up empty,
+    and Generate died with "Speaker is required".
+    """
+    values = [value for _, value in speaker_choices(models_dir)]
+    if "ryan" in values:
+        return "ryan"
+    return values[0] if values else "ryan"
+
+
 # (UI label, value passed to the model). Values must match `talker_config.codec_language_id`
 # keys *and* upstream's supported-language filter, which excludes the dialect entries —
 # see the note above. The hosted Space also omits Italian, which the model does accept.
@@ -134,7 +148,12 @@ VRAM_MARGIN_MB = int(os.environ.get("QWEN_TTS_VRAM_MARGIN_MB", "1024"))
 
 
 def mem_available_mb() -> float:
-    """MemAvailable from /proc/meminfo (0.0 when unavailable, e.g. non-Linux)."""
+    """MemAvailable from /proc/meminfo, or +inf when the platform does not report it.
+
+    Unknown is deliberately NOT 0.0: `_load()` compares this against the RAM floor, so
+    returning 0 on a machine without /proc/meminfo (macOS) would make every single load
+    raise MemoryError. Callers that *display* it must handle +inf (see `status()`).
+    """
     try:
         with open("/proc/meminfo", encoding="utf-8") as fh:
             for line in fh:
@@ -142,7 +161,7 @@ def mem_available_mb() -> float:
                     return int(line.split()[1]) / 1024.0
     except (OSError, ValueError):
         pass
-    return 0.0
+    return float("inf")
 
 
 def vram_available_mb() -> float:
@@ -308,7 +327,11 @@ class ModelHub:
             attn_implementation=self.attn_impl,
         )
         tts.device = torch.device("cpu")
-        print(f"[hub] {capability} ready in CPU RAM ({mem_available_mb():.0f}MB free)", flush=True)
+        # Surfaced because the sampling sliders are only meaningful if the checkpoint's
+        # own generate_config.json leaves do_sample on (upstream lets that file override
+        # every default in `_merge_generate_kwargs`).
+        print(f"[hub] {capability} ready in CPU RAM ({mem_available_mb():.0f}MB free); "
+              f"generate defaults: {getattr(tts, 'generate_defaults', 'n/a')}", flush=True)
         return tts
 
     def _get_cpu(self, capability: str) -> Qwen3TTSModel:
@@ -351,21 +374,24 @@ class ModelHub:
                 return tts
 
             need = self.weight_mb(capability) + self.vram_margin_mb
-            while vram_available_mb() < need and self.on_gpu:
-                evicted_name, evicted = self.on_gpu.popitem(last=False)
-                print(f"[hub] evicting {evicted_name} -> CPU RAM "
-                      f"({vram_available_mb():.0f}MB free, need {need:.0f}MB)", flush=True)
-                self._move(evicted, torch.device("cpu"))
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    gc.collect()
+            # Only a CUDA target has VRAM to budget. `vram_available_mb()` reports 0 with
+            # no CUDA device, which used to make `--device cpu` refuse every load.
+            if DEVICE.type == "cuda":
+                while vram_available_mb() < need and self.on_gpu:
+                    evicted_name, evicted = self.on_gpu.popitem(last=False)
+                    print(f"[hub] evicting {evicted_name} -> CPU RAM "
+                          f"({vram_available_mb():.0f}MB free, need {need:.0f}MB)", flush=True)
+                    self._move(evicted, torch.device("cpu"))
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        gc.collect()
 
-            if vram_available_mb() < need:
-                raise MemoryError(
-                    f"Need ~{need:.0f}MB of VRAM for {capability} but only "
-                    f"{vram_available_mb():.0f}MB is free. Close other GPU users "
-                    f"(nvidia-smi) or lower --max-resident."
-                )
+                if vram_available_mb() < need:
+                    raise MemoryError(
+                        f"Need ~{need:.0f}MB of VRAM for {capability} but only "
+                        f"{vram_available_mb():.0f}MB is free. Close other GPU users "
+                        f"(nvidia-smi) or lower --max-resident."
+                    )
 
             print(f"[hub] promoting {capability} -> {DEVICE} "
                   f"({vram_available_mb():.0f}MB free)", flush=True)
@@ -379,8 +405,10 @@ class ModelHub:
             vram = f"{free_b / 2**30:.1f}GB free / {total_b / 2**30:.1f}GB total"
         else:
             vram = "no CUDA device"
+        ram = mem_available_mb()
+        ram_txt = "unknown" if ram == float("inf") else f"{ram / 1024:.1f}GB free"
         return (
-            f"GPU: {vram} | RAM: {mem_available_mb() / 1024:.1f}GB free | "
+            f"GPU: {vram} | RAM: {ram_txt} | "
             f"in CPU RAM: {', '.join(self.cpu_cache) or '-'} | "
             f"on GPU: {', '.join(self.on_gpu) or '-'}"
         )
@@ -430,9 +458,20 @@ def _normalize_audio(wav, eps: float = 1e-12, clip: bool = True) -> np.ndarray:
 
 
 def _audio_to_tuple(audio) -> Optional[Tuple[np.ndarray, int]]:
-    """Gradio Audio value -> (wav float32, sample_rate)."""
+    """Gradio Audio value -> (wav float32, sample_rate).
+
+    The reference/clip boxes are `type="filepath"`, so the normal case is a path string
+    handed over by Gradio — which is client-supplied, hence `resolve_input_path` before
+    anything opens it. The tuple/dict forms are kept for tests and for callers that
+    already hold a waveform.
+    """
     if audio is None:
         return None
+    if isinstance(audio, dict) and audio.get("path"):
+        return _audio_to_tuple(audio["path"])
+    if isinstance(audio, (str, os.PathLike)):
+        wav, sr = sf.read(resolve_input_path(audio, "reference audio"), dtype="float32", always_2d=False)
+        return _normalize_audio(wav), int(sr)
     if isinstance(audio, tuple) and len(audio) == 2 and isinstance(audio[0], int):
         sr, wav = audio
         return _normalize_audio(wav), int(sr)
@@ -447,6 +486,106 @@ def _audio_to_tuple(audio) -> Optional[Tuple[np.ndarray, int]]:
 # ============================================================================
 class MediaError(RuntimeError):
     """Anything the user can fix: bad file, no audio track, missing ffmpeg."""
+
+
+# ---------------------------------------------------------------------------
+# Path containment for anything the browser names (defense in depth)
+# ---------------------------------------------------------------------------
+# Gradio 6 does gate inbound file paths: `Blocks.process_api` -> `preprocess_data` ->
+# `processing_utils._check_allowed(payload.path, check_in_upload_folder)` refuses to move
+# a file into its cache unless a user actually uploaded it (verified live, 2026-11-02:
+# posting {"path": "/etc/hostname.wav"} to /gradio_api/call/import_media dies with
+# "...because it was not uploaded by a user"). So this guard is the *belt*, not the
+# braces. It stays because (a) the components themselves do no such check —
+# `components/file.py::_process_single_file` uses `f.path` straight off the payload — so
+# a Gradio upgrade that loosens preprocess_data silently reopens an arbitrary media read;
+# (b) it also covers paths that reach us by other routes (gr.State contents, and
+# QWEN_TTS_ALLOWED_MEDIA_DIRS if someone widens it); and (c) it turns an opaque
+# framework-level InvalidPathError into a message the user can act on.
+MEDIA_DIR = os.path.join(ROOT, "tmp", "media")
+
+# Uploaded clips are working data, not an archive: they are re-read on every slider
+# drag, then nothing needs them. Prune anything older than this (0 disables pruning).
+MEDIA_TTL_SECONDS = int(os.environ.get("QWEN_TTS_MEDIA_TTL_SECONDS", str(6 * 3600)))
+
+
+def media_dir() -> str:
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    return MEDIA_DIR
+
+
+def allowed_input_roots() -> List[str]:
+    """Real, absolute directories a client-supplied path may live in."""
+    roots = [MEDIA_DIR]
+    try:
+        from gradio import utils as gradio_utils
+        for getter in ("get_upload_folder", "get_cache_folder"):
+            fn = getattr(gradio_utils, getter, None)
+            if callable(fn):
+                roots.append(str(fn()))
+    except Exception:  # noqa: BLE001 - gradio moves these helpers between versions
+        pass
+    # Where Gradio writes the files it hands back to the browser: every (sr, wav) we
+    # return to a clip box is saved there by postprocess, and the browser then sends
+    # that exact path back to us as an input. Ask the components themselves rather than
+    # assuming it is the same as the upload dir — it has not always been.
+    try:
+        from gradio.components import Audio as _GradioAudio, File as _GradioFile
+        for component in (_GradioAudio, _GradioFile):
+            cache = getattr(component(type="filepath"), "GRADIO_CACHE", None)
+            if cache:
+                roots.append(str(cache))
+    except Exception:  # noqa: BLE001
+        pass
+    roots += [p for p in os.environ.get("QWEN_TTS_ALLOWED_MEDIA_DIRS", "").split(os.pathsep) if p]
+    return [os.path.realpath(r) for r in roots if r]
+
+
+def resolve_input_path(path: Any, what: str = "media file") -> str:
+    """Validate a client-supplied path and return its real path, or raise MediaError.
+
+    Containment is checked *before* existence, so a probe cannot use this to find out
+    whether /opt/recordings/something.wav exists.
+    """
+    if not path or not isinstance(path, (str, os.PathLike)):
+        raise MediaError(f"No {what} was provided.")
+    text = os.fspath(path)
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", text):
+        raise MediaError(f"{what.capitalize()} URLs are not accepted — upload the file instead.")
+    real = os.path.realpath(os.path.abspath(text))
+    if not any(real == root or real.startswith(root + os.sep) for root in allowed_input_roots()):
+        raise MediaError(f"Refusing to read a {what} outside the upload directory.")
+    if not os.path.isfile(real):
+        raise MediaError(f"{what.capitalize()} not found.")
+    return real
+
+
+def prune_media(max_age_seconds: Optional[float] = None) -> int:
+    """Delete extracted clips older than `max_age_seconds`; returns how many went.
+
+    The TTL is read from the module global at call time (not bound as a default) so
+    tests and `--media-ttl` style overrides can change it after import.
+    """
+    if max_age_seconds is None:
+        max_age_seconds = MEDIA_TTL_SECONDS
+    if max_age_seconds <= 0:
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    try:
+        entries = os.listdir(MEDIA_DIR)
+    except OSError:
+        return 0
+    for fname in entries:
+        path = os.path.join(MEDIA_DIR, fname)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue  # someone else is mid-request with this file; leave it
+    return removed
+
 
 
 def ffmpeg_extract_audio(src: str, dst: str, sr: int = REF_SAMPLE_RATE) -> str:
@@ -469,24 +608,39 @@ def ffmpeg_extract_audio(src: str, dst: str, sr: int = REF_SAMPLE_RATE) -> str:
 def load_media(path: str, sr: int = REF_SAMPLE_RATE) -> Tuple[np.ndarray, int]:
     """Load any supported upload as a float32 mono waveform at `sr`.
 
-    Video containers go straight through ffmpeg; audio files are read natively and only
-    fall back to ffmpeg when libsndfile cannot handle the codec (aac, some mp3/opus).
+    The path comes from the browser, so it is confined to `allowed_input_roots()` here,
+    once, at the only public entry point.
     """
-    if not path or not os.path.exists(path):
-        raise MediaError(f"File not found: {path!r}")
+    return _load_media(resolve_input_path(path), sr)
+
+
+def _load_media(path: str, sr: int) -> Tuple[np.ndarray, int]:
+    """`load_media` for paths we already validated (or wrote ourselves)."""
     suffix = os.path.splitext(path)[1].lower()
     if suffix not in MEDIA_SUFFIXES:
         raise MediaError(f"Unsupported file type {suffix or '(none)'}. Supported: {', '.join(MEDIA_SUFFIXES)}")
 
     if suffix not in AUDIO_SUFFIXES:
-        with tempfile.TemporaryDirectory(prefix="qwen-tts-media-") as tmp:
-            return load_media(ffmpeg_extract_audio(path, os.path.join(tmp, "audio.wav"), sr), sr)
+        # ffmpeg output lands in MEDIA_DIR so the recursive call re-validates inside an
+        # allowed root instead of escaping to a system temp dir.
+        fd, extracted = tempfile.mkstemp(prefix="qwen-tts-media-", suffix=".wav", dir=media_dir())
+        os.close(fd)
+        try:
+            return _load_media(ffmpeg_extract_audio(path, extracted, sr), sr)
+        finally:
+            with suppress(OSError):
+                os.remove(extracted)
 
     try:
         wav, in_sr = sf.read(path, dtype="float32", always_2d=False)
     except Exception:  # noqa: BLE001 - unsupported codec: let ffmpeg decode it
-        with tempfile.TemporaryDirectory(prefix="qwen-tts-media-") as tmp:
-            return load_media(ffmpeg_extract_audio(path, os.path.join(tmp, "audio.wav"), sr), sr)
+        fd, extracted = tempfile.mkstemp(prefix="qwen-tts-media-", suffix=".wav", dir=media_dir())
+        os.close(fd)
+        try:
+            return _load_media(ffmpeg_extract_audio(path, extracted, sr), sr)
+        finally:
+            with suppress(OSError):
+                os.remove(extracted)
 
     wav = np.asarray(wav, dtype=np.float32)
     if wav.ndim > 1:
@@ -692,14 +846,9 @@ class Transcriber:
 
 ASR: Optional[Transcriber] = None
 
-# gr.State travels to the browser as JSON, so the loaded clip is kept on disk and only
-# its path/duration live in state (a numpy array there would not survive the round-trip).
-MEDIA_DIR = os.path.join(ROOT, "tmp", "media")
-
-
-def media_dir() -> str:
-    os.makedirs(MEDIA_DIR, exist_ok=True)
-    return MEDIA_DIR
+# (Uploaded clips are kept on disk under MEDIA_DIR — see the path-containment block
+# above. gr.State travels to the browser as JSON, so only the clip's path/duration live
+# in state; a numpy array there would not survive the round-trip.)
 
 
 # ============================================================================
@@ -747,10 +896,6 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
                 max_new_tokens=budget,
                 **_sampling(temperature, top_p, top_k, rep_penalty),
             )
-        # Remember it so "save as voice" can persist this exact clip + transcript.
-        _LAST_DESIGN.clear()
-        _LAST_DESIGN.update(wav=wavs[0], sr=sr, text=text.strip(),
-                            instruct=voice_description.strip(), language=language)
         return _ok((sr, wavs[0]), _report(wavs[0], sr, budget, "VoiceDesign"))
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}"
@@ -759,10 +904,6 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
 # Reusable clone prompts, keyed by a hash of the uploaded reference audio, so the
 # reference encoder is not recomputed for every line (big speedup for repeated takes).
 _CLONE_PROMPTS: Dict[str, Any] = {}
-
-# Last successful VoiceDesign output, so the "save as voice" button has something to
-# persist without re-running generation. {(sr, wav), text, instruct, language}
-_LAST_DESIGN: Dict[str, Any] = {}
 
 
 # ============================================================================
@@ -825,22 +966,32 @@ def voice_choices() -> List[Tuple[str, str]]:
     return [(f"{r['name']} ({r.get('seconds', '?')}s)", r["slug"]) for r in list_voices()]
 
 
-def save_designed_voice(name: str) -> Tuple[Any, str, Any]:
-    """Save the last VoiceDesign result as a reusable clone voice."""
-    if not _LAST_DESIGN:
-        return gr.update(), "Nothing to save yet — generate something in the Voice Design tab first.", gr.update()
+def save_designed_voice(name: str, audio: Any, text: str, voice_description: str,
+                        language: str) -> Tuple[Any, str, Any]:
+    """Save the clip currently in the Voice Design audio box as a reusable clone voice.
+
+    Clip, transcript and description all arrive as inputs rather than from a module-level
+    "last generation" cache: a process-global there meant that with two people on the LAN,
+    one person's Save button persisted the other person's clip.
+    """
     if not (name or "").strip():
         return gr.update(), "Error: give the voice a name first.", gr.update()
+    if not (text or "").strip():
+        return gr.update(), "Error: the text the clip speaks is empty — it is what ICL cloning needs.", gr.update()
     try:
+        parsed = _audio_to_tuple(audio)
+        if parsed is None:
+            return gr.update(), "Nothing to save yet — generate something in the Voice Design tab first.", gr.update()
+        wav, sr = parsed
         record = save_voice(
             name=name,
-            wav=_LAST_DESIGN["wav"],
-            sr=_LAST_DESIGN["sr"],
-            text=_LAST_DESIGN["text"],
-            instruct=_LAST_DESIGN["instruct"],
-            language=_LAST_DESIGN["language"],
+            wav=wav,
+            sr=sr,
+            text=text.strip(),
+            instruct=(voice_description or "").strip(),
+            language=language,
         )
-    except (OSError, ValueError) as e:
+    except (MediaError, OSError, ValueError) as e:
         return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
     return (
         gr.update(),
@@ -883,8 +1034,16 @@ def refresh_voices() -> Any:
 
 
 def _clone_cache_key(audio_tuple, ref_text, x_vector_only) -> str:
+    """Content hash of the reference clip + transcript + mode.
+
+    Keyed on the PCM bytes, not on (length, float sum): two different clips with equal
+    length and a matching sum used to share one cached clone prompt, which on a shared
+    LAN meant answering in someone else's voice.
+    """
     wav, sr = audio_tuple
-    return f"{sr}|{wav.shape[0]}|{float(wav.sum()):.4f}|{ref_text or ''}|{bool(x_vector_only)}"
+    pcm = np.ascontiguousarray(wav, dtype=np.float32).tobytes()
+    digest = hashlib.sha256(pcm).hexdigest()[:32]
+    return f"{sr}|{wav.shape[0]}|{digest}|{ref_text or ''}|{bool(x_vector_only)}"
 
 
 def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector_only,
@@ -955,6 +1114,7 @@ def import_media(file_value: Any) -> Tuple[Any, str, Any, Any, Any, Any, str]:
     """Take a video/audio upload, extract its audio, and pre-select the best window."""
     path = file_value[0] if isinstance(file_value, (list, tuple)) and file_value else file_value
     try:
+        prune_media()
         wav, sr = load_media(path)
         suffix = os.path.splitext(str(path))[1].lower()
         kind = "video — audio track extracted" if suffix in VIDEO_SUFFIXES else "audio"
@@ -1056,7 +1216,7 @@ after a model switch pays a few seconds of load time.
                         )
                         with gr.Row():
                             cv_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="English")
-                            cv_speaker = gr.Dropdown(label="Speaker", choices=speaker_choices(), value="ryan")
+                            cv_speaker = gr.Dropdown(label="Speaker", choices=speaker_choices(), value=default_speaker())
                         cv_instruct = gr.Textbox(
                             label="Style instruction (optional)", lines=2,
                             placeholder="e.g. Speak in a cheerful, energetic tone / 用愤怒的语气说",
@@ -1092,7 +1252,7 @@ after a model switch pays a few seconds of load time.
                             vd_save_btn = gr.Button("Save as clone voice", size="sm", scale=1)
                         vd_save_status = gr.Textbox(label="Voice library", lines=1, interactive=False)
                     with gr.Column(scale=2):
-                        vd_audio = gr.Audio(label="Generated audio", type="numpy")
+                        vd_audio = gr.Audio(label="Generated voice", type="filepath")
                         vd_status = gr.Textbox(label="Status", lines=2, interactive=False)
                 vd_btn.click(generate_voice_design,
                              inputs=[vd_text, vd_language, vd_instruct] + sampling,
@@ -1120,7 +1280,7 @@ after a model switch pays a few seconds of load time.
                 with gr.Row():
                     with gr.Column(scale=2):
                         cl_ref_audio = gr.Audio(label="Reference clip (trimmed selection lands here)",
-                                                type="numpy", sources=["upload", "microphone"])
+                                                type="filepath", sources=["upload", "microphone"])
                     with gr.Column(scale=2):
                         cl_asr_language = gr.Dropdown(
                             label="Transcript language",
@@ -1168,7 +1328,8 @@ after a model switch pays a few seconds of load time.
                                         inputs=[cl_media_state, cl_start, cl_end, cl_asr_language],
                                         outputs=[cl_ref_text, cl_media_status])
 
-                vd_save_btn.click(save_designed_voice, inputs=[vd_voice_name],
+                vd_save_btn.click(save_designed_voice,
+                                  inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
                                   outputs=[vd_voice_name, vd_save_status, cl_voice])
                 cl_load_btn.click(load_saved_voice, inputs=[cl_voice],
                                   outputs=[cl_ref_audio, cl_ref_text, cl_voice_status])
@@ -1210,6 +1371,16 @@ def main() -> int:
                              "two copies of the weights in RAM can lock the machine).")
     parser.add_argument("--ssl-certfile", default=None)
     parser.add_argument("--ssl-keyfile", default=None)
+    parser.add_argument("--ssl-self-signed", action="store_true",
+                        help="Tell Gradio not to verify the certificate it is serving "
+                             "(set by run.sh --ssl-self-signed). Without this, launch() "
+                             "kills itself: its startup self-check does an https request "
+                             "to its own server and fails on the self-signed cert.")
+    parser.add_argument("--username", default=None,
+                        help="Require this username to use the UI (with --password). Required in "
+                             "spirit for anything bound beyond localhost.")
+    parser.add_argument("--password", default=None,
+                        help="Require this password to use the UI (with --username).")
     parser.add_argument("--share", action="store_true", help="Create a public gradio.app link.")
     parser.add_argument("--asr-model", default=ASR_MODEL_ID,
                         help=f"Whisper model for reference transcription (default {ASR_MODEL_ID}); "
@@ -1237,17 +1408,42 @@ def main() -> int:
                    max_cpu_resident=args.max_cpu_resident, ram_floor_mb=args.ram_floor_mb)
 
     def serve() -> int:
+        removed = prune_media()
+        if removed:
+            print(f"[webui] pruned {removed} stale clip(s) from {MEDIA_DIR}", flush=True)
         if args.preload:
             for capability in list(CAPABILITIES)[: HUB.max_cpu_resident]:
                 HUB._get_cpu(capability)
 
         demo = build_ui()
+
+        auth = None
+        if args.username or args.password:
+            if not (args.username and args.password):
+                print("[webui] warning: --username and --password must be given together; "
+                      "starting UNAUTHENTICATED.", flush=True)
+            else:
+                auth = [(args.username, args.password)]
+        reachable_beyond_localhost = bool(args.share) or args.ip not in ("127.0.0.1", "localhost", "::1")
+        if reachable_beyond_localhost and auth is None:
+            print("[webui] WARNING: serving unauthenticated on "
+                  f"{'a public gradio.app link' if args.share else args.ip}:{args.port}. Anyone who can "
+                  "reach it can run the model and upload files to this machine. "
+                  "Pass --username/--password.", flush=True)
+
         launch_kwargs: Dict[str, Any] = dict(
-            server_name=args.ip, server_port=args.port, share=args.share,
+            server_name=args.ip, server_port=args.port, share=args.share, auth=auth,
             inbrowser=False, css=".gradio-container {max-width: none !important;}",
         )
         if args.ssl_certfile and args.ssl_keyfile:
             launch_kwargs.update(ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)
+            if args.ssl_self_signed:
+                # Gradio's own startup check (blocks.launch -> httpx.get(local_api_url +
+                # "startup-events", verify=ssl_verify)) dials its own https port. With a
+                # self-signed cert that raises CERTIFICATE_VERIFY_FAILED and launch() dies
+                # before the UI is reachable — verified 2026-11-02 on gradio 6.17. This
+                # only affects Gradio talking to itself; browsers still see the cert.
+                launch_kwargs["ssl_verify"] = False
 
         print(f"[webui] {HUB.status()}", flush=True)
         demo.queue(default_concurrency_limit=1).launch(**launch_kwargs)

@@ -1,0 +1,23 @@
+# Direct runtime dependencies of webui/app.py (and the CPU test tier).
+#
+# NOT included here, on purpose:
+#   * torch / torchaudio — setup.sh installs these from the cu128 index
+#     (https://download.pytorch.org/whl/cu128) so the wheel covers sm_120 (RTX 50xx).
+#     Installing torch from PyPI here instead can silently drop the CUDA build.
+#   * transformers / accelerate — pinned by the upstream `qwen-tts` package
+#     (transformers==4.57.3, accelerate==1.12.0). Do not pin them here too; let upstream
+#     own that pair, and never `pip install -U transformers` into this venv.
+#   * qwen-tts itself — installed editable from ./repo by setup.sh.
+#
+# The ranges below are what the app is known to work against. For a byte-reproducible
+# environment, freeze the venv that ran the green test tiers and commit it as a lock:
+#   uv pip freeze > requirements.lock.txt
+gradio>=6.0,<7          # Blocks(css=...) moved to launch(css=...); show_api is gone
+numpy>=1.26
+soundfile>=0.12         # wav read/write (libsndfile is bundled in the wheel)
+librosa>=0.10           # resampling only; setup.sh keeps ffmpeg for decoding
+pillow>=10              # the waveform is drawn by hand, no matplotlib
+# Imported by upstream's 25Hz tokenizer path at module import time, so the CPU tests need
+# them even though none of the 12Hz models we ship touch that code.
+sox>=1.4
+onnxruntime>=1.16

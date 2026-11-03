@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import List, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -76,6 +77,18 @@ CASES = {
 }
 
 
+# Cases that did not actually run. A skip is not a pass: main() exits non-zero unless
+# --allow-skip, because `--only media_pipeline` on a box without ffmpeg used to print
+# SKIPPED and still report "All smoke tests passed" with exit 0.
+SKIPPED: List[Tuple[str, str]] = []
+
+
+def skip(case: str, reason: str, note: str = "") -> None:
+    """Record a case that did not run, so the exit code can say so."""
+    SKIPPED.append((case, reason))
+    print(f"  [{case}] SKIPPED: {reason}" + (f" ({note})" if note else ""))
+
+
 def check_audio(path: str, wav: np.ndarray, sr: int, min_seconds: float = 0.5) -> None:
     assert wav.ndim == 1, f"expected 1-D audio, got shape {wav.shape}"
     assert len(wav) / sr >= min_seconds, f"audio too short: {len(wav) / sr:.2f}s"
@@ -87,7 +100,7 @@ def check_audio(path: str, wav: np.ndarray, sr: int, min_seconds: float = 0.5) -
     print(f"    rms={rms:.4f} peak={peak:.3f} dur={len(wav) / sr:.2f}s -> {path}")
 
 
-def run_voice_library(hub: webui.ModelHub, keep_gpu: bool) -> None:
+def run_voice_library(hub: webui.ModelHub) -> None:
     """VoiceDesign -> save_voice -> load_saved_voice -> Base clone, as one user flow."""
     import tempfile
 
@@ -131,16 +144,20 @@ def run_voice_library(hub: webui.ModelHub, keep_gpu: bool) -> None:
         check_audio(clone_path, outs[0], out_sr)
     finally:
         webui.VOICES_DIR = original
-        if not keep_gpu and "voice_design" in hub.on_gpu:
-            pass  # both models get evicted by the caller below
+        # Both models are evicted by the caller below; nothing to do here.
 
 
-def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True) -> None:
+def run_media_pipeline(hub: webui.ModelHub, use_asr: bool = True) -> None:
     """video upload -> ffmpeg -> waveform/trim helpers -> Whisper -> clone."""
     cfg = CASES["media_pipeline"]
     if not shutil.which(webui.FFMPEG_BIN):
-        print("  [media_pipeline] SKIPPED: ffmpeg not on PATH")
-        return
+        # A skip is not a pass: main() exits non-zero unless --allow-skip.
+        skip("media_pipeline", f"ffmpeg ({webui.FFMPEG_BIN}) not on PATH")
+
+    # The app only reads uploads from inside its media dir (resolve_input_path), so the
+    # fixture mp4 has to be built there, not in OUT_DIR next to it.
+    webui.MEDIA_DIR = os.path.join(OUT_DIR, "media")
+    os.makedirs(webui.MEDIA_DIR, exist_ok=True)
 
     # 1. synthesize the source speech with a known speaker and known words
     with hub.lock:
@@ -152,7 +169,7 @@ def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True
     seconds = len(wavs[0]) / sr
 
     # 2. wrap it in a real mp4 (video stream + aac audio), like a phone export
-    mp4 = os.path.join(OUT_DIR, "media_pipeline.mp4")
+    mp4 = os.path.join(webui.MEDIA_DIR, "media_pipeline.mp4")
     proc = subprocess.run(
         [webui.FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error",
          "-f", "lavfi", "-i", f"color=c=navy:s=320x240:d={seconds + 0.5:.2f}",
@@ -164,8 +181,6 @@ def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True
 
     # 3. the app's own import path must see only the audio, through the same callbacks
     #    the browser hits (gr.State is JSON-decoded on the way back, so we round-trip it)
-    webui.MEDIA_DIR = os.path.join(OUT_DIR, "media")
-    os.makedirs(webui.MEDIA_DIR, exist_ok=True)
     imported = webui.import_media(mp4)
     state, status = imported[0], imported[1]
     assert "Loaded" in status, f"import failed: {status}"
@@ -199,7 +214,7 @@ def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True
         webui.ASR.unload()
         webui.ASR = None
     else:
-        print("  [media_pipeline] whisper skipped (--no-asr), using the known transcript")
+        skip("media_pipeline/whisper", "--no-asr", note=f"using the known transcript for {cfg['spoken']!r}")
 
     # 6. clone from the trimmed video-derived clip, again via the UI callback
     with hub.lock:
@@ -216,7 +231,7 @@ def run_media_pipeline(hub: webui.ModelHub, keep_gpu: bool, use_asr: bool = True
 
 def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool = True) -> None:
     if capability == "media_pipeline":
-        run_media_pipeline(hub, keep_gpu, use_asr)
+        run_media_pipeline(hub, use_asr)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:
@@ -226,7 +241,7 @@ def run_case(hub: webui.ModelHub, capability: str, keep_gpu: bool, use_asr: bool
         return
 
     if capability == "voice_library":
-        run_voice_library(hub, keep_gpu)
+        run_voice_library(hub)
         if not keep_gpu:
             with hub.lock:
                 while hub.on_gpu:
@@ -275,7 +290,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true",
                         help="Run even if the webui is up (unsafe: two copies of the weights).")
     parser.add_argument("--no-asr", action="store_true",
-                        help="Skip the Whisper step of the media pipeline case.")
+                        help="Skip the Whisper step of the media pipeline case (records a "
+                             "skip; combine with --allow-skip to still exit 0).")
+    parser.add_argument("--allow-skip", action="store_true",
+                        help="Exit 0 even when cases were skipped (a skip is a failure by "
+                             "default, so CI cannot quietly go green on a missing ffmpeg).")
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -292,6 +311,14 @@ def main() -> int:
         for capability in (args.only or list(CASES)):
             print(f"* {capability}")
             run_case(hub, capability, args.keep_gpu, use_asr=not args.no_asr)
+        if SKIPPED:
+            print(f"\n{len(SKIPPED)} case(s) did not actually run:")
+            for case, reason in SKIPPED:
+                print(f"  SKIPPED {case}: {reason}")
+            if not args.allow_skip:
+                print("\nA skipped case is not a pass. Fix the cause, or re-run with "
+                      "--allow-skip if the skip is intended.")
+                return 1
         print("\nAll smoke tests passed.")
         return 0
 

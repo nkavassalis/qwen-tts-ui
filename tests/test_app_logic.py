@@ -8,7 +8,15 @@ Covers the boundaries that matter for usability:
   * _report()  — a generation that hits the cap is flagged as a non-stopping run.
   * _audio_to_tuple / _normalize_audio — gradio audio payloads become clean mono
                  float32 in [-1, 1] at the declared sample rate, whatever the input form.
-  * _clone_cache_key — same reference audio hits the cache, different audio/text does not.
+  * _clone_cache_key — same reference audio hits the cache, different audio does not
+                 (including same-length, same-sum audio, which the old key collided on).
+  * resolve_input_path / load_media / _audio_to_tuple — a browser-named path is only
+                 ever read from inside the upload dirs (belt to Gradio's own check).
+  * prune_media — extracted clips do not accumulate on disk forever.
+  * build_ui — the Blocks tree constructs against the installed Gradio.
+  * ModelHub.acquire — the VRAM budget only applies to a CUDA target (--device cpu).
+  * setup.sh — its download list still matches CAPABILITIES.
+  * smoke_test.skip() — a skipped GPU case cannot report success.
 
 Run: .venv/bin/python tests/test_app_logic.py
 """
@@ -17,7 +25,10 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+import types
 
+import gradio as gr
 import numpy as np
 import soundfile as sf
 
@@ -85,6 +96,13 @@ def test_clone_cache_key() -> None:
     check(key != webui._clone_cache_key((wav, 24000), "hello", True), "x-vector mode changes the key")
     check(key != webui._clone_cache_key((wav, 24000), "hello!", False), "transcript changes the key")
     check(key != webui._clone_cache_key((wav * 2, 24000), "hello", False), "different audio changes the key")
+    # Same length, same sample multiset (so the same sum), different order: the old
+    # (length, float-sum) key collided here, so one user could be served another user's
+    # cached clone prompt.
+    ramp = np.linspace(-0.1, 0.1, 24000, dtype=np.float32)
+    check(webui._clone_cache_key((ramp, 24000), "hello", False)
+          != webui._clone_cache_key((np.roll(ramp, 1), 24000), "hello", False),
+          "same-length, same-sum, reordered audio must not reuse the cached prompt")
 
 
 def test_move_reaches_the_speech_tokenizer() -> None:
@@ -185,8 +203,6 @@ def test_speaker_choices_come_from_the_checkpoint() -> None:
 
 
 def test_voice_library(tmp_dir=None) -> None:
-    import tempfile
-
     wav = (np.sin(np.linspace(0, 200, 24000)) * 0.3).astype(np.float32)
     with tempfile.TemporaryDirectory() as tmp:
         original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
@@ -228,28 +244,47 @@ def test_voice_library(tmp_dir=None) -> None:
             webui.VOICES_DIR = original
 
 
-def test_save_designed_voice_requires_generation() -> None:
-    import tempfile
+def test_save_designed_voice_uses_the_audio_box() -> None:
+    """'Save as voice' reads the clip from its inputs, never from a process global.
 
+    It used to persist a module-level "last design" cache, so with two people on the LAN
+    one person's Save button could persist the other person's clip.
+    """
+    wav = (np.sin(np.linspace(0, 200, 24000)) * 0.3).astype(np.float32)
     with tempfile.TemporaryDirectory() as tmp:
         original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
+        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
         try:
-            webui._LAST_DESIGN.clear()
-            _, msg, _ = webui.save_designed_voice("nobody")
-            check("Nothing to save yet" in msg, "cannot save before generating")
+            clip_path = os.path.join(tmp, "design.wav")
+            sf.write(clip_path, wav, 24000)
 
-            webui._LAST_DESIGN.update(wav=np.zeros(24000, dtype=np.float32), sr=24000,
-                                      text="hello", instruct="warm", language="english")
-            _, msg, update = webui.save_designed_voice("   ")
+            _, msg, _ = webui.save_designed_voice("nobody", None, "text", "warm", "english")
+            check("Nothing to save yet" in msg, "cannot save without a clip in the box")
+
+            _, msg, _ = webui.save_designed_voice("   ", clip_path, "text", "warm", "english")
             check("name" in msg.lower(), "blank name rejected")
             check(webui.list_voices() == [], "rejected save writes nothing")
 
-            _, msg, update = webui.save_designed_voice("Warm Narrator")
-            check("Saved" in msg, "saving the last design works")
+            _, msg, _ = webui.save_designed_voice("x", clip_path, "   ", "warm", "english")
+            check("empty" in msg, "a clip with no transcript is rejected (ICL needs it)")
+            check(webui.list_voices() == [], "rejected save writes nothing")
+
+            _, msg, update = webui.save_designed_voice("Warm Narrator", clip_path,
+                                                       "hello", "warm", "english")
+            check("Saved" in msg, "saving the clip in the box works")
             check(update["choices"][0][1] == "warm_narrator", "clone tab dropdown is refreshed with the new voice")
+            saved = webui.list_voices()[0]
+            check(saved["text"] == "hello" and saved["instruct"] == "warm",
+                  "transcript and description come from the Voice Design inputs")
+
+            # A path outside the allowed roots is refused, not read.
+            _, msg, _ = webui.save_designed_voice("spy", "/opt/recordings/take.wav",
+                                                  "hello", "warm", "english")
+            check("outside the upload directory" in msg, f"foreign path refused: {msg}")
+            check(webui.list_voices() == [saved], "the refused save added nothing")
         finally:
             webui.VOICES_DIR = original
-            webui._LAST_DESIGN.clear()
+            webui.MEDIA_DIR = original_media
 
 
 def test_slug_rejects_junk() -> None:
@@ -294,13 +329,14 @@ def test_memory_guards() -> None:
             check("floor" in str(e), f"refusal explains the floor: {e}")
         check(guarded.cpu_cache == {}, "refused load leaves nothing pinned")
 
-    # _free_cpu must never drop the model we are about to need, nor one on the GPU.
-    hub = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=5, ram_floor_mb=0)
-    hub.cpu_cache["a"] = object()
-    hub.cpu_cache["b"] = object()
-    hub.on_gpu["b"] = hub.cpu_cache["b"]
-    hub._free_cpu(10 ** 9, protect="a")
-    check("b" in hub.cpu_cache, "a model resident on the GPU is not dropped from the CPU cache")
+        # _free_cpu must never drop the model we are about to need, nor one on the GPU.
+        # (Still inside the temp dir: ModelHub is built from `tmp`.)
+        hub = webui.ModelHub(tmp, None, "sdpa", 1, max_cpu_resident=5, ram_floor_mb=0)
+        hub.cpu_cache["a"] = object()
+        hub.cpu_cache["b"] = object()
+        hub.on_gpu["b"] = hub.cpu_cache["b"]
+        hub._free_cpu(10 ** 9, protect="a")
+        check("b" in hub.cpu_cache, "a model resident on the GPU is not dropped from the CPU cache")
 
 
 def test_exclusive_owner_lock() -> None:
@@ -324,97 +360,218 @@ def test_exclusive_owner_lock() -> None:
 
 
 def test_media_helpers() -> None:
-    import tempfile
     import types
 
+    with tempfile.TemporaryDirectory() as tmp:
+        # Uploads are only read from inside the allowed roots (see resolve_input_path),
+        # so every fixture file in this test lives in the media dir.
+        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
+        try:
+            _media_helpers_body(tmp)
+        finally:
+            webui.MEDIA_DIR = original_media
+
+
+def _media_helpers_body(tmp: str) -> None:
     # --- load_media input validation -------------------------------------------------
-    for bad in ("", None, "/nope/missing.mp4"):
+    for bad in ("", None):
         try:
             webui.load_media(bad)
             raise AssertionError(f"expected MediaError for {bad!r}")
         except webui.MediaError:
             pass
-    with tempfile.NamedTemporaryFile(suffix=".txt") as fh:
+    missing = os.path.join(tmp, "nope.mp4")
+    try:
+        webui.load_media(missing)
+        raise AssertionError("expected MediaError for a missing upload")
+    except webui.MediaError as e:
+        check("not found" in str(e).lower(), f"missing file is explained: {e}")
+    with tempfile.NamedTemporaryFile(suffix=".txt", dir=tmp, delete=False) as fh:
         fh.write(b"not media")
-        fh.flush()
+    try:
+        webui.load_media(fh.name)
+        raise AssertionError("expected MediaError for a .txt upload")
+    except webui.MediaError as e:
+        check("Unsupported file type" in str(e), "unsupported type names the extension")
+
+    # --- ffmpeg command construction + failure reporting -----------------------------
+    calls = {}
+    real_run, real_which = webui.subprocess.run, webui.shutil.which
+
+    def fake_run(cmd, **kw):
+        calls["cmd"] = list(cmd)
+        return types.SimpleNamespace(returncode=0, stderr="")
+
+    try:
+        webui.subprocess.run = fake_run
+        webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav", sr=24000)
+        cmd = calls["cmd"]
+        check(cmd[0] == webui.FFMPEG_BIN, "uses the configured ffmpeg")
+        check("-vn" in cmd and "-map" in cmd, "drops the video stream and maps the first audio stream")
+        check(cmd[cmd.index("-ac") + 1] == "1" and cmd[cmd.index("-ar") + 1] == "24000",
+              "downmixes to mono at the requested rate")
+        check(cmd[-1] == "/out/a.wav" and "pcm_s16le" in cmd, "writes PCM wav")
+
+        webui.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
+            returncode=1, stderr="x\nStream map '0:a:0' matches no streams.")
         try:
-            webui.load_media(fh.name)
-            raise AssertionError("expected MediaError for a .txt upload")
+            webui.ffmpeg_extract_audio("/in/silent.mp4", "/out/a.wav")
+            raise AssertionError("expected MediaError")
         except webui.MediaError as e:
-            check("Unsupported file type" in str(e), "unsupported type names the extension")
+            check("matches no streams" in str(e), f"ffmpeg stderr reaches the user: {e}")
+
+        webui.subprocess.run = real_run
+        webui.shutil.which = lambda name: None
+        try:
+            webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav")
+            raise AssertionError("expected MediaError when ffmpeg is missing")
+        except webui.MediaError as e:
+            check("ffmpeg" in str(e), "missing ffmpeg says so")
+    finally:
+        webui.subprocess.run, webui.shutil.which = real_run, real_which
+
+    # --- a video upload goes through ffmpeg, an audio upload does not ----------------
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr)) * 0.4).astype(np.float32)
+    real_extract = webui.ffmpeg_extract_audio
+    used_ffmpeg = {"called": False}
+
+    def fake_extract(src, dst, sr=24000):
+        used_ffmpeg["called"] = True
+        sf.write(dst, wav, sr)
+        return dst
+
+    try:
+        webui.ffmpeg_extract_audio = fake_extract
+        video = os.path.join(tmp, "clip.mp4")
+        open(video, "wb").write(b"fake mp4 bytes")
+        got, got_sr = webui.load_media(video)
+        check(used_ffmpeg["called"] and got_sr == 24000 and len(got) == sr,
+              "video is decoded via ffmpeg to mono float32")
+
+        used_ffmpeg["called"] = False
+        audio = os.path.join(tmp, "clip.wav")
+        sf.write(audio, wav, sr)
+        got, got_sr = webui.load_media(audio)
+        check(not used_ffmpeg["called"] and len(got) == sr, "wav is read natively, no ffmpeg")
+
+        # stereo + wrong sample rate -> mono at the target rate
+        stereo_path = os.path.join(tmp, "stereo44.wav")
+        sf.write(stereo_path, np.stack([wav, wav], axis=-1), 44100)
+        got, got_sr = webui.load_media(stereo_path)
+        expected_seconds = len(wav) / 44100.0
+        check(got_sr == 24000 and got.ndim == 1 and abs(len(got) / 24000 - expected_seconds) < 0.02,
+              f"stereo 44.1k is downmixed and resampled (got {got_sr}Hz, {len(got) / 24000:.2f}s "
+              f"vs {expected_seconds:.2f}s)")
+
+        # the ffmpeg scratch file is cleaned up out of the media dir
+        check(not [f for f in os.listdir(tmp) if f.startswith("qwen-tts-media-")],
+              "the extracted scratch wav is deleted after import")
+    finally:
+        webui.ffmpeg_extract_audio = real_extract
+
+
+def test_client_paths_are_confined_to_the_upload_dirs() -> None:
+    """Our own guard on browser-named paths (belt to Gradio's braces).
+
+    Gradio 6's preprocess_data already refuses a path no user uploaded, but the File and
+    Audio components themselves do not check `payload.path` at all — so if a future
+    Gradio loosens preprocess_data, this is the only thing standing between a client and
+    an arbitrary .wav/.mp4 read off this machine. Regression guard for that day.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
+        try:
+            # An absolute path with a legal extension, outside every allowed root.
+            for outside in ("/etc/hostname.wav", "/opt/recordings/secret.mp3",
+                            os.path.join(tempfile.gettempdir(), "elsewhere.wav")):
+                try:
+                    webui.load_media(outside)
+                    raise AssertionError(f"expected MediaError for {outside!r}")
+                except webui.MediaError as e:
+                    check("outside the upload directory" in str(e),
+                          f"refusal explains containment, not existence: {e}")
+
+            # A symlink planted inside the media dir must not escape it (realpath check).
+            wav = (np.sin(np.linspace(0, 200, 24000)) * 0.3).astype(np.float32)
+            real = os.path.join(tmp, "real.wav")
+            sf.write(real, wav, 24000)
+            link = os.path.join(tmp, "link.wav")
+            os.symlink(real, link)
+            got, got_sr = webui.load_media(link)
+            check(len(got) == 24000, "a symlink inside the media dir still loads")
+
+            escape = os.path.join(tmp, "escape.wav")
+            os.symlink("/etc/hostname", escape)
+            try:
+                webui.load_media(escape)
+                raise AssertionError("expected MediaError for a symlink escape")
+            except webui.MediaError as e:
+                check("outside the upload directory" in str(e), f"symlink escape refused: {e}")
+
+            # URLs are not paths; ffmpeg would happily fetch them.
+            try:
+                webui.load_media("http://evil.example/x.wav")
+                raise AssertionError("expected MediaError for a URL")
+            except webui.MediaError as e:
+                check("URLs are not accepted" in str(e), f"URL rejected: {e}")
+
+            # The audio path used by the reference box goes through the same guard.
+            try:
+                webui._audio_to_tuple("/opt/recordings/secret.wav")
+                raise AssertionError("expected MediaError from _audio_to_tuple")
+            except webui.MediaError as e:
+                check("outside the upload directory" in str(e), f"audio box guarded: {e}")
+
+            # Inside the media dir, both entry points work.
+            check(webui._audio_to_tuple(real)[1] == 24000, "a clip in the media dir loads")
+        finally:
+            webui.MEDIA_DIR = original_media
+
+
+def test_gradio_roundtrip_paths_are_accepted() -> None:
+    """The containment rule must not lock us out of the files Gradio writes for us.
+
+    Every (sr, wav) handed to a clip box is written into Gradio's component cache by
+    postprocess, and the browser sends that exact path back as an input on the next
+    click. If allowed_input_roots() ever stops covering it, 'Clone & generate' starts
+    refusing our own clips — a self-inflicted outage, not a security win.
+    """
+    sr = 24000
+    wav = (np.sin(np.linspace(0, 300, sr)) * 0.4).astype(np.float32)
+    box = gr.Audio(type="filepath")
+    filedata = box.postprocess((sr, wav))
+    path = getattr(filedata, "path", None) or (filedata or {}).get("path")
+    check(bool(path), "gradio wrote the clip out")
+    got, got_sr = webui._audio_to_tuple(path)
+    check(got_sr == sr and len(got) > 0, f"our own output round-trips ({got_sr}Hz, {len(got)} samples)")
+    check(os.path.realpath(str(path)) in webui.allowed_input_roots()
+          or any(os.path.realpath(str(path)).startswith(r + os.sep)
+                 for r in webui.allowed_input_roots()),
+          "gradio's component cache is an allowed input root")
+
+
+def test_prune_media() -> None:
+    import os as _os
+    import time as _time
 
     with tempfile.TemporaryDirectory() as tmp:
-        # --- ffmpeg command construction + failure reporting -------------------------
-        calls = {}
-        real_run, real_which = webui.subprocess.run, webui.shutil.which
-
-        def fake_run(cmd, **kw):
-            calls["cmd"] = list(cmd)
-            return types.SimpleNamespace(returncode=0, stderr="")
-
+        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
         try:
-            webui.subprocess.run = fake_run
-            webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav", sr=24000)
-            cmd = calls["cmd"]
-            check(cmd[0] == webui.FFMPEG_BIN, "uses the configured ffmpeg")
-            check("-vn" in cmd and "-map" in cmd, "drops the video stream and maps the first audio stream")
-            check(cmd[cmd.index("-ac") + 1] == "1" and cmd[cmd.index("-ar") + 1] == "24000",
-                  "downmixes to mono at the requested rate")
-            check(cmd[-1] == "/out/a.wav" and "pcm_s16le" in cmd, "writes PCM wav")
-
-            webui.subprocess.run = lambda cmd, **kw: types.SimpleNamespace(
-                returncode=1, stderr="x\nStream map '0:a:0' matches no streams.")
-            try:
-                webui.ffmpeg_extract_audio("/in/silent.mp4", "/out/a.wav")
-                raise AssertionError("expected MediaError")
-            except webui.MediaError as e:
-                check("matches no streams" in str(e), f"ffmpeg stderr reaches the user: {e}")
-
-            webui.subprocess.run = real_run
-            webui.shutil.which = lambda name: None
-            try:
-                webui.ffmpeg_extract_audio("/in/movie.mp4", "/out/a.wav")
-                raise AssertionError("expected MediaError when ffmpeg is missing")
-            except webui.MediaError as e:
-                check("ffmpeg" in str(e), "missing ffmpeg says so")
+            fresh = os.path.join(tmp, "fresh.wav")
+            old = os.path.join(tmp, "old.wav")
+            for path in (fresh, old):
+                sf.write(path, np.zeros(100, dtype=np.float32), 24000)
+            past = _time.time() - 7200
+            _os.utime(old, (past, past))
+            check(webui.prune_media(max_age_seconds=3600) == 1, "only the stale clip goes")
+            check(_os.path.exists(fresh) and not _os.path.exists(old), "fresh survives, stale does not")
+            check(webui.prune_media(max_age_seconds=0) == 0, "TTL 0 disables pruning")
+            webui.MEDIA_DIR = os.path.join(tmp, "does-not-exist")
+            check(webui.prune_media() == 0, "missing media dir is not an error")
         finally:
-            webui.subprocess.run, webui.shutil.which = real_run, real_which
+            webui.MEDIA_DIR = original_media
 
-        # --- a video upload goes through ffmpeg, an audio upload does not ------------
-        sr = 24000
-        wav = (np.sin(np.linspace(0, 300, sr)) * 0.4).astype(np.float32)
-        real_extract = webui.ffmpeg_extract_audio
-        used_ffmpeg = {"called": False}
-
-        def fake_extract(src, dst, sr=24000):
-            used_ffmpeg["called"] = True
-            sf.write(dst, wav, sr)
-            return dst
-
-        try:
-            webui.ffmpeg_extract_audio = fake_extract
-            video = os.path.join(tmp, "clip.mp4")
-            open(video, "wb").write(b"fake mp4 bytes")
-            got, got_sr = webui.load_media(video)
-            check(used_ffmpeg["called"] and got_sr == 24000 and len(got) == sr,
-                  "video is decoded via ffmpeg to mono float32")
-
-            used_ffmpeg["called"] = False
-            audio = os.path.join(tmp, "clip.wav")
-            sf.write(audio, wav, sr)
-            got, got_sr = webui.load_media(audio)
-            check(not used_ffmpeg["called"] and len(got) == sr, "wav is read natively, no ffmpeg")
-
-            # stereo + wrong sample rate -> mono at the target rate
-            stereo_path = os.path.join(tmp, "stereo44.wav")
-            sf.write(stereo_path, np.stack([wav, wav], axis=-1), 44100)
-            got, got_sr = webui.load_media(stereo_path)
-            expected_seconds = len(wav) / 44100.0
-            check(got_sr == 24000 and got.ndim == 1 and abs(len(got) / 24000 - expected_seconds) < 0.02,
-                  f"stereo 44.1k is downmixed and resampled (got {got_sr}Hz, {len(got) / 24000:.2f}s "
-                  f"vs {expected_seconds:.2f}s)")
-        finally:
-            webui.ffmpeg_extract_audio = real_extract
 
 
 def test_trim_window() -> None:
@@ -510,7 +667,6 @@ def test_transcriber() -> None:
 def test_media_state_is_json_serialisable() -> None:
     """gr.State round-trips through the browser as JSON — no numpy, no torch objects."""
     import json
-    import tempfile
 
     sr = 24000
     with tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +710,154 @@ def test_import_media_reports_errors() -> None:
     check("Error" in result[2], "auto-pick without media explains itself")
 
 
+def test_build_ui_constructs() -> None:
+    """The whole Blocks tree must build against the installed Gradio.
+
+    Catches the drift class that bit us once: Gradio 6 moved `css` from Blocks() to
+    launch() and dropped `show_api`, and a wrong component kwarg or a mis-wired
+    .click() input list only shows up when a human clicks. This runs in ~1s, CPU-only.
+    """
+    class StubHub:
+        def status(self) -> str:
+            return "stub"
+
+    original, webui.HUB = webui.HUB, StubHub()
+    try:
+        demo = webui.build_ui()
+    finally:
+        webui.HUB = original
+
+    check(demo is not None, "build_ui returned a Blocks instance")
+    check(len(demo.fns) >= 13, f"every button/slider is wired (found {len(demo.fns)} listeners)")
+
+    audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
+    by_label = {b.label: b for b in audios}
+    check(len(audios) == 4, f"three outputs + one reference input, found {len(audios)}")
+    for label in ("Reference clip (trimmed selection lands here)", "Generated voice"):
+        check(label in by_label, f"{label} exists")
+    # Anything we read back from the browser is filepath-typed so that we open it
+    # ourselves, after resolve_input_path; with type="numpy" Gradio opens the client's
+    # path before our code runs, so we never get a chance to check it.
+    check(by_label["Reference clip (trimmed selection lands here)"].type == "filepath",
+          "the reference box is filepath-typed so resolve_input_path can guard it")
+    check(by_label["Generated voice"].type == "filepath",
+          "the Voice Design box is filepath-typed: 'Save as voice' reads it back")
+
+
+def test_acquire_works_without_cuda() -> None:
+    """`--device cpu` used to refuse every load: the VRAM gate ran against 0MB free."""
+    import torch
+
+    class FakeTTS:
+        pass
+
+    hub = webui.ModelHub("/nonexistent", None, "sdpa", 1)
+    hub._get_cpu = lambda capability: FakeTTS()
+    hub.weight_mb = lambda capability: 4000.0
+    hub._move = lambda tts, device: None
+
+    original = webui.DEVICE
+    try:
+        webui.DEVICE = torch.device("cpu")
+        got = hub.acquire("custom_voice")
+        check(isinstance(got, FakeTTS), "cpu target returns the model")
+        check("custom_voice" in hub.on_gpu, "cpu target is tracked as resident")
+
+        if not torch.cuda.is_available():
+            # With the gate back on and no VRAM at all, it must still refuse loudly.
+            hub.on_gpu.clear()
+            webui.DEVICE = torch.device("cuda")
+            try:
+                hub.acquire("voice_design")
+                raise AssertionError("expected MemoryError with no VRAM")
+            except MemoryError as e:
+                check("VRAM" in str(e), f"cuda target still enforces the margin: {e}")
+    finally:
+        webui.DEVICE = original
+
+
+def test_default_speaker_is_offered() -> None:
+    """The preselected speaker must be one the checkpoint actually has."""
+    values = {value for _, value in webui.speaker_choices(os.path.join(webui.ROOT, "does-not-exist"))}
+    check(webui.default_speaker(os.path.join(webui.ROOT, "does-not-exist")) in values,
+          "fallback default is in the fallback list")
+    real = webui.default_speaker(webui.ROOT)
+    check(real in {value for _, value in webui.speaker_choices(webui.ROOT)},
+          "default is offered by the checkpoint (or the fallback list)")
+
+
+def test_smoke_test_skips_are_not_passes() -> None:
+    """A skipped GPU case must not report success (house rule: a skip is not a pass).
+
+    `--only media_pipeline` on a box without ffmpeg used to print SKIPPED and still exit
+    0 saying "All smoke tests passed". The GPU work is stubbed out here; only the
+    bookkeeping around it is under test.
+    """
+    import contextlib
+    import io
+    import smoke_test
+    import types
+
+    class FakeCuda:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def get_device_name(_index=0):
+            return "fake-gpu"
+
+        @staticmethod
+        def get_device_capability(_index=0):
+            return (12, 0)
+
+    real_torch, real_run_case, real_hub = smoke_test.torch, smoke_test.run_case, webui.ModelHub
+    real_argv = sys.argv
+    smoke_test.torch = types.SimpleNamespace(cuda=FakeCuda, bfloat16=object(), __version__="0.0-test")
+    smoke_test.webui.ModelHub = lambda *a, **kw: types.SimpleNamespace(lock=None, on_gpu={})
+    try:
+        last_output = [""]
+
+        def run(skip_it: bool):
+            smoke_test.SKIPPED.clear()
+            smoke_test.run_case = (lambda hub, cap, keep_gpu, use_asr=True:
+                                   smoke_test.skip(cap, "stubbed") if skip_it else None)
+            sys.argv = ["smoke_test.py", "--only", "custom_voice"]
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = smoke_test.main()
+            last_output[0] = out.getvalue()
+            return rc
+
+        check(run(skip_it=False) == 0, "a full run exits 0")
+        check(run(skip_it=True) == 1, "a skipped case exits non-zero, not 0")
+        check("SKIPPED custom_voice" in last_output[0], "and it says which case was skipped")
+
+        smoke_test.SKIPPED.clear()
+        smoke_test.run_case = lambda hub, cap, keep_gpu, use_asr=True: smoke_test.skip(cap, "stubbed")
+        sys.argv = ["smoke_test.py", "--only", "custom_voice", "--allow-skip"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            check(smoke_test.main() == 0, "--allow-skip is the explicit opt-out")
+        check(smoke_test.SKIPPED and smoke_test.SKIPPED[0][0] == "custom_voice",
+              "the skip is recorded with its case name")
+    finally:
+        smoke_test.torch, smoke_test.run_case = real_torch, real_run_case
+        smoke_test.webui.ModelHub = real_hub
+        sys.argv = real_argv
+        smoke_test.SKIPPED.clear()
+
+
+def test_setup_sh_knows_every_capability() -> None:
+    """setup.sh downloads what app.py can load; the two lists must not drift."""
+    setup = os.path.join(webui.ROOT, "setup.sh")
+    with open(setup, encoding="utf-8") as fh:
+        body = fh.read()
+    for capability, (dirname, _) in webui.CAPABILITIES.items():
+        check(dirname in body, f"setup.sh does not download the {capability} checkpoint ({dirname})")
+    check("Qwen3-TTS-Tokenizer-12Hz" in body, "setup.sh downloads the 12Hz tokenizer")
+    for needle in ("whisper-large-v3", '--exclude "*fp32*"'):
+        check(needle in body, f"setup.sh is missing {needle!r} (README documents it)")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
@@ -564,5 +868,10 @@ if __name__ == "__main__":
             except AssertionError as e:
                 failures += 1
                 print(f"FAIL {name}: {e}")
+            except Exception as e:  # noqa: BLE001 - one crashing case must not hide the rest
+                failures += 1
+                import traceback
+                print(f"ERROR {name}: {type(e).__name__}: {e}")
+                traceback.print_exc()
     print("\n", "all passed" if not failures else f"{failures} failed")
     raise SystemExit(1 if failures else 0)

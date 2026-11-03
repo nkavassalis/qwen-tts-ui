@@ -1,11 +1,19 @@
+# environment
 .venv/
+
+# downloaded artefacts (see setup.sh)
 models/
-logs/
-certs/
-__pycache__/
-*.pyc
-tests/output/
 repo/
+
+# runtime state — never commit real user audio or key material
 voices/
 tmp/
+logs/
+certs/
 .qwen-tts.lock
+.gradio/
+
+# test output
+tests/output/
+__pycache__/
+*.pyc

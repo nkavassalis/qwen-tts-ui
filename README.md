@@ -35,34 +35,49 @@ do in a text editor:
 
 ```bash
 ./run.sh                      # -> http://127.0.0.1:7860
-./run.sh --ip 0.0.0.0         # expose on the LAN
+./run.sh --ip 0.0.0.0 --username you --password '…'   # expose on the LAN, with a login
 ./run.sh --preload            # warm checkpoints into RAM at startup (bounded by --max-cpu-resident)
 ./run.sh --max-cpu-resident 1 # safest: pin only one 4.3GB copy at a time
-./run.sh --ssl-self-signed --ip 0.0.0.0   # HTTPS; needed for browser mic on non-localhost
+./run.sh --ssl-self-signed --ip 0.0.0.0 --username you --password '…'   # HTTPS; needed for browser mic on non-localhost
 ./run.sh --no-asr                # drop Whisper (frees ~3GB VRAM, disables the transcribe button)
 ./run.sh --asr-model openai/whisper-large-v3-turbo   # swap the transcription model
 ./run.sh --help                  # all flags
 ```
 
+Nothing binds beyond localhost unless you pass `--ip` or `--share`, and the server prints a
+loud warning if you do either without `--username/--password`. See
+[Exposure and safety](#exposure-and-safety) before sharing it.
+
 First request after a model switch pays ~2s of GPU upload; after that generation runs
 faster than realtime (~13s for 6s of audio, including queueing).
 
-Rebuild the environment from scratch with `./setup.sh` (creates `.venv` on Python 3.12,
-installs `torch==2.8.0+cu128`, installs the pinned upstream `qwen-tts` from `./repo`,
-downloads the checkpoints into `./models/`).
+Rebuild the environment from scratch with `./setup.sh` — it creates `.venv` on Python 3.12
+(needs [uv](https://docs.astral.sh/uv/)), installs `torch==2.8.0` + `torchaudio` from the
+**cu128** index (the wheel line that covers sm_120 / RTX 50xx), installs
+`requirements.txt`, installs upstream `qwen-tts` editable from `./repo` (which pins
+`transformers==4.57.3`), downloads the checkpoints into `./models/`, and fetches Whisper
+into the Hugging Face cache. `./setup.sh --models` re-downloads weights only, `--asr` only
+Whisper. Pin the upstream checkout with `QWEN_TTS_UPSTREAM_REF=<sha-or-tag>`.
 
 ## Layout
 
 ```
-setup.sh            reproducible env + weight download
+setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
+requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-repo/               upstream QwenLM/Qwen3-TTS checkout (installed editable)
+tests/test_app_logic.py   CPU-only unit tests (28 cases) for UI helpers and guards
+tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
+AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
+CLAUDE.md           pointer to AGENTS.md
+CHANGELOG.md        one entry per change
+LICENSE             Apache-2.0 (upstream Qwen3-TTS is Apache-2.0 too)
+repo/               upstream QwenLM/Qwen3-TTS checkout (installed editable, gitignored)
 models/             1.7B checkpoints + Qwen3-TTS-Tokenizer-12Hz (~14GB, gitignored)
 voices/             saved designed voices: <slug>.wav + <slug>.json (gitignored)
+tmp/media/          extracted reference clips, pruned after 6h (gitignored)
+certs/              self-signed HTTPS key pair (gitignored)
 .qwen-tts.lock      single-owner advisory lock (gitignored)
-tests/test_app_logic.py   CPU-only unit tests (20 cases) for UI helpers and guards
-tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 ```
 
 Beyond Python: **ffmpeg** on PATH (video ingest; checked and reported at startup) and
@@ -75,9 +90,9 @@ references mostly cost time and raise the chance of a rambling ICL run.
 
 **Whisper large-v3 via transformers, not faster-whisper.** It reuses the torch/CUDA stack
 already installed (no ctranslate2, whose kernels may not cover sm_120), transcribes a 6s
-clip in ~3s on this GPU, and only loads when the user presses the button. It is fetched
-with `--exclude "*fp32*" "*.bin" "*.msgpack"` — the repo otherwise carries 24GB of flax/fp32
-duplicates of the one 2.9GB file needed. `--asr-model` swaps it (e.g. turbo), `--no-asr`
+clip in ~3s on this GPU, and only loads when the user presses the button. `setup.sh` fetches
+it with `--exclude "*fp32*" "*.bin" "*.msgpack" "*.h5" "*.ot"` — the repo otherwise carries
+~24GB of flax/tf/fp32 duplicates of the one 2.9GB safetensors file needed. `--asr-model` swaps it (e.g. turbo), `--no-asr`
 skips it. The raw padding mask is passed explicitly, which both silences the
 pad-token-equals-eos warning and stops Whisper hallucinating over the 30s of zero padding a
 short clip gets.
@@ -88,7 +103,8 @@ actually changes the image.
 
 ## Memory safety (read this first)
 
-This box is **WSL2 with dynamic memory** (`hv_balloon` is set to essentially the host's whole RAM).
+This box is **WSL2 with dynamic memory** (`hv_balloon` is set to essentially the host's
+whole RAM).
 The VM is allowed to balloon to essentially your whole 32GB of host RAM, so over-committing
 inside WSL does not just OOM the distro — it can starve Windows and hard-lock the machine.
 That happened once: the server was started with `--preload` (three checkpoints, ~13GB) while
@@ -108,19 +124,48 @@ Rule of thumb: **one Qwen3-TTS process at a time**, and check `free -m` before r
 caps. If Windows itself feels tight, lower `--max-cpu-resident` to 1 or set a hard cap in
 `C:\\Users\\<you>\\.wslconfig` (`memory=20GB`).
 
+## Exposure and safety
+
+This is a desk tool that runs an unauthenticated model endpoint by design, so the
+boundaries are worth stating:
+
+- **It binds to 127.0.0.1 unless you say otherwise.** `--ip 0.0.0.0` and `--share` (a
+  public gradio.app tunnel) are conveniences, not defaults, and the server prints a warning
+  if you use either without `--username/--password`. That flag pair is one shared
+  credential (Gradio's `auth=`), not per-user accounts — fine for a house LAN, not for the
+  internet.
+- **Uploads and reference clips are confined to the upload directories.** Anything the
+  browser names is resolved and checked against `allowed_input_roots()` (Gradio's upload and
+  component-cache dirs plus `tmp/media/`) before it is opened, so a client cannot point the
+  app at an arbitrary `.wav`/`.mp4` on this machine. Gradio 6 checks this too; ours is the
+  second check, and the File/Audio components themselves do neither. To serve a curated
+  folder of clips, add it to `QWEN_TTS_ALLOWED_MEDIA_DIRS` (path-separator separated).
+- **Nothing is kept forever.** Extracted reference clips live in `tmp/media/` and are pruned
+  at startup and on each import once older than `QWEN_TTS_MEDIA_TTL_SECONDS` (default 6
+  hours). Saved voices in `voices/` are yours to keep — and gitignored.
+- **Nothing is logged.** Status lines echo exception text into the browser, so treat the
+  status boxes as user-visible output.
+- `certs/` holds a private key when you use `--ssl-self-signed`; it is gitignored.
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~2s, no weights needed, 20 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 28 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
+
+The CPU tier still needs the venv (`torch`, `gradio`, `qwen_tts`, `soundfile`, `librosa`,
+`PIL`) — it imports the app module — it just needs no CUDA and no weights. It also builds
+the whole Gradio UI (`test_build_ui_constructs`), which is what catches Gradio API drift
+before a human clicks it.
 
 The smoke test covers six flows: CustomVoice, VoiceDesign, Base clone, a dialect speaker
 (Dylan → Beijing dialect), the design→save→load→clone voice-library flow, and the media
 pipeline (synth speech → wrap in a real mp4 → ffmpeg import → auto-trim → Whisper → clone).
 It refuses to run while the web server holds the lock — stop the server first rather than
-using `--force`. Pass `--no-asr` to skip the Whisper step.
+using `--force`. A case that never ran (no ffmpeg, `--no-asr`) is reported as `SKIPPED` and
+exits non-zero, because a skip is not a pass; pass `--allow-skip` when the skip is intended.
 
 `smoke_test.py` writes the audio it produces to `tests/output/` and asserts each clip is
 non-silent, non-clipping and of plausible length, so a silently-broken pipeline (e.g. a
@@ -153,7 +198,7 @@ guards the regression.
 **Dialects are a speaker trait, not a language.** The checkpoint carries
 `talker_config.spk_is_dialect` (`dylan → beijing_dialect`, `eric → sichuan_dialect`) and
 upstream deliberately filters the dialect entries out of `get_supported_languages()`
-(modeling_qwen3_tts.py:1832), so passing `language="beijing_dialect"` raises
+(modeling_qwen3_tts.py:1831-1834), so passing `language="beijing_dialect"` raises
 `ValueError: Unsupported languages`. You get an accent by picking the speaker; the UI labels
 the speaker dropdown accordingly and keeps dialects out of the language dropdown. Italian *is*
 selectable — the hosted Space omits it by oversight.
@@ -186,6 +231,17 @@ reference doesn't re-encode it.
 | Clone rambles / never stops | Hit the token cap; raise repetition penalty, lower temperature, or use a cleaner reference clip |
 | `Model not found at models/...` | `./setup.sh --models` (or `.venv/bin/hf download Qwen/<name> --local-dir models/<name>`) |
 | Two people at once | Requests are queued (`default_concurrency_limit=1`); raise `--max-resident` and the queue limit only if VRAM allows |
+| `CERTIFICATE_VERIFY_FAILED` while starting with HTTPS | Pass `--ssl-self-signed` (run.sh adds it for you): Gradio's own startup self-check dials its own https port and dies on a self-signed cert unless `ssl_verify=False` |
+| `Refusing to read a media file outside the upload directory` | Something named a path the app may not open. Re-upload it through the file box; to serve a curated folder, add it to `QWEN_TTS_ALLOWED_MEDIA_DIRS` |
+| Gradio: `Cannot move … to the gradio cache dir because it was not uploaded by a user` | The same rule from Gradio's side — a path that did not come from a real upload. Not something to work around |
 
 `sox` prints a warning at import time; it is only used by the 25Hz tokenizer path, which
 none of these 12Hz models touch. Safe to ignore (or `apt install sox`).
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE). `webui/app.py` is adapted from the official
+Qwen3-TTS Hugging Face Space, and the whole thing is built on
+[QwenLM/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Apache-2.0, Alibaba Qwen). The
+model checkpoints and Whisper weights are downloaded separately under their own licenses;
+nothing here redistributes them.
