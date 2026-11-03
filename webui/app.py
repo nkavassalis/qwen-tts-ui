@@ -1,6 +1,9 @@
 # coding=utf-8
 """
-Local Qwen3-TTS Gradio WebUI.
+qwen3-tts-ui — a local Qwen3-TTS Gradio web UI.
+
+Five tabs: preset voices, design-a-voice, clone-a-voice, a one-call **Speak** endpoint for
+scripts (`scripts/say.py`), and a **Chat** tab that streams a reply sentence by sentence.
 
 Adapted from the official Hugging Face Space (Qwen/Qwen3-TTS app.py) for a single
 local GPU. Differences from the Space version:
@@ -11,6 +14,11 @@ local GPU. Differences from the Space version:
     LRU "GPU slot" moves at most `--max-resident` models onto the GPU on demand (~1-3s swap).
   * No `spaces` (Zero-GPU) dependency, no model-size dropdown, attn_implementation
     is `sdpa` (flash-attn 2 has no sm_120/Blackwell wheels; the Space uses sdpa too).
+  * Long text is split on sentence boundaries and stitched, because this checkpoint
+    accelerates past ~30-45s of audio per pass and intelligibility goes with the pace.
+
+Voice cloning is the part of this that can do harm: use it on voices you have permission to
+use. The README's *Ethical use* section spells out what that means.
 
 Run:  ./run.sh            (or)  .venv/bin/python webui/app.py --ip 127.0.0.1 --port 7860
 """
@@ -1750,7 +1758,7 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
     try:
         parsed = _audio_to_tuple(audio)
         if parsed is None:
-            return gr.update(), "Nothing to save yet — generate something in the Voice Design tab first.", gr.update()
+            return gr.update(), "Nothing to save yet — generate something on the Design a voice tab first.", gr.update()
         wav, sr = parsed
         record = save_voice(
             name=name,
@@ -2361,14 +2369,20 @@ def refresh_status():
 # UI
 # ============================================================================
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Qwen3-TTS") as demo:
+    with gr.Blocks(title="qwen3-tts-ui", theme=gr.themes.Soft(primary_hue="indigo",
+                                                              secondary_hue="slate")) as demo:
         gr.Markdown(
-            """# Qwen3-TTS — local (1.7B, 16GB Blackwell)
-**TTS (CustomVoice)**: 9 preset speakers + natural-language style instructions ·
-**Voice Design**: invent a voice from a text description ·
-**Voice Clone (Base)**: clone any voice from a ~3s reference clip.
-Models stay in CPU RAM and are swapped onto the GPU on demand; the first request
-after a model switch pays a few seconds of load time.
+            """# qwen3-tts-ui
+Text to speech that runs entirely on this machine — no cloud, no API keys, nothing leaves
+the box. Nine preset voices, voices invented from a description, and cloning from a few
+seconds of audio.
+
+**Preset voices** pick a speaker and direct them in words · **Design a voice** invents one
+from a description · **Clone a voice** works from a ~3s clip · **Speak** and **Chat** are the
+same saved voices, reachable from a script or a chat box.
+
+*Weights live in CPU RAM and move onto the GPU on demand, so the first request after you
+switch tabs pays a couple of seconds. Details in the Runtime line below.*
 """
         )
         status_bar = gr.Textbox(value=HUB.status(), label="Runtime", interactive=False, lines=1)
@@ -2397,7 +2411,7 @@ after a model switch pays a few seconds of load time.
         output_options = [s_postproc]
 
         with gr.Tabs():
-            with gr.Tab("TTS (CustomVoice)"):
+            with gr.Tab("Preset voices"):
                 with gr.Row():
                     with gr.Column(scale=2):
                         cv_text = gr.Textbox(
@@ -2420,7 +2434,7 @@ after a model switch pays a few seconds of load time.
                              inputs=[cv_text, cv_language, cv_speaker, cv_instruct] + sampling + output_options,
                              outputs=[cv_audio, cv_status])
 
-            with gr.Tab("Voice Design"):
+            with gr.Tab("Design a voice"):
                 with gr.Row():
                     with gr.Column(scale=2):
                         vd_text = gr.Textbox(
@@ -2449,12 +2463,17 @@ after a model switch pays a few seconds of load time.
                              inputs=[vd_text, vd_language, vd_instruct] + sampling + output_options,
                              outputs=[vd_audio, vd_status])
 
-            with gr.Tab("Voice Clone (Base)"):
+            with gr.Tab("Clone a voice"):
                 gr.Markdown(
                     "Clone a voice from a short clip, then make it say anything — three steps, "
                     "top to bottom. **Quality comes from the reference and its transcript**, not "
                     "from the sliders; see the README's quality section. A clean 3–10s stretch of "
                     "one speaker, with no music or reverb, clones best.")
+                gr.Markdown(
+                    "> **Use it kindly.** Clone a voice you have permission to use — your own, or "
+                    "someone else's with their consent. A cloned voice that is passed off as the "
+                    "real person is the misuse this feature makes easy, and running it locally "
+                    "does not change that. See *Ethical use* in the README.")
 
                 gr.Markdown("#### 1 · The reference — the clip the voice is taken from")
                 cl_media_state = gr.State(value=None)
@@ -2607,7 +2626,7 @@ after a model switch pays a few seconds of load time.
                                     outputs=[cl_voice, cl_voice_status, cl_ref_audio])
                 cl_refresh_btn.click(refresh_voices, outputs=[cl_voice])
 
-            with gr.Tab("Speak (assistant API)"):
+            with gr.Tab("Speak"):
                 gr.Markdown(
                     "One call: pick a saved voice, type what to say. This is also the endpoint "
                     "external tools use — `scripts/say.py --voice <slug> --text \"...\"` renders it "
@@ -2619,7 +2638,7 @@ after a model switch pays a few seconds of load time.
                     sp_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
                                            scale=4, allow_custom_value=True,
                                            info="Name or slug. Voices come from the library on the "
-                                                "Clone and Voice Design tabs.")
+                                                "Clone a voice and Design a voice tabs.")
                     sp_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
                 sp_text = gr.Textbox(
                     label="What to say", lines=3,
@@ -2643,7 +2662,7 @@ after a model switch pays a few seconds of load time.
                              inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
                              outputs=[sp_audio, sp_status])
 
-            with gr.Tab("Chat (speak as it goes)"):
+            with gr.Tab("Chat"):
                 gr.Markdown(
                     "Type what you want heard. The reply is spoken **piece by piece**: you hear the "
                     "first sentence after ~6–9s instead of waiting for the whole thing, and the log "
@@ -2673,8 +2692,12 @@ after a model switch pays a few seconds of load time.
                                outputs=[ch_log, ch_audio, ch_status])
 
         gr.Markdown(
-            "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen). "
-            "Long texts are capped at `max_new_tokens=2048`; split very long scripts into chunks."
+            "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen), "
+            "1.7B checkpoints, run offline. Long text is split on sentence boundaries and "
+            "stitched automatically, so you can paste a page and it will not rush.\n\n"
+            "**Ethical use:** clone only voices you have permission to use, never impersonate "
+            "someone to deceive or defraud them, and say so when audio is synthetic. "
+            "See *Ethical use* in the README."
         )
     return demo
 
@@ -2722,7 +2745,7 @@ def resolve_credentials(args: Any, environ: Optional[Dict[str, str]] = None,
               "Use --password-file or QWEN_TTS_PASSWORD instead.", flush=True)
         secret = args.password
     else:
-        secret = prompt(f"Qwen3-TTS password for user '{username}' (input hidden): ")
+        secret = prompt(f"qwen3-tts-ui password for user '{username}' (input hidden): ")
 
     if not secret:
         print("[webui] warning: no password could be resolved; starting UNAUTHENTICATED.", flush=True)
@@ -2733,7 +2756,7 @@ def resolve_credentials(args: Any, environ: Optional[Dict[str, str]] = None,
 def main() -> int:
     global HUB, DEVICE
 
-    parser = argparse.ArgumentParser(description="Local Qwen3-TTS Gradio demo (1.7B models).")
+    parser = argparse.ArgumentParser(description="qwen3-tts-ui — local Qwen3-TTS Gradio demo (1.7B models).")
     parser.add_argument("--models-dir", default=MODELS_DIR, help="Directory holding the Qwen3-TTS-* checkpoints.")
     parser.add_argument("--ip", default="127.0.0.1", help="Bind address (0.0.0.0 to expose on the LAN).")
     parser.add_argument("--port", type=int, default=7860)
@@ -2821,7 +2844,10 @@ def main() -> int:
 
         launch_kwargs: Dict[str, Any] = dict(
             server_name=args.ip, server_port=args.port, share=args.share, auth=auth,
-            inbrowser=False, css=".gradio-container {max-width: none !important;}",
+            inbrowser=False,
+            css=".gradio-container {max-width: 1400px !important;} "
+                ".gradio-container h1 {margin-bottom: .1em;} "
+                ".gradio-container h4 {margin-bottom: .3em; opacity: .85;}",
         )
         if args.ssl_certfile and args.ssl_keyfile:
             launch_kwargs.update(ssl_certfile=args.ssl_certfile, ssl_keyfile=args.ssl_keyfile)

@@ -2,6 +2,43 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — named qwen3-tts-ui, polished the UI, added an ethical-use statement, QA pass
+
+The header read `Qwen3-TTS — local (1.7B, 16GB Blackwell)`, which is a commit message, not a
+title. The product is **qwen3-tts-ui** and now the repo, the browser tab, the page header and
+the README H1 all say so. Tab labels went from checkpoint names to what they do — **Preset
+voices**, **Design a voice**, **Clone a voice**, **Speak**, **Chat** — with the checkpoint names
+kept in the README table where they are useful. The dev detail (1.7B, Blackwell, LRU swapping)
+moved out of the header into the Runtime line, which already carried it. Softer theme, a
+readable container width instead of full-bleed, and user-facing strings now name tabs the way
+the UI labels them.
+
+**Ethical use**, because voice cloning is the harmful-use surface and offline is not a defence:
+a README section (consent, no impersonation, label synthetic audio, the documented harms, and
+that `voices/` holds real people's voices), a note on the Clone tab itself — where you are
+about to upload someone's voice — and a pointer in the footer.
+
+The QA pass found and fixed:
+
+- **The footer told users to do something the app now does for them**: "Long texts are capped at
+  `max_new_tokens=2048`; split very long scripts into chunks" — stale since the chunker landed.
+- **AGENTS.md named a repo that no longer exists** (`nkavassalis/qwen-tts`) in two places.
+- **Six environment variables were undocumented** (`QWEN_TTS_MODELS_DIR`, `QWEN_TTS_RAM_FLOOR_MB`,
+  `QWEN_TTS_VRAM_MARGIN_MB`, `QWEN_TTS_LOCK`, `QWEN_TTS_URL`, `QWEN_TTS_USERNAME`). There is now
+  a table, and a test that fails if a `QWEN_TTS_*` knob exists without a README entry.
+- **`gradio_client` was a direct dependency of `scripts/say.py` and missing from
+  `requirements.txt`** — it only worked because Gradio pulls it transitively.
+- The README described three tabs when there are five, and `run.sh`'s own header omitted
+  `--no-asr` / `--asr-model`.
+- Three new doc-drift tests (72 CPU checks): one name everywhere, every `gr.Tab` label present
+  in the README, every env var documented, the stale footer claim cannot come back, and the
+  ethical-use language present in both the README and the Clone tab.
+
+Checked and found fine, so it is on the record: no unused top-level functions, no TODO/FIXME
+debt, `.gitignore` still covers every user-audio and key path, `--max-resident` and
+`--max-cpu-resident` are both live (GPU slot vs RAM cap), and the speaker/language counts in
+the README (9 speakers, 10 languages + Auto) match the checkpoint.
+
 ## 2026-11-03 — Chat tab: type it, hear it, starting before the reply is finished
 
 Asked whether there could be a chat-style interface with semi-real-time playback. The honest

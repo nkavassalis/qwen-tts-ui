@@ -13,6 +13,7 @@
 # environment, freeze the venv that ran the green test tiers and commit it as a lock:
 #   uv pip freeze > requirements.lock.txt
 gradio>=6.0,<7          # Blocks(css=...) moved to launch(css=...); show_api is gone
+gradio_client>=2.0      # scripts/say.py and the smoke tests talk to the server with this
 numpy>=1.26
 soundfile>=0.12         # wav read/write (libsndfile is bundled in the wheel)
 librosa>=0.10           # resampling only; setup.sh keeps ffmpeg for decoding

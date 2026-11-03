@@ -17,6 +17,9 @@ Covers the boundaries that matter for usability:
   * ModelHub.acquire — the VRAM budget only applies to a CUDA target (--device cpu).
   * setup.sh — its download list still matches CAPABILITIES.
   * smoke_test.skip() — a skipped GPU case cannot report success.
+  * docs vs code — the product name, the tab labels and the environment variables in the
+                 README are the ones the code actually has, and the ethical-use statement
+                 exists in both the README and next to the clone button.
 
 Run: .venv/bin/python tests/test_app_logic.py
 """
@@ -34,6 +37,8 @@ import soundfile as sf
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "webui"))
 import app as webui  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def check(cond: bool, msg: str) -> None:
@@ -1857,6 +1862,75 @@ def test_chat_path_shares_the_chunker_and_locks_per_chunk() -> None:
     check("autoplay=True" in demo_source, "the chat player actually plays without a click")
     check("ch_text.submit(chat_say" in demo_source,
           "Enter submits, not just the button")
+
+
+def test_product_name_is_consistent() -> None:
+    """One name, everywhere. It used to be 'Qwen3-TTS — local (1.7B, 16GB Blackwell)'."""
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+    check('title="qwen3-tts-ui"' in source, "the browser tab is titled qwen3-tts-ui")
+    check("# qwen3-tts-ui" in source, "the page header says qwen3-tts-ui")
+    check("16GB Blackwell" not in source,
+          "the header is for people, not a hardware spec sheet; the Runtime line carries that")
+
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+        readme = fh.read()
+    check(readme.startswith("# qwen3-tts-ui"), "the README opens with the same name")
+
+    with open(os.path.join(ROOT, "AGENTS.md"), encoding="utf-8") as fh:
+        agents = fh.read()
+    check("nkavassalis/qwen-tts-ui" in agents and "`nkavassalis/qwen-tts`," not in agents,
+          "AGENTS.md points at the repo that exists")
+
+
+def test_tabs_and_readme_agree() -> None:
+    """Docs drift from the UI silently; this is the cheap check that stops it."""
+    import inspect
+    import re
+
+    labels = re.findall(r'gr\.Tab\("([^"]+)"\)', inspect.getsource(webui.build_ui))
+    check(len(labels) == 5, f"five tabs are expected, found {labels}")
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+        readme = fh.read()
+    missing = [label for label in labels if label not in readme]
+    check(not missing, f"every tab label appears in the README: missing {missing}")
+
+    # The footer used to tell people to chunk their own text, which the app has done
+    # automatically since the chunker landed.
+    import app as _self  # noqa: F401 - just to be sure we are reading the live module
+    source = inspect.getsource(webui)
+    check("split very long scripts into chunks" not in source,
+          "the footer must not tell users to do what the app now does for them")
+
+
+def test_environment_variables_are_documented() -> None:
+    """Same idea as the setup.sh capability check: a knob nobody can find is a knob nobody uses."""
+    import re
+
+    found: set = set()
+    for relative in ("webui/app.py", "scripts/say.py", "run.sh", "setup.sh"):
+        with open(os.path.join(ROOT, relative), encoding="utf-8") as fh:
+            found |= set(re.findall(r"QWEN_TTS_[A-Z_]+", fh.read()))
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+        readme = fh.read()
+    undocumented = sorted(name for name in found if name not in readme)
+    check(not undocumented, f"undocumented environment variables: {undocumented}")
+
+
+def test_ethical_use_is_stated_where_it_is_needed() -> None:
+    """Cloning is the harmful-use surface; the warning belongs next to the button."""
+    import inspect
+
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
+        readme = fh.read()
+    check("## Ethical use" in readme, "the README has an ethical-use section")
+    for word in ("consent", "impersonat", "synthetic"):
+        check(word in readme.lower(), f"ethical use covers {word}")
+
+    clone_source = inspect.getsource(webui.build_ui)
+    check("permission to use" in clone_source, "the Clone tab says it before you upload a clip")
+    check("Ethical use" in clone_source, "and points at the section rather than replacing it")
 
 
 if __name__ == "__main__":

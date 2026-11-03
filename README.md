@@ -1,32 +1,36 @@
-# Qwen3-TTS — local deployment (16GB Blackwell: RTX 5070 Ti / 5080)
+# qwen3-tts-ui
 
-[Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) running fully offline on this machine,
-behind a Gradio web UI at **http://127.0.0.1:7860**.
+Text to speech that runs entirely on your own machine. Nine preset voices you can direct in
+words, voices invented from a description, and cloning from a few seconds of audio — behind a
+Gradio UI at **http://127.0.0.1:7860**, with no cloud calls, no API keys, and nothing leaving
+the box.
 
-**Target hardware is any single 16GB Blackwell card** — RTX 5070 Ti, RTX 5080, anything in
-that class. The VRAM budget, the LRU GPU slot and the memory guards are all written for
-that card class, not for one specific SKU; the 5070 Ti is simply what it is developed and
-tested on (under WSL2).
-
-Three modes, all on the **1.7B** checkpoints (the best quality tier Qwen has released —
-the 0.6B variants score noticeably worse on WER/speaker-similarity and VoiceDesign is
-1.7B-only):
+Built on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen) using the **1.7B**
+checkpoints, the best quality tier Qwen has released — the 0.6B variants score noticeably
+worse on WER/speaker-similarity, and voice design is 1.7B-only.
 
 | Tab | Checkpoint | What it does |
 |---|---|---|
-| TTS (CustomVoice) | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 preset speakers (labels show each one's native language/dialect), 10 languages, natural-language style instructions ("用愤怒的语气说", "very happy") |
-| Voice Design | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Invent a brand-new voice from a text description of timbre/age/emotion/accent |
-| Voice Clone (Base) | `Qwen3-TTS-12Hz-1.7B-Base` | Clone a voice from a ~3s reference clip (upload or microphone) |
+| **Preset voices** | `Qwen3-TTS-12Hz-1.7B-CustomVoice` | 9 speakers (labels show each one's native language/dialect), 10 languages, style instructions in plain words ("用愤怒的语气说", "very happy") |
+| **Design a voice** | `Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Invent a brand-new voice from a text description of timbre/age/emotion/accent |
+| **Clone a voice** | `Qwen3-TTS-12Hz-1.7B-Base` | Clone from a ~3s reference clip — upload (video works too) or microphone, visual trimming, Whisper transcription of the clip |
+| **Speak** | `Qwen3-TTS-12Hz-1.7B-Base` | One call: name a saved voice, type what to say. Also the endpoint `scripts/say.py` uses, so a script or a coding assistant can talk to you |
+| **Chat** | `Qwen3-TTS-12Hz-1.7B-Base` | Type it, hear it — each sentence plays as soon as it exists, instead of after the whole reply |
 
-**Voice library**: both generation tabs can save a voice, and the Voice Clone tab loads
-them back as a reusable reference — Voice Design's *Save as clone voice* keeps the clip it
-generated, Voice Clone's *Save to voice library* keeps the trimmed reference clip plus its
-transcript. Each save is `voices/<slug>.wav` + a sidecar `.json`, so a voice survives
-requests and restarts — the hosted demo cannot, since it keeps nothing between sessions.
+**Hardware:** any single 16GB Blackwell card — RTX 5070 Ti, RTX 5080, anything in that class.
+The VRAM budget, the LRU GPU slot and the memory guards are written for that card class, not
+for one specific SKU; the 5070 Ti is simply what it is developed and tested on (under WSL2).
+
+**Voice library**: the voice tabs can save a voice, and **Clone a voice** loads them back as
+a reusable reference — *Save as clone voice* keeps the clip voice design generated, *Save to
+voice library* keeps the trimmed reference clip plus its transcript, and *Save selected take*
+promotes any best-of-N candidate you preferred over the auto-pick. Each save is
+`voices/<slug>.wav` + a sidecar `.json`, so a voice survives requests and restarts — the
+hosted demo cannot, since it keeps nothing between sessions.
 Under the hood the saved clip + transcript feed `create_voice_clone_prompt`, so it clones
-with full ICL quality.
+with full ICL quality. The same library is what `scripts/say.py` speaks from.
 
-**Reference-clip workshop** (Voice Clone tab) — the three things the hosted box makes you
+**Reference-clip workshop** (**Clone a voice** tab) — the three things the hosted box makes you
 do in a text editor:
 
 - **Video uploads work.** Drop in an `.mp4`/`.mov`/`.mkv`/`.webm`/… and ffmpeg strips the
@@ -152,7 +156,7 @@ run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
 scripts/say.py      CLI for the assistant API: render text in a saved voice and play it
-tests/test_app_logic.py   CPU-only unit tests (68 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (72 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 10 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -235,9 +239,33 @@ boundaries are worth stating:
   status boxes as user-visible output.
 - `certs/` holds a private key when you use `--ssl-self-signed`; it is gitignored.
 
+## Ethical use
+
+Voice cloning is the part of this that can do harm, and running it offline does not change
+what the audio is once it leaves the machine. The checkpoints are trained to imitate a voice
+from seconds of it, which is exactly what makes impersonation easy. So, plainly:
+
+- **Clone voices you have permission to use.** Your own, or someone else's with their
+  knowledge and consent. Consent to record a clip is not consent to put words in someone's
+  mouth.
+- **Never impersonate a real person to deceive.** Passing synthetic audio off as someone's
+  genuine voice — to a family member, an employer, a bank, a court, a journalist — is where
+  this crosses from a tool into fraud, and in a growing number of places it is also a crime
+  (right of publicity, personation, wire fraud). The technology being local is not a defence.
+- **Say when audio is synthetic.** Label it in anything you publish or send. If you would not
+  show the recipient your face behind it, do not send it with their voice.
+- **No harassment, no fabrication, no vote-suppression, no sexualised deepfakes.** These are
+  the documented harms of this technology; none of them are edge cases.
+- **Saved voices are real people's voices.** `voices/` is gitignored for a reason, `tmp/media/`
+  is pruned for a reason, and if you share this box on a LAN, other people's clips are sitting
+  in folders on your machine.
+
+Nothing in this repo logs, uploads, or reports what you synthesise — which is the point of a
+local tool, and also why the judgement above is yours rather than the software's.
+
 ## Talking to it from elsewhere (assistant API)
 
-The **Speak (assistant API)** tab is one call: name a saved voice, type what to say. It is
+The **Speak** tab is one call: name a saved voice, type what to say. It is
 also what external tools hit, and `scripts/say.py` wraps it so the whole thing is a shell
 command — which is the shape a coding assistant actually wants:
 
@@ -273,7 +301,7 @@ read everything aloud is a way to make your terminal slower.
 
 ### The Chat tab, and what "real-time" means here
 
-The **Chat (speak as it goes)** tab types-and-talks: you enter text, it appears in a log and
+The **Chat** tab types-and-talks: you enter text, it appears in a log and
 is spoken aloud, and **each sentence is handed to the player the moment it exists** — you are
 listening while the rest is still being generated.
 
@@ -286,10 +314,29 @@ on a 60-word reply: **first audio at 12.6s, whole reply at 30.2s**, three pieces
 So: good for "read this to me" where you want to start hearing it now, not a conversation
 partner. The player is `autoplay=True`, so each piece starts on arrival without a click.
 
+## Environment variables
+
+Everything is optional; these are the knobs that exist, so you do not have to read the source
+to find them.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `QWEN_TTS_MODELS_DIR` | `./models` | Where the `Qwen3-TTS-12Hz-1.7B-*` checkpoints live (`--models-dir` wins) |
+| `QWEN_TTS_ASR_MODEL` | `openai/whisper-large-v3` | Whisper model for *Transcribe selected clip* |
+| `QWEN_TTS_MEDIA_TTL_SECONDS` | 6 hours | Age after which clips in `tmp/media/` are pruned |
+| `QWEN_TTS_ALLOWED_MEDIA_DIRS` | — | Extra directories the path guard accepts, path-separator separated |
+| `QWEN_TTS_RAM_FLOOR_MB` | 4096 | Refuse to load another model when available RAM drops below this |
+| `QWEN_TTS_VRAM_MARGIN_MB` | 1024 | Keep this much VRAM free for activations and the vocoder |
+| `QWEN_TTS_LOCK` | `./.qwen-tts.lock` | The single-owner lock file (see *Memory safety*) |
+| `QWEN_TTS_UPSTREAM_REF` | a pinned SHA | Which upstream commit `setup.sh` installs — move it deliberately |
+| `QWEN_TTS_PASSWORD` | — | Shared credential for `--username` (also `--password-file`) |
+| `QWEN_TTS_USERNAME` | — | Read by `scripts/say.py` for the server login |
+| `QWEN_TTS_URL` | `http://127.0.0.1:7860` | Read by `scripts/say.py` (also `--url`) |
+
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 68 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 72 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -357,7 +404,7 @@ In order of how much each one actually costs you:
    ~5s it flattens, and long references make ICL runs more likely to ramble.
 4. **Recording level does not matter.** A reference peaking at 0.1 scored 0.991 — don't
    bother normalising.
-5. **Set the language explicitly** instead of Auto, and on the CustomVoice tab pick a
+5. **Set the language explicitly** instead of Auto, and on the **Preset voices** tab pick a
    speaker whose native language matches the text (upstream's own recommendation).
 6. **Shape the text.** Prosody follows punctuation; spell out numbers; split long scripts
    into sentences, which also keeps you inside the 2048-token budget.

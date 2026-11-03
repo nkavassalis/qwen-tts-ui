@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the local Qwen3-TTS Gradio web UI.
+# Launch qwen3-tts-ui — the local Qwen3-TTS Gradio web UI.
 #
 #   ./run.sh                     -> http://127.0.0.1:7860  (localhost only)
 #   ./run.sh --ip 0.0.0.0        -> expose on the LAN (pass --username/--password!)
@@ -7,6 +7,8 @@
 #                                   startup (default 2, not all three)
 #   ./run.sh --ssl-self-signed --ip 0.0.0.0 --port 7860
 #                                -> HTTPS, needed for browser mic access on non-localhost
+#   ./run.sh --no-asr            -> skip Whisper entirely (frees ~3GB of VRAM when loaded)
+#   ./run.sh --asr-model openai/whisper-large-v3-turbo   -> swap the transcription model
 #
 # Any other flags are forwarded to webui/app.py (see --help).
 set -euo pipefail
