@@ -1951,6 +1951,43 @@ def test_ethical_use_is_stated_where_it_is_needed() -> None:
     check("Ethical use" in clone_source, "and points at the section rather than replacing it")
 
 
+def test_the_auto_pick_names_the_take_you_are_hearing() -> None:
+    """With N players hidden and one clip in the main player, 'which one is this' must be answered."""
+    import inspect
+
+    source = inspect.getsource(webui.generate_voice_clone)
+    check("kept take #" in source,
+          "the first status line names the take the main player is holding")
+    check("Auto-pick: take #" in source, "the takes note leads with the auto-pick, in bold")
+    check("the auto-pick was take #" in source,
+          "and the picker repeats it, so the override is made with the information")
+
+
+def test_a_saved_voice_reaches_every_tab() -> None:
+    """Saving worked; the Chat tab just never heard about it, so it looked broken.
+
+    The library dropdowns were per-tab, so a take kept on the Clone tab was invisible to
+    Speak and Chat until a reload. Every action that mutates the library now chains one
+    refresh over every dropdown that can speak a voice.
+    """
+    import inspect
+
+    updates = webui.voice_library_updates()
+    check(len(updates) == 4, "three dropdowns plus the machine-readable list")
+    check(all(isinstance(update, dict) and "choices" in update for update in updates[:3]),
+          "each dropdown gets its choices refreshed")
+    check(isinstance(updates[3], str), "the --list box gets the text list")
+
+    source = inspect.getsource(webui.build_ui)
+    for event in ("cl_save_evt", "cl_take_save_evt", "cl_delete_evt", "cl_refresh_evt",
+                  "vd_save_evt"):
+        check(event in source, f"{event} must exist so its save/delete can chain the refresh")
+    check("event.then(voice_library_updates, outputs=library_outputs)" in source,
+          "the refresh is chained onto every library-mutating action")
+    check("library_outputs = [cl_voice, sp_voice, ch_voice, sp_list]" in source,
+          "and it covers Clone, Speak, Chat and the API list box")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -1880,8 +1880,9 @@ def save_generated_voice(state: Any, selection: Any, name: str) -> Tuple[Any, st
         return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
     return (
         gr.update(),
-        f"Saved take #{chosen['index']} as ‘{record['name']}’ ({record['seconds']}s) — "
-        f"the model's own decode, not the post-processed copy. Pick it under Saved voices.",
+        f"Saved take #{chosen['index']} as ‘{record['name']}’ ({record['seconds']}s, "
+        f"voices/{record['slug']}.wav) — the model's own decode, not the post-processed copy. "
+        f"It is in the **Saved voices** list here and in the **Speak** and **Chat** tabs now.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -1916,6 +1917,19 @@ def delete_saved_voice(slug: str) -> Tuple[Any, str, Any]:
 
 def refresh_voices() -> Any:
     return gr.update(choices=voice_choices())
+
+
+def voice_library_updates() -> Tuple[Any, Any, Any, str]:
+    """Refresh **every** dropdown that can speak a saved voice, plus the machine-readable list.
+
+    The library dropdowns used to live and die inside the tab that owned them: keep a take on
+    the Clone tab and the Chat and Speak tabs never heard about it, so a save that worked
+    looked like a save that did nothing. One helper, wired to every action that changes the
+    library, so the tabs cannot drift apart again.
+    """
+    choices = voice_choices()
+    return (gr.update(choices=choices), gr.update(choices=choices),
+            gr.update(choices=choices), voices_available())
 
 
 def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[str, int, str]], Optional[str]]:
@@ -2218,7 +2232,11 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
 
         best = choose_best_candidate(results)
         chosen = results[best]
-        report = _report(chosen["wav"], chosen["sr"], budget, "VoiceClone")
+        kept_index = results[best]["index"]
+        # The auto-pick has to be impossible to miss: the player above shows one clip out of N
+        # and nothing else on the page said which one you were listening to.
+        report = _report(chosen["wav"], chosen["sr"], budget,
+                         f"VoiceClone · kept take #{kept_index} of {n}" if n > 1 else "VoiceClone")
         notes: List[str] = []
         if n > 1:
             def fmt(m: Dict[str, Any]) -> str:
@@ -2236,7 +2254,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
             scored_by = ("penalty = WER + Whisper confidence + waveform defects"
                          if any(m["wer"] is not None for m in results)
                          else "waveform defects (transcription off)")
-            notes.append(f"Best of {n}: kept #{results[best]['index']} ({scored_by}) — "
+            notes.append(f"**Auto-pick: take #{kept_index} of {n}** — scored by {scored_by}: "
                          + ", ".join(fmt(m) for m in results))
         else:
             flags = defect_flags(chosen.get("defects") or {})
@@ -2271,12 +2289,12 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
             takes.append(gr.update(value=None, visible=False))
         take_state = build_take_state(results, results[best]["index"], paths, target_text, language)
         pick_choices = [(t["label"], str(t["index"])) for t in take_state["takes"] if t["path"]]
-        pick_update = gr.update(choices=pick_choices,
-                                value=str(results[best]["index"]) if pick_choices else None,
-                                visible=n > 1 and len(pick_choices) > 1)
-        pick_update = gr.update(choices=pick_choices,
-                                value=str(results[best]["index"]) if pick_choices else None,
-                                visible=n > 1 and len(pick_choices) > 1)
+        pick_update = gr.update(
+            choices=pick_choices,
+            value=str(kept_index) if pick_choices else None,
+            visible=n > 1 and len(pick_choices) > 1,
+            label=f"Which take to keep — the auto-pick was take #{kept_index}; select another "
+                  f"to overrule it, then Save selected take")
         return _ok((out_sr, out_wav), status + _post_note(postproc)) + tuple(takes) + (
             gr.update(visible=n > 1), take_state, pick_update)
     except Exception as e:  # noqa: BLE001
@@ -2604,9 +2622,10 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                                     + output_options + [cl_candidates, cl_seed],
                              outputs=[cl_audio, cl_status, cl_take_1, cl_take_2, cl_take_3, cl_take_4,
                                       cl_takes_note, cl_take_state, cl_take_pick])
-                cl_take_save_btn.click(save_generated_voice,
-                                       inputs=[cl_take_state, cl_take_pick, cl_take_name],
-                                       outputs=[cl_take_name, cl_take_status, cl_voice])
+                cl_take_save_evt = cl_take_save_btn.click(
+                    save_generated_voice,
+                    inputs=[cl_take_state, cl_take_pick, cl_take_name],
+                    outputs=[cl_take_name, cl_take_status, cl_voice])
 
                 # Transcript/clip fit is a live, non-blocking check: a transcript that does not
                 # match the selection is the worst clone failure mode we measured, and it is
@@ -2633,17 +2652,18 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                                         outputs=[cl_ref_text, cl_media_status]).then(
                     clip_fit_status, inputs=fit_inputs, outputs=[cl_fit])
 
-                vd_save_btn.click(save_designed_voice,
-                                  inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
-                                  outputs=[vd_voice_name, vd_save_status, cl_voice])
-                cl_save_btn.click(save_reference_voice,
-                                  inputs=[cl_voice_name, cl_ref_audio, cl_ref_text, cl_language],
-                                  outputs=[cl_voice_name, cl_save_status, cl_voice])
+                vd_save_evt = vd_save_btn.click(
+                    save_designed_voice,
+                    inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
+                    outputs=[vd_voice_name, vd_save_status, cl_voice])
+                cl_save_evt = cl_save_btn.click(save_reference_voice,
+                                                inputs=[cl_voice_name, cl_ref_audio, cl_ref_text, cl_language],
+                                                outputs=[cl_voice_name, cl_save_status, cl_voice])
                 cl_load_btn.click(load_saved_voice, inputs=[cl_voice],
                                   outputs=[cl_ref_audio, cl_ref_text, cl_voice_status])
-                cl_delete_btn.click(delete_saved_voice, inputs=[cl_voice],
-                                    outputs=[cl_voice, cl_voice_status, cl_ref_audio])
-                cl_refresh_btn.click(refresh_voices, outputs=[cl_voice])
+                cl_delete_evt = cl_delete_btn.click(delete_saved_voice, inputs=[cl_voice],
+                                                     outputs=[cl_voice, cl_voice_status, cl_ref_audio])
+                cl_refresh_evt = cl_refresh_btn.click(refresh_voices, outputs=[cl_voice])
 
             with gr.Tab("Speak"):
                 gr.Markdown(
@@ -2675,8 +2695,6 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                     value=voices_available(),
                     info="This box is also an API output — `scripts/say.py --list` reads it, "
                          "which is how a script finds the slug to pass back.")
-                sp_refresh_btn.click(refresh_voices, outputs=[sp_voice]).then(
-                    voices_available, outputs=[sp_list])
                 sp_btn.click(speak,
                              inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
                              outputs=[sp_audio, sp_status])
@@ -2695,6 +2713,7 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                     ch_voice = gr.Dropdown(label="Voice", choices=voice_choices(), value=None,
                                            scale=2, allow_custom_value=True,
                                            info="From the voice library; name or slug.")
+                    ch_refresh_btn = gr.Button("Refresh voices", size="sm", scale=1)
                 with gr.Row():
                     ch_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
                                               value="Auto", scale=2)
@@ -2711,6 +2730,20 @@ switch tabs pays a couple of seconds. Details in the Runtime line below.*
                                outputs=[ch_log, ch_player, ch_status])
                 ch_clear.click(lambda: ([], "", "Cleared."),
                                outputs=[ch_log, ch_player, ch_status])
+
+            # Anything that changes the voice library must tell every tab that reads it. These
+            # are registered here because the Speak and Chat dropdowns do not exist yet when
+            # the Clone and Design tabs are wired. `.then()` lives on the event, not the Button.
+            library_outputs = [cl_voice, sp_voice, ch_voice, sp_list]
+            for event in (cl_save_evt, cl_take_save_evt, cl_delete_evt, cl_refresh_evt,
+                          vd_save_evt):
+                event.then(voice_library_updates, outputs=library_outputs)
+            sp_refresh_btn.click(refresh_voices, outputs=[sp_voice]).then(
+                voice_library_updates, outputs=library_outputs)
+            # The Chat tab had no way to see a voice saved elsewhere. This chain is also what
+            # keeps /voices_available a named endpoint, which `scripts/say.py --list` calls.
+            ch_refresh_btn.click(refresh_voices, outputs=[ch_voice]).then(
+                voices_available, outputs=[sp_list])
 
         gr.Markdown(
             "---\nPowered by [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen), "

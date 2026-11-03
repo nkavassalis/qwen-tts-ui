@@ -283,9 +283,10 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         took = time.time() - t0
         assert audio is not None, f"best-of-N generation failed: {status}"
         sr, wav = audio
-        assert "Best of 3" in status, f"no best-of-N report in the status:\n{status}"
+        assert "Auto-pick: take #" in status, f"no best-of-N report in the status:\n{status}"
         assert status.count("WER") >= 3, f"candidates were not scored by WER:\n{status}"
-        assert "kept #" in status, f"no winner named in the status:\n{status}"
+        assert "kept take #" in status, (
+            f"the first status line must say which take the player is holding:\n{status}")
         assert "WARNING" not in status, f"a correct transcript must not be flagged:\n{status}"
         assert sr == webui.POSTPROCESS_SR, \
             f"the listening copy should come back at {webui.POSTPROCESS_SR}Hz, got {sr}Hz"
@@ -315,6 +316,8 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
             f"the picker offers every take: {pick}"
         assert pick["value"] == str(next(t["index"] for t in state["takes"] if t["kept"])), \
             f"the picker defaults to the auto-pick: {pick['value']}"
+        assert "auto-pick" in (pick.get("label") or "").lower(), \
+            f"the picker must say which one it chose for you: {pick.get('label')}"
 
         loser = str(next(t["index"] for t in state["takes"] if not t["kept"]))
         with tempfile.TemporaryDirectory() as vdir:

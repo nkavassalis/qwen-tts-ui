@@ -39,7 +39,7 @@ scripts/say.py             CLI over the assistant API: /speak + /voices_availabl
                            through paplay/ffplay/aplay/afplay
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 72 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 74 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 10 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -67,12 +67,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 72 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 74 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 10 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 72/72 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 74/74 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -355,7 +355,7 @@ tier the hardening pass could not execute:
 
 Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunking:
 
-- **CPU tier 72/72**, **GPU tier 10/10** (adds `long_text`, `speak_api`, `chat_stream`).
+- **CPU tier 74/74**, **GPU tier 10/10** (adds `long_text`, `speak_api`, `chat_stream`).
 - **Chat streaming measured**: 60-word reply → **first audio at 12.6s**, whole reply 30.2s, 3
   pieces, 17.0s of speech, log text identical to the input.
 - **One GPU assertion was corrected, and it is on the record here because it touches the

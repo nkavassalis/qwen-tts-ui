@@ -81,7 +81,12 @@ The tab is three numbered steps, top to bottom, and they are the whole workflow.
 #### Auditioning candidates
 
 With *Candidates (best of N)* above 1 you get **one player per take**, labelled with its
-numbers, plus **Generated audio (the auto-pick)** above them. The pick ranks by a penalty:
+numbers, plus **Generated audio (the auto-pick)** above them. Which one you are hearing is
+said three times — the status line opens with `VoiceClone · kept take #2 of 3`, the takes note
+leads with **Auto-pick: take #2 of 3**, and the picker's own label repeats it — because with
+four players hidden and one clip playing, "which take is this?" was otherwise unanswered.
+
+The pick ranks by a penalty:
 
 | signal | what it catches | weight |
 |---|---|---|
@@ -156,7 +161,7 @@ run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
 scripts/say.py      CLI for the assistant API: render text in a saved voice and play it
-tests/test_app_logic.py   CPU-only unit tests (72 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (74 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 10 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -340,7 +345,7 @@ to find them.
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 72 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 74 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — the auto-pick now says which take it picked, and a saved take reaches every tab
+
+Two things Nick noticed by using it.
+
+**"Which take am I listening to?"** With N candidates, four players are hidden and one clip is
+playing, and only a buried line in the takes note answered it. The kept take is now named in
+three places: the status opens with `VoiceClone · kept take #2 of 3`, the takes note leads with
+**Auto-pick: take #2 of 3**, and the picker's label reads "the auto-pick was take #2; select
+another to overrule it". The per-player `(kept)` marker stays.
+
+**"Save selected take said it worked but nothing happened."** It had worked — `voices/myvoice.wav`
+was on disk — but the confirmation went into a text box the user had already looked away from,
+and the voice appeared only in the Clone tab's dropdown. **Speak and Chat never learned the
+library had changed**, so a voice saved on one tab was invisible on the others until a reload.
+
+- `voice_library_updates()` refreshes all three dropdowns (Clone, Speak, Chat) plus the
+  machine-readable list, and is chained with `.then()` onto every action that mutates the
+  library: save reference, save take, save designed voice, delete, refresh. (`.then()` is on
+  the *event*, not the `Button` — the first attempt raised `AttributeError` at UI build.)
+- The Chat tab gained the **Refresh voices** button it never had.
+- The confirmation now says where the file went and where to find it: `Saved take #1 as
+  'myvoice' (3.9s, voices/myvoice.wav) — … in the Saved voices list here and in the Speak and
+  Chat tabs now.`
+- The CPU tier caught a regression from this work: replacing the Refresh chain had quietly
+  un-wired `voices_available`, which is the endpoint `scripts/say.py --list` calls. The Chat
+  refresh button now owns that chain, and the endpoint test is what noticed.
+- Also removed a duplicated `pick_update = gr.update(...)` block left behind in the clone
+  callback.
+
+CPU 72 -> 74 checks (auto-pick naming, library refresh fan-out), GPU 10/10.
+
 ## 2026-11-03 — Chat audio stopped autoplaying after the first few pieces
 
 Nick hit it while testing: the first three pieces played, then the chat went silent.
