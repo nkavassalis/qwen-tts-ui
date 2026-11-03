@@ -72,16 +72,42 @@ The tab is three numbered steps, top to bottom, and they are the whole workflow.
 #### Auditioning candidates
 
 With *Candidates (best of N)* above 1 you get **one player per take**, labelled with its
-scores, plus **Generated audio (the auto-pick)** above them. The pick is
-`choose_best_candidate`: lowest Whisper WER against the text you asked for, ties broken by
-speaker similarity. Listen to them all and keep whichever you like — every player has its
-own download icon, so the scorer's choice is a suggestion, not a gate.
+numbers, plus **Generated audio (the auto-pick)** above them. The pick ranks by a penalty:
 
-What that scorer is genuinely good at, from the measurements below: rejecting a dud take
-(WER 0.133 against 0.000 on identical inputs). What it is not good at: choosing between
-takes that are all correctly pronounced — SIM spread only 0.001 there, so the tie-break is
-close to noise, and neither metric measures naturalness, prosody or emotion at all. Trust
-your ears whenever the labels read as a tie.
+| signal | what it catches | weight |
+|---|---|---|
+| **WER** — Whisper vs the text you asked for | wrong, missing or extra words | ×2.0, dominant |
+| **confidence** — Whisper's decoder log-prob of the *intended* text, given the audio | a take that is barely decodable at all | ×0.4 below −2.6 |
+| **defects** — speaking rate vs text length, edge silence, clipping | dead air, machine-gun pacing, blown peaks | capped at 0.3 |
+| **SIM** — speaker encoder vs your reference | near-identical takes | tie-break only |
+
+Listen to them all and keep whichever you like: every player has its own download icon, so
+the scorer is a suggestion, not a gate.
+
+Measured on four seeds of the same line — the pick below is reproducible with `Seed: 7`,
+`Candidates: 4`:
+
+| take | WER | conf | SIM | defect flags | penalty |
+|---|---|---|---|---|---|
+| #1 | 0.00 | −2.01 | 0.988 | 0.9s silence | 0.12 |
+| #2 | 0.00 | −1.91 | 0.988 | 0.8s silence | 0.10 |
+| #3 | 0.00 | −1.99 | 0.987 | 0.5s silence | 0.01 |
+| **#4 (kept)** | 0.00 | −2.09 | 0.985 | — | **0.00** |
+
+All four pronounce the line perfectly, so WER cannot separate them and similarity prefers
+#1. The defect term is what promotes #4 — #1 is carrying 0.9 seconds of dead air.
+
+**What confidence is, and what it is not.** It is Whisper's own decoder log-probability,
+which on this checkpoint measures about **−1.9 for a clean take**, so the threshold sits at
+−2.6: it fires on disaster, not on taste. Deliberately degraded takes read −1.87 to −2.02
+for added silence, clipping and half-speed pacing (no signal at all), and −6.3 for pure
+silence. It is scored against **the text you asked for**, never against the transcript
+Whisper produced — on a noise-degraded take, grading Whisper's own answer read −1.91 and
+missed it, while grading the intended text read −2.07 and caught it. Whisper is confident
+about whatever it decided to hear; that is self-consistency, not audio quality.
+
+And nothing here measures naturalness, prosody or emotion. When the numbers read as a tie,
+your ears are the better judge — which is exactly why the takes stay on the page.
 
 ## Quick start
 
@@ -120,7 +146,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (40 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (45 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -206,7 +232,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 40 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 45 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

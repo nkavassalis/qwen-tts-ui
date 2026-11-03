@@ -324,7 +324,8 @@ def word_error_rate(hypothesis: str, reference: str) -> float:
     return previous[-1] / float(len(ref))
 
 
-def take_label(index: int, wer: Optional[float], sim: Optional[float], kept: bool) -> str:
+def take_label(index: int, wer: Optional[float], sim: Optional[float], kept: bool,
+               confidence: Optional[float] = None, defects: Optional[Dict[str, Any]] = None) -> str:
     """Label for a candidate's player: which take it was and how it scored.
 
     The scores are shown so the automatic pick is arguable rather than mysterious — the
@@ -333,27 +334,155 @@ def take_label(index: int, wer: Optional[float], sim: Optional[float], kept: boo
     bits = []
     if wer is not None:
         bits.append(f"WER {wer:.2f}")
+    if confidence is not None:
+        bits.append(f"conf {confidence:+.2f}")
     if sim is not None:
         bits.append(f"SIM {sim:.3f}")
+    if defects:
+        flags = defect_flags(defects)
+        if flags:
+            bits.append("⚠ " + ", ".join(flags))
     return f"Take #{index}" + (f" — {' · '.join(bits)}" if bits else "") + \
            (" (kept)" if kept else "")
 
 
-def choose_best_candidate(metrics: List[Dict[str, Optional[float]]]) -> int:
-    """Index of the best candidate: content fidelity first, then speaker similarity.
+# ---------------------------------------------------------------------------
+# Candidate scoring
+# ---------------------------------------------------------------------------
+# WER alone was a weak judge: it is a hard 0/1 per word, so a take that mumbles and a take
+# that is merely slightly wrong score the same, and it says nothing about a clip that is
+# half silence or full of clipped peaks. Two additions, both cheap and offline:
+#
+#   * Whisper's own sequence log-probability (`confidence`). Where WER is a guess about
+#     discrete words, confidence is a graded answer about the whole audio: garble, doubled
+#     words and hallucinated tails all push it down well before WER notices.
+#   * A defect report off the waveform: speaking rate against the text length, leading and
+#     trailing silence, and clipping. These are the ways a take is "wrong" in a way no
+#     transcript-based metric can see.
+#
+# The weights below are heuristics on a common scale, not a trained model: WER and
+# confidence are the signals with evidence behind them (see README), the defect penalties
+# are deliberately small so a slightly long tail of silence cannot outvote a take that says
+# the words wrong.
 
-    WER is the tie-breaker that matters — a candidate that says the wrong words is worse
-    no matter how close its timbre is. When ASR is disabled every WER is None and ranking
-    falls back to similarity alone.
+CONF_GOOD = -2.60          # mean decoder log-prob considered clean; below this it is penalised
+WER_WEIGHT = 2.0           # content dominates: no defect or confidence gap outranks it
+CONF_WEIGHT = 0.4          # a full log-prob below the line costs less than 20% wrong words
+DEFECT_CAP = 0.3           # defects alone cannot outrank a take that says the words wrong
+RATE_RATIO_LOW, RATE_RATIO_HIGH = 0.6, 1.8   # plausible band around WORDS_PER_SECOND
+SILENCE_RMS = 0.005        # 20ms window RMS below this counts as silence
+SILENCE_BUDGET = 0.5       # seconds of lead+tail silence tolerated before a penalty
+CLIP_FRACTION = 0.001      # share of samples at full scale before it counts as clipping
+
+
+def _rms_windows(wav: np.ndarray, sr: int, window: int) -> np.ndarray:
+    if wav.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    frames = max(1, wav.size // window)
+    padded = np.pad(wav, (0, frames * window - wav.size))
+    return np.sqrt(np.mean(padded.reshape(frames, window).astype(np.float64) ** 2, axis=1))
+
+
+def defect_report(wav: np.ndarray, sr: int, text: str) -> Dict[str, Any]:
+    """Waveform-level defects, plus the penalty they contribute to ranking.
+
+    Pure and CPU-only on purpose: these are the checks that must keep working when Whisper
+    is disabled, and they cost microseconds rather than a GPU pass.
+    """
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    sr = int(sr) or 1
+    seconds = wav.size / float(sr)
+    report: Dict[str, Any] = {"seconds": round(seconds, 3), "rate": 0.0, "rate_ratio": 0.0,
+                              "lead_silence": 0.0, "tail_silence": 0.0,
+                              "clipped_fraction": 0.0, "penalty": 0.0}
+    if wav.size == 0:
+        report["penalty"] = 1.0
+        return report
+
+    words, cjk = speech_units(text)
+    if words or cjk:
+        expected = (WORDS_PER_SECOND if not cjk or words / max(1, words + cjk) > 0.5
+                    else CHARS_PER_SECOND)
+        rate = (words + cjk) / max(seconds, 1e-6)
+        report["rate"] = round(rate, 2)
+        report["rate_ratio"] = round(rate / expected, 2)
+
+    window = max(1, int(0.02 * sr))
+    rms = _rms_windows(wav, sr, window)
+    if rms.size:
+        loud = rms >= SILENCE_RMS
+        lead = int(np.argmax(loud)) if loud.any() else int(rms.size)
+        tail = int(np.argmax(loud[::-1])) if loud.any() else int(rms.size)
+        report["lead_silence"] = round(lead * window / float(sr), 3)
+        report["tail_silence"] = round(tail * window / float(sr), 3)
+
+    report["clipped_fraction"] = round(float(np.mean(np.abs(wav) >= 0.999)), 5)
+
+    penalty = 0.0
+    if report["rate_ratio"]:
+        ratio = report["rate_ratio"]
+        if ratio < RATE_RATIO_LOW:
+            penalty += min(0.5, (RATE_RATIO_LOW - ratio) * 0.6)
+        elif ratio > RATE_RATIO_HIGH:
+            penalty += min(0.5, (ratio - RATE_RATIO_HIGH) * 0.4)
+    excess = (report["lead_silence"] + report["tail_silence"]) - SILENCE_BUDGET
+    if excess > 0:
+        penalty += min(0.3, excess * 0.3)
+    if report["clipped_fraction"] > CLIP_FRACTION:
+        penalty += 0.4 if report["clipped_fraction"] > 0.01 else 0.2
+    report["penalty"] = round(penalty, 3)
+    return report
+
+
+def defect_flags(report: Dict[str, Any]) -> List[str]:
+    """Human-readable version of the defects, for the player labels and the status line."""
+    flags = []
+    if report.get("rate_ratio") and (report["rate_ratio"] < RATE_RATIO_LOW
+                                     or report["rate_ratio"] > RATE_RATIO_HIGH):
+        flags.append(f"rate {report['rate_ratio']:.2f}x")
+    if report.get("lead_silence", 0) + report.get("tail_silence", 0) > SILENCE_BUDGET:
+        flags.append(f"{report['lead_silence'] + report['tail_silence']:.1f}s silence")
+    if report.get("clipped_fraction", 0) > CLIP_FRACTION:
+        flags.append("clipping")
+    return flags
+
+
+def candidate_penalty(wer: Optional[float], confidence: Optional[float],
+                      defects: Optional[Dict[str, Any]]) -> float:
+    """One number per candidate, lower is better. Missing signals cost nothing.
+
+    The weights encode one rule: **saying the words wrong is the worst thing a take can
+    do**. WER carries weight 2, so a 20%-wrong take still loses to a take that is quiet,
+    slightly silent at the edges and only mildly unintelligible. Confidence and defects
+    exist to separate takes whose WER is a tie — which, measured, is most of them.
+    """
+    penalty = 0.0
+    if wer is not None:
+        penalty += WER_WEIGHT * float(wer)
+    if confidence is not None and confidence < CONF_GOOD:
+        penalty += CONF_WEIGHT * (CONF_GOOD - float(confidence))
+    if defects:
+        penalty += min(DEFECT_CAP, float(defects.get("penalty", 0.0)))
+    return round(penalty, 4)
+
+
+def choose_best_candidate(metrics: List[Dict[str, Optional[float]]]) -> int:
+    """Index of the best candidate: lowest penalty, then closest voice, then order.
+
+    Similarity is only a tie-breaker, and only a narrow one — measured across seeds it
+    varies by ~0.001, so it decides near-identical takes and nothing else. A candidate
+    whose content is wrong must never win on timbre.
     """
     if not metrics:
         raise ValueError("no candidates to choose from")
 
-    def key(item: Tuple[int, Dict[str, Optional[float]]]):
+    def key(item: Tuple[int, Dict[str, Any]]):
         index, m = item
-        wer = m.get("wer")
+        penalty = m.get("penalty")
+        if penalty is None:
+            penalty = candidate_penalty(m.get("wer"), m.get("confidence"), m.get("defects"))
         sim = m.get("sim")
-        return (float("inf") if wer is None else round(float(wer), 3),
+        return (round(float(penalty), 2),
                 -(float("inf") if sim is None else float(sim)), index)
 
     return min(enumerate(metrics), key=key)[0]
@@ -978,6 +1107,34 @@ def render_waveform(wav: np.ndarray, sr: int, start: Optional[float] = None,
 # ============================================================================
 # Transcription of the reference clip (the ICL clone needs a matching transcript)
 # ============================================================================
+def _mean_token_logprob(logits: torch.Tensor, token_ids: List[int],
+                        offset: int = 0) -> Optional[float]:
+    """Average log-probability the decoder assigned to the tokens it was asked to produce.
+
+    `offset` is the length of the decoder prefix that was fed in but is not being scored
+    (Whisper's start/language/task/timestamp tokens): logits at position t predict token
+    t+1 of the *fed* sequence, so the first scoreable token sits at `offset`, not 0.
+    Getting that wrong is silent and catastrophic — measured, the same clean clip reads
+    -13.5 (worse than uniform) with the offset missing and near -0.2 with it.
+
+    Kept separate from the forward pass so the arithmetic is testable without weights:
+    a confident decoder gives ~0, a uniform one gives log(1/vocab) ≈ -10.8 for Whisper's
+    51,865-token vocabulary.
+    """
+    if logits is None or not token_ids:
+        return None
+    try:
+        step_logits = logits[0]
+        if step_logits.shape[0] < offset + len(token_ids):
+            return None
+        index = torch.tensor(list(token_ids), device=step_logits.device).unsqueeze(1)
+        window = step_logits[offset:offset + len(token_ids)].float()
+        log_probs = torch.log_softmax(window, dim=-1)
+        return round(float(log_probs.gather(1, index).mean()), 4)
+    except Exception:  # noqa: BLE001 - a scoring signal must never break a transcription
+        return None
+
+
 class Transcriber:
     """Lazy Whisper wrapper, loaded only when the user actually asks for a transcript.
 
@@ -1024,35 +1181,120 @@ class Transcriber:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _confidence(self, features: Any, padding_mask: np.ndarray, text: str,
+                    ids: Any = None) -> Optional[float]:
+        """How sure Whisper was about the transcript it just produced.
+
+        A second, teacher-forced forward pass over the *returned* text rather than a read
+        of the beam-search bookkeeping: `output_scores` is dropped somewhere inside
+        Whisper's own generation-config juggling (it is only forced on for token timestamps
+        and `logprob_threshold`), and the beam path would have to be reconstructed from
+        `beam_indices` anyway. One forward pass is cheap, exact, and does not depend on
+        which decoding strategy produced the text.
+
+        The forced decoder prefix (start-of-transcript, language, task, no-timestamps) is
+        reused from the sequence `generate` returned. Scoring the text without it asks the
+        decoder a different question — measured, the same clean clip reads -3.06 with no
+        prefix and near -0.3 with it, which would make the whole signal meaningless.
+
+        The value is a per-token mean, so it is comparable across clip lengths: roughly
+        above -0.35 is clean audio, below about -0.8 means the decoder was guessing.
+        """
+        try:
+            if not text:
+                return None
+            encoded = self.tokenizer(text, return_tensors="pt").input_ids.to(self.device)
+            if encoded.numel() == 0:
+                return None
+            prefix = None
+            if ids is not None and ids.shape[1] >= 4:
+                prefix = ids[0][:4].to(self.device).unsqueeze(0)  # start, language, task, timestamps
+            if prefix is None:
+                start = int(self.model.config.decoder_start_token_id)
+                prefix = torch.full((1, 1), start, dtype=torch.long, device=self.device)
+            shifted = torch.cat([prefix, encoded[:, :-1]], dim=1)
+            with torch.inference_mode():
+                out = self.model(
+                    input_features=features,
+                    attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
+                    decoder_input_ids=shifted)
+            # logits[t] predicts fed[t+1], and fed = prefix + text[:-1]: the first scoreable
+            # token therefore lines up with logits[prefix_len - 1], not logits[prefix_len].
+            return _mean_token_logprob(getattr(out, "logits", None), encoded[0].tolist(),
+                                       offset=max(0, int(prefix.shape[1]) - 1))
+        except Exception:  # noqa: BLE001 - confidence is a bonus, never a failure
+            return None
+
     def transcribe(self, wav: np.ndarray, sr: int, language: Optional[str] = None) -> str:
+        return self.transcribe_with_confidence(wav, sr, language)[0]
+
+    def score_transcript(self, wav: np.ndarray, sr: int, text: str,
+                         language: Optional[str] = None) -> Optional[float]:
+        """How well Whisper thinks this audio matches `text` — independent of what it heard.
+
+        Used to rank candidates, which is why it scores the text we *asked for* rather than
+        Whisper's own transcript: measured on a noise-degraded take, scoring the transcript
+        it produced read -1.911 (no worse than clean) while scoring the intended text read
+        -2.067. Whisper is confidently consistent about whatever it decided to hear, so
+        grading it against its own answer measures self-consistency, not audio.
+        """
+        if not wav.size or not (text or "").strip():
+            return None
+        with self.lock:
+            self.load()
+            features, padding_mask = self._features(wav, sr)
+            with torch.inference_mode():
+                out = self.model.generate(
+                    features,
+                    attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
+                    language=ASR_LANGUAGE_CODES.get((language or "").strip().lower()),
+                    task="transcribe", num_beams=4, no_repeat_ngram_size=4,
+                    return_dict_in_generate=True)
+            ids = getattr(out, "sequences", out)
+            return self._confidence(features, padding_mask, text, ids)
+
+    def _features(self, wav: np.ndarray, sr: int) -> Tuple[Any, np.ndarray]:
+        """Mel features plus the padding mask, resampled to Whisper's 16kHz."""
+        import librosa
+        if int(sr) != 16000:
+            wav = librosa.resample(y=np.asarray(wav, dtype=np.float32), orig_sr=int(sr), target_sr=16000)
+            sr = 16000
+        features = self.feature_extractor(
+            np.asarray(wav, dtype=np.float32), sampling_rate=int(sr), return_tensors="pt"
+        ).input_features.to(self.device, self.dtype)
+        # Whisper pads every clip to 30s; without an explicit padding mask it cannot
+        # tell silence from audio (and warns, since pad == eos for this checkpoint).
+        max_samples = self.feature_extractor.nb_max_frames * 160  # 30s at 16kHz
+        padding_mask = np.zeros(max_samples, dtype=np.int64)
+        padding_mask[:min(len(wav), max_samples)] = 1
+        return features, padding_mask
+
+    def transcribe_with_confidence(self, wav: np.ndarray, sr: int,
+                                   language: Optional[str] = None) -> Tuple[str, Optional[float]]:
+        """Transcribe, and also return Whisper's length-normalised sequence log-probability.
+
+        That number is the more graded of the two signals: WER counts discrete word errors,
+        while confidence falls on mumble, doubled words and hallucinated tails even when the
+        edit distance stays at zero. None when the decoder did not report it.
+        """
         if not wav.size:
             raise MediaError("Nothing to transcribe — pick a non-empty clip.")
         code = ASR_LANGUAGE_CODES.get((language or "").strip().lower())
         with self.lock:
             self.load()
-            import librosa
-            if int(sr) != 16000:
-                wav = librosa.resample(y=np.asarray(wav, dtype=np.float32), orig_sr=int(sr), target_sr=16000)
-                sr = 16000
-            features = self.feature_extractor(
-                np.asarray(wav, dtype=np.float32), sampling_rate=int(sr), return_tensors="pt"
-            ).input_features.to(self.device, self.dtype)
-            # Whisper pads every clip to 30s; without an explicit padding mask it cannot
-            # tell silence from audio (and warns, since pad == eos for this checkpoint).
-            max_samples = self.feature_extractor.nb_max_frames * 160  # 30s at 16kHz
-            raw_length = min(len(wav), max_samples)
-            padding_mask = np.zeros(max_samples, dtype=np.int64)
-            padding_mask[:raw_length] = 1
+            features, padding_mask = self._features(wav, sr)
             with torch.inference_mode():
-                ids = self.model.generate(
+                out = self.model.generate(
                     features,
                     attention_mask=torch.from_numpy(padding_mask).unsqueeze(0).to(self.device),
                     language=code, task="transcribe",
-                    num_beams=4, no_repeat_ngram_size=4)
+                    num_beams=4, no_repeat_ngram_size=4, return_dict_in_generate=True)
+            ids = getattr(out, "sequences", out)
             text = self.tokenizer.decode(ids[0], skip_special_tokens=True).strip()
+            confidence = self._confidence(features, padding_mask, text, ids)
         if not text:
             raise MediaError("Transcription came back empty — the clip may be music or silence.")
-        return text
+        return text, confidence
 
 
 ASR: Optional[Transcriber] = None
@@ -1357,7 +1599,10 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                     **_sampling(temperature, top_p, top_k, rep_penalty),
                 )
                 wav = wavs[0]
-                sim = wer = None
+                sim = wer = confidence = None
+                # Defects are measured whether or not Whisper is available: they are the
+                # signals that survive a disabled ASR, and they cost microseconds.
+                defects = defect_report(wav, sr, target_text)
                 if ref_embedding is not None:
                     try:
                         cand = tts.model.extract_speaker_embedding(
@@ -1367,10 +1612,18 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                         sim = None
                 if n > 1 and ASR is not None and ASR.enabled:
                     try:
-                        wer = word_error_rate(ASR.transcribe(wav, sr, asr_language), target_text)
+                        hypothesis, _ = ASR.transcribe_with_confidence(wav, sr, asr_language)
+                        wer = word_error_rate(hypothesis, target_text)
+                        # Graded companion to WER, scored against the intended text: it can
+                        # see a mumble that Whisper still transcribed perfectly.
+                        confidence = ASR.score_transcript(wav, sr, target_text, asr_language)
                     except Exception:  # noqa: BLE001 - scoring must not sink the generation
-                        wer = None
-                results.append({"index": i + 1, "wav": wav, "sr": int(sr), "sim": sim, "wer": wer})
+                        wer = confidence = None
+                metrics: Dict[str, Any] = {"index": i + 1, "wav": wav, "sr": int(sr),
+                                            "sim": sim, "wer": wer, "confidence": confidence,
+                                            "defects": defects}
+                metrics["penalty"] = candidate_penalty(wer, confidence, defects)
+                results.append(metrics)
 
         best = choose_best_candidate(results)
         chosen = results[best]
@@ -1378,17 +1631,27 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
         notes: List[str] = []
         if n > 1:
             def fmt(m: Dict[str, Any]) -> str:
-                bits = []
+                bits = [f"pen {m['penalty']:.2f}"]
                 if m["wer"] is not None:
                     bits.append(f"WER {m['wer']:.2f}")
+                if m["confidence"] is not None:
+                    bits.append(f"conf {m['confidence']:+.2f}")
                 if m["sim"] is not None:
                     bits.append(f"SIM {m['sim']:.3f}")
+                flags = defect_flags(m.get("defects") or {})
+                if flags:
+                    bits.append("⚠ " + ", ".join(flags))
                 return f"#{m['index']} " + " ".join(bits)
-            scored_by = ("Whisper WER + speaker similarity"
+            scored_by = ("penalty = WER + Whisper confidence + waveform defects"
                          if any(m["wer"] is not None for m in results)
-                         else "speaker similarity (transcription off)")
+                         else "waveform defects (transcription off)")
             notes.append(f"Best of {n}: kept #{results[best]['index']} ({scored_by}) — "
                          + ", ".join(fmt(m) for m in results))
+        else:
+            flags = defect_flags(chosen.get("defects") or {})
+            if flags:
+                notes.append("Take flags: " + ", ".join(flags) +
+                             " — the clip is worth a listen before you keep it")
         if fit:
             notes.append("WARNING: " + fit)
         status = report + (("\n" + "\n".join(notes)) if notes else "")
@@ -1401,7 +1664,8 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 take_wav, take_sr = postprocess_output(item["wav"], item["sr"], postproc)
                 takes.append(gr.update(value=(take_sr, take_wav), visible=True,
                                        label=take_label(item["index"], item["wer"], item["sim"],
-                                                        item["index"] == results[best]["index"])))
+                                                        item["index"] == results[best]["index"],
+                                                        item.get("confidence"), item.get("defects"))))
             else:
                 takes.append(gr.update(value=None, visible=False))
         while len(takes) < MAX_CANDIDATES:
@@ -1673,10 +1937,12 @@ after a model switch pays a few seconds of load time.
                     cl_take_4 = gr.Audio(label="Take #4", type="numpy", visible=False)
                 cl_takes_note = gr.Markdown(
                     visible=False,
-                    value="*Candidates (best of N)*: **Generated audio** above is the auto-pick "
-                          "(best Whisper WER, then speaker similarity). Every take is left below so "
-                          "you can listen and overrule it — each has its own download icon, so the "
-                          "one you keep does not have to be the one the scorer preferred.")
+                    value="*Candidates (best of N)*: **Generated audio** above is the auto-pick, "
+                          "ranked by a penalty = Whisper WER + Whisper confidence + waveform "
+                          "defects (speaking rate, edge silence, clipping). Every take is left "
+                          "below with its numbers, and each has its own download icon — the "
+                          "scorer is a first opinion, not a gate. Trust your ears when the "
+                          "numbers look like a tie.")
 
                 gr.Markdown("#### 3 · Keep it — the voice library")
                 gr.Markdown(

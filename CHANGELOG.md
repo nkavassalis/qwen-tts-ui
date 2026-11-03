@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — candidate scoring gets two more signals, both calibrated by measurement
+
+WER alone was a weak judge: a hard 0/1 per word, blind to a take that is half dead air and
+indifferent between four takes that all say the words right.
+
+- **Waveform defects** (`defect_report`, CPU-only so it survives `--no-asr`): speaking rate
+  against text length (CJK counted per character), leading/trailing silence, clipping.
+  Capped at 0.3 so they can never outrank content. On the measured four-seed run this is
+  what changed the pick: all four takes score WER 0.00 and similarity prefers #1, but #1
+  carries 0.9s of dead air, so #4 is kept.
+- **Whisper decoder confidence** (`Transcriber.score_transcript`): mean log-probability of
+  the *intended* text given the candidate audio, from a teacher-forced forward pass.
+- Ranking is now `candidate_penalty` = WER ×2.0 + confidence ×0.4 (only below -2.60) +
+  defects (≤0.3), with similarity as a tie-break. The players and the status line show every
+  number, and the winner is marked `(kept)`.
+- Three findings that only measuring could give, all in the README:
+  * confidence reads **~-1.9 on a clean take**, so the guessed threshold of -0.35 would
+    have penalised every candidate and swamped WER. It is a disaster detector (pure silence
+    -6.3), not a quality meter: tail silence, clipping and half-speed pacing move it <0.15.
+  * scoring Whisper's own transcript instead of the requested text **misses** degradation —
+    on a noisy take: -1.91 (missed) vs -2.07 (caught). That is self-consistency, not audio.
+  * an off-by-`prefix_len` in the log-prob gather reads **-13.5, worse than uniform**, and
+    raises nothing. Now pinned by `test_mean_token_logprob_alignment`, since the GPU tier
+    cannot tell a plausible-looking wrong number from a right one.
+- Also: `output_scores` is silently dropped by Whisper's generation-config handling (only
+  `logprob_threshold` / token timestamps force it) and `sequences_scores` is None — hence
+  the second forward pass.
+- Tests: CPU tier 40 -> 45 (defect report, penalty ordering and caps, log-prob alignment,
+  take labels with confidence/defects). GPU tier unchanged at 7/7, still asserting three
+  labelled visible takes with exactly one `(kept)`.
+
 ## 2026-11-03 — Clone tab reads as three steps; every candidate is auditionable
 
 Two usability problems, both real: *Save this reference as a voice* sat between the

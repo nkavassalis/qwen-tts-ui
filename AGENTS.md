@@ -30,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 40 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 45 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 40 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 45 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 40/40 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 45/45 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,27 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **Candidate ranking is a penalty, calibrated by measurement, not by taste**
+  (`candidate_penalty`). WER ×2.0 dominates; Whisper decoder confidence ×0.4 but only below
+  `CONF_GOOD = -2.60`; waveform defects capped at 0.3; SIM is a tie-break only. Three things
+  learned the hard way, all measured on the real checkpoint:
+  * **Confidence reads ~-1.9 on a clean take**, not near zero. The first guess of -0.35
+    would have penalised *every* candidate ~0.6 and swamped WER. Pure silence reads -6.3;
+    added tail silence, clipping and half-speed pacing move it by <0.15, so it is a
+    disaster detector, not a quality meter. Do not tune `CONF_GOOD` upward toward zero.
+  * **Score the text we asked for** (`Transcriber.score_transcript`), never Whisper's own
+    transcript: on a noise-degraded take, grading the returned transcript read -1.91 and
+    missed it, grading the intended text read -2.07 and caught it. Whisper is confident
+    about whatever it decided to hear.
+  * **`_mean_token_logprob`'s `offset` is `prefix_len - 1`** — `logits[t]` predicts
+    `fed[t+1]`, and the fed sequence carries Whisper's forced start/language/task/timestamp
+    prefix. One token off reads -13.5 (worse than uniform) with no error raised.
+    `test_mean_token_logprob_alignment` pins it; the GPU tier cannot, because it looks
+    plausible either way.
+  Confidence comes from a second teacher-forced forward pass, not from beam bookkeeping:
+  `output_scores` is silently dropped by Whisper's own generation-config juggling (only
+  `logprob_threshold`/`return_token_timestamps` force it on) and `sequences_scores` comes
+  back None.
 - **The clone tab is three numbered steps, and the order is load-bearing.** Reference →
   what it should say → keep it. Save used to sit between the reference and the synthesis
   controls, which made people look for it in the wrong place and misread *Target text* as

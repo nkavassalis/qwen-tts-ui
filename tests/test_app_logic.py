@@ -1234,6 +1234,133 @@ def test_take_labels_explain_the_pick() -> None:
           "a missing WER (transcription off) is omitted too")
 
 
+def test_defect_report() -> None:
+    """The waveform-level half of the scorer: things no transcript can tell you."""
+    sr = 24000
+    speech = " ".join(f"word{i}" for i in range(15))          # 15 words ~ 6s at 2.5 w/s
+
+    def tone(seconds, amp=0.25, freq=180):
+        t = np.arange(int(seconds * sr)) / sr
+        return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+    good = webui.defect_report(tone(6.0), sr, speech)
+    check(good["penalty"] == 0.0, f"a normal take is not penalised: {good}")
+    check(webui.defect_flags(good) == [], "and raises no flags")
+    check(abs(good["rate_ratio"] - 1.0) < 0.25, f"rate reads ~1x for a natural clip: {good}")
+
+    padded = np.concatenate([np.zeros(int(0.8 * sr), dtype=np.float32), tone(4.0),
+                             np.zeros(int(0.8 * sr), dtype=np.float32)]).astype(np.float32)
+    silent = webui.defect_report(padded, sr, speech)
+    check(silent["lead_silence"] > 0.6 and silent["tail_silence"] > 0.6,
+          f"edge silence is measured: {silent}")
+    check(any("silence" in f for f in webui.defect_flags(silent)), f"and flagged: {silent}")
+    check(silent["penalty"] > 0, "silence costs penalty")
+
+    hot = (np.sign(tone(6.0)) * 0.9999).astype(np.float32)   # hard clipped
+    clipped = webui.defect_report(hot, sr, speech)
+    check(clipped["clipped_fraction"] > webui.CLIP_FRACTION, f"clipping measured: {clipped}")
+    check("clipping" in webui.defect_flags(clipped), "and flagged")
+    check(clipped["penalty"] >= 0.2, "and penalised")
+
+    slow = webui.defect_report(tone(12.0), sr, "two slow words")
+    check("rate" in " ".join(webui.defect_flags(slow)), f"a crawl is flagged: {slow}")
+    fast = webui.defect_report(tone(2.0), sr, " ".join(f"w{i}" for i in range(30)))
+    check("rate" in " ".join(webui.defect_flags(fast)), f"machine-gun is flagged: {fast}")
+    check(slow["penalty"] > 0 and fast["penalty"] > 0, "both cost penalty")
+
+    empty = webui.defect_report(np.zeros(0, dtype=np.float32), sr, speech)
+    check(empty["penalty"] == 1.0, "an empty take is the worst possible score")
+
+    # CJK is counted per character, or every Chinese take would read as 'too slow'.
+    chinese = "我" * 20
+    zh = webui.defect_report(tone(5.0), sr, chinese)
+    check(zh["penalty"] == 0.0, f"20 characters in 5s reads as a normal rate: {zh}")
+
+
+def test_candidate_penalty() -> None:
+    """Content still beats everything; confidence and defects only break near-ties."""
+    pen = webui.candidate_penalty
+    check(pen(0.0, -0.10, {"penalty": 0.0}) == 0.0, "a clean take costs nothing")
+    check(pen(0.4, -2.00, {"penalty": 0.0}) > pen(0.0, -3.5, {"penalty": 0.3}),
+          "saying the words wrong outweighs a struggling decoder plus defects")
+    check(pen(0.0, -2.00, {"penalty": 0.0}) < pen(0.0, -3.50, {"penalty": 0.0}),
+          "a struggling decoder separates two takes with identical WER")
+    check(pen(None, None, None) == 0.0, "no signals at all costs nothing (ASR off)")
+    check(pen(0.0, -2.00, {"penalty": 5.0}) == webui.DEFECT_CAP,
+          "defects are capped so they can never outvote content")
+    check(pen(0.0, webui.CONF_GOOD, None) == 0.0, "confidence exactly at the good line is free")
+    check(pen(0.0, webui.CONF_GOOD - 0.4, None) > 0.1, "below the line it is penalised")
+    check(pen(0.0, -1.9, None) == 0.0,
+          "the measured level of a clean take (-1.9) must cost nothing")
+    check(pen(0.0, -6.3, None) > 1.0,
+          "the measured level of pure silence (-6.3) must dominate every other signal")
+    check(pen(0.2, None, None) > pen(0.0, None, {"penalty": 0.4}),
+          "10% wrong words outweighs a fistful of defect flags")
+    check(pen(0.02, None, None) < pen(0.0, -4.0, None),
+          "a take that is barely decodable can lose over one trivial word error")
+
+
+def test_choose_best_candidate_uses_the_penalty() -> None:
+    metrics = [{"wer": 0.0, "sim": 0.95, "penalty": 0.6},
+               {"wer": 0.1, "sim": 0.95, "penalty": 0.1}]
+    check(webui.choose_best_candidate(metrics) == 1,
+          "a zero-WER take riddled with defects loses to a slightly wrong clean one")
+    check(webui.choose_best_candidate([{"wer": 0.05, "sim": 0.99},
+                                       {"wer": 0.05, "sim": 0.99}]) == 0,
+          "perfectly equal candidates resolve to the first, deterministically")
+    check(webui.choose_best_candidate([{"wer": 0.0, "sim": 0.9, "penalty": 0.0},
+                                       {"wer": 0.0, "sim": 0.99, "penalty": 0.004}]) == 1,
+          "within rounding, similarity still breaks the tie")
+
+
+def test_take_label_shows_confidence_and_defects() -> None:
+    conf = webui.take_label(1, 0.0, 0.99, False, confidence=-0.42)
+    check("conf -0.42" in conf, f"confidence is shown so the pick can be questioned: {conf}")
+    flagged = webui.take_label(1, 0.0, 0.99, False,
+                               defects={"penalty": 0.3, "rate_ratio": 1.0, "lead_silence": 0.9,
+                                        "tail_silence": 0.4, "clipped_fraction": 0.0})
+    check("silence" in flagged and "⚠" in flagged, f"defects are visible on the player: {flagged}")
+    clean = webui.take_label(1, 0.0, 0.99, False, confidence=-0.1,
+                             defects={"penalty": 0.0, "rate_ratio": 1.0, "lead_silence": 0.1,
+                                      "tail_silence": 0.1, "clipped_fraction": 0.0})
+    check("⚠" not in clean, f"a clean take is not covered in warnings: {clean}")
+
+
+def test_mean_token_logprob_alignment() -> None:
+    """The off-by-prefix bug in this arithmetic is silent and total, so pin it.
+
+    Measured on a real clean clip: correct alignment reads -1.9, one token off reads
+    -13.5 (worse than a uniform distribution). Nothing errors; the signal just becomes
+    garbage that penalises every candidate equally.
+    """
+    import torch
+
+    vocab, steps = 8, 6
+    logits = torch.full((1, steps, vocab), -10.0)
+    for position in range(steps):
+        logits[0, position, (position + 1) % vocab] = 20.0   # logits[t] predicts token t+1
+    tokens = [1, 2, 3, 4]
+
+    aligned = webui._mean_token_logprob(logits, tokens, offset=0)
+    check(aligned is not None and aligned > -0.01,
+          f"a decoder that is certain reads ~0, got {aligned}")
+    misaligned = webui._mean_token_logprob(logits, tokens, offset=2)
+    check(misaligned is not None and misaligned < -3,
+          f"the same tokens one step off must read as nonsense, got {misaligned}")
+
+    uniform = torch.zeros(1, 4, vocab)
+    flat = webui._mean_token_logprob(uniform, [0, 1, 2, 3])
+    check(abs(flat - float(np.log(1.0 / vocab))) < 1e-3,
+          f"a uniform decoder reads log(1/vocab), got {flat}")
+
+    check(webui._mean_token_logprob(logits, []) is None, "no tokens, no score")
+    check(webui._mean_token_logprob(None, [1]) is None, "no logits, no score")
+    check(webui._mean_token_logprob(logits[:, :3], tokens, offset=0) is None,
+          "not enough steps to score every token -> None rather than a partial average")
+    check(webui._mean_token_logprob(logits, tokens, offset=3) is None,
+          "offset plus tokens running past the end is refused, not silently truncated")
+
+
 def test_candidate_players_are_wired() -> None:
     """Every take must reach the page — otherwise 'best of N' is a black box."""
     import inspect
