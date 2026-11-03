@@ -324,6 +324,21 @@ def word_error_rate(hypothesis: str, reference: str) -> float:
     return previous[-1] / float(len(ref))
 
 
+def take_label(index: int, wer: Optional[float], sim: Optional[float], kept: bool) -> str:
+    """Label for a candidate's player: which take it was and how it scored.
+
+    The scores are shown so the automatic pick is arguable rather than mysterious — the
+    player itself is the override, since you can listen to every take and download any one.
+    """
+    bits = []
+    if wer is not None:
+        bits.append(f"WER {wer:.2f}")
+    if sim is not None:
+        bits.append(f"SIM {sim:.3f}")
+    return f"Take #{index}" + (f" — {' · '.join(bits)}" if bits else "") + \
+           (" (kept)" if kept else "")
+
+
 def choose_best_candidate(metrics: List[Dict[str, Optional[float]]]) -> int:
     """Index of the best candidate: content fidelity first, then speaker similarity.
 
@@ -1378,7 +1393,21 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
             notes.append("WARNING: " + fit)
         status = report + (("\n" + "\n".join(notes)) if notes else "")
         out_wav, out_sr = postprocess_output(chosen["wav"], chosen["sr"], postproc)
-        return _ok((out_sr, out_wav), status + _post_note(postproc))
+        # Hand back every take, not just the winner: the auto-pick is a first opinion, and
+        # the only honest way to let someone overrule it is to let them hear the alternatives.
+        takes: List[Any] = []
+        for item in results:
+            if n > 1:
+                take_wav, take_sr = postprocess_output(item["wav"], item["sr"], postproc)
+                takes.append(gr.update(value=(take_sr, take_wav), visible=True,
+                                       label=take_label(item["index"], item["wer"], item["sim"],
+                                                        item["index"] == results[best]["index"])))
+            else:
+                takes.append(gr.update(value=None, visible=False))
+        while len(takes) < MAX_CANDIDATES:
+            takes.append(gr.update(value=None, visible=False))
+        return _ok((out_sr, out_wav), status + _post_note(postproc)) + tuple(takes) + (
+            gr.update(visible=n > 1),)
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}"
 
@@ -1578,15 +1607,15 @@ after a model switch pays a few seconds of load time.
 
             with gr.Tab("Voice Clone (Base)"):
                 gr.Markdown(
-                    "Upload a clip — **video works**, only the audio track is used — drag the "
-                    "selection to the best stretch, transcribe it, then synthesize new text. "
-                    "A clean 3–10s window clones best. **Keep things:** *Save to voice library* "
-                    "stores the reference clip for reuse; every audio player has a download "
-                    "icon for the generated wav. **Quality comes from the reference and its "
-                    "transcript**, not the sliders — see the README's quality section.")
+                    "Clone a voice from a short clip, then make it say anything — three steps, "
+                    "top to bottom. **Quality comes from the reference and its transcript**, not "
+                    "from the sliders; see the README's quality section. A clean 3–10s stretch of "
+                    "one speaker, with no music or reverb, clones best.")
+
+                gr.Markdown("#### 1 · The reference — the clip the voice is taken from")
                 cl_media_state = gr.State(value=None)
-                cl_upload = gr.File(label="Upload video or audio", file_types=MEDIA_SUFFIXES,
-                                    type="filepath")
+                cl_upload = gr.File(label="Upload video or audio — video works, only its audio track is used",
+                                    file_types=MEDIA_SUFFIXES, type="filepath")
                 with gr.Row():
                     cl_import_btn = gr.Button("Extract audio & show waveform", variant="primary")
                     cl_auto_btn = gr.Button("Auto-pick best clip")
@@ -1600,7 +1629,7 @@ after a model switch pays a few seconds of load time.
 
                 with gr.Row():
                     with gr.Column(scale=2):
-                        cl_ref_audio = gr.Audio(label="Reference clip (trimmed selection lands here)",
+                        cl_ref_audio = gr.Audio(label="Reference clip (the trimmed selection lands here)",
                                                 type="filepath", sources=["upload", "microphone"])
                     with gr.Column(scale=2):
                         cl_asr_language = gr.Dropdown(
@@ -1609,26 +1638,21 @@ after a model switch pays a few seconds of load time.
                             value="Auto")
                         cl_transcribe_btn = gr.Button("Transcribe selected clip", variant="primary")
                 cl_ref_text = gr.Textbox(
-                    label="Reference transcript (editable — must match the clip)", lines=3,
-                    placeholder="Exact text spoken in the selected clip. Transcribe it above, then fix anything Whisper got wrong.")
+                    label="The reference clip says… (transcript — must match what you hear)", lines=3,
+                    placeholder="Transcribe the selection above, then fix anything Whisper got wrong. "
+                                "This is what the clip says, not what you want it to say.")
                 cl_xvector = gr.Checkbox(
                     label="x-vector only (no transcript needed, lower similarity)", value=False)
                 cl_fit = gr.Textbox(label="Fit check", lines=1, interactive=False)
 
-                with gr.Row():
-                    cl_voice_name = gr.Textbox(
-                        label="Save this reference as a voice (name)", scale=3,
-                        placeholder="e.g. phone voice memo",
-                        info="Stores the trimmed clip plus its transcript in voices/ — reuse it "
-                             "later without re-uploading. Does not save the generated output; "
-                             "use the download icon on its player for that.")
-                    cl_save_btn = gr.Button("Save to voice library", size="sm", scale=1)
-                cl_save_status = gr.Textbox(label="Save status", lines=1, interactive=False)
-
+                gr.Markdown("#### 2 · What it should say")
                 with gr.Row():
                     with gr.Column(scale=2):
-                        cl_text = gr.Textbox(label="Target text", lines=4,
-                                             placeholder="What the cloned voice should say...")
+                        cl_text = gr.Textbox(
+                            label="Say this in the cloned voice", lines=4,
+                            placeholder="New words for the cloned voice to speak…",
+                            info="The new line to synthesise — the box above is what the reference "
+                                 "says; this is what you want to hear.")
                         cl_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES, value="Auto")
                         with gr.Row():
                             cl_candidates = gr.Slider(1, MAX_CANDIDATES, value=1, step=1,
@@ -1639,24 +1663,48 @@ after a model switch pays a few seconds of load time.
                             cl_seed = gr.Textbox(label="Seed (blank = random)", value="", scale=1,
                                                  info="Same seed + same inputs reproduces the same audio.")
                         cl_btn = gr.Button("Clone & generate", variant="primary")
+                    with gr.Column(scale=2):
+                        cl_audio = gr.Audio(label="Generated audio (the auto-pick)", type="numpy")
+                        cl_status = gr.Textbox(label="Status", lines=2, interactive=False)
+                with gr.Row():
+                    cl_take_1 = gr.Audio(label="Take #1", type="numpy", visible=False)
+                    cl_take_2 = gr.Audio(label="Take #2", type="numpy", visible=False)
+                    cl_take_3 = gr.Audio(label="Take #3", type="numpy", visible=False)
+                    cl_take_4 = gr.Audio(label="Take #4", type="numpy", visible=False)
+                cl_takes_note = gr.Markdown(
+                    visible=False,
+                    value="*Candidates (best of N)*: **Generated audio** above is the auto-pick "
+                          "(best Whisper WER, then speaker similarity). Every take is left below so "
+                          "you can listen and overrule it — each has its own download icon, so the "
+                          "one you keep does not have to be the one the scorer preferred.")
 
+                gr.Markdown("#### 3 · Keep it — the voice library")
+                gr.Markdown(
+                    "Saving keeps the **reference clip + transcript** so you do not have to "
+                    "re-upload it next time; **Load** puts one back into step 1. The audio you "
+                    "generated is kept with the download icon on its player, not here.")
+                with gr.Row():
+                    cl_voice_name = gr.Textbox(
+                        label="Save this reference as a voice (name)", scale=3,
+                        placeholder="e.g. phone voice memo",
+                        info="Writes voices/<name>.wav + .json on this machine.")
+                    cl_save_btn = gr.Button("Save to voice library", size="sm", scale=1)
+                cl_save_status = gr.Textbox(label="Save status", lines=1, interactive=False)
                 with gr.Row():
                     cl_voice = gr.Dropdown(label="Saved voices (designed or saved from a clip)",
                                            choices=voice_choices(),
                                            value=None, scale=4, allow_custom_value=False,
-                                           info="Load fills in the reference clip and its transcript; "
-                                                "saving happens above, or in the Voice Design tab.")
+                                           info="Load fills in the reference clip and its transcript.")
                     cl_load_btn = gr.Button("Load", size="sm", scale=1)
                     cl_delete_btn = gr.Button("Delete", size="sm", scale=1, variant="stop")
                     cl_refresh_btn = gr.Button("Refresh", size="sm", scale=1)
                 cl_voice_status = gr.Textbox(label="Voice library", lines=1, interactive=False)
-                with gr.Row():
-                    cl_audio = gr.Audio(label="Generated audio", type="numpy")
-                    cl_status = gr.Textbox(label="Status", lines=2, interactive=False)
+
                 cl_btn.click(generate_voice_clone,
                              inputs=[cl_ref_audio, cl_ref_text, cl_text, cl_language, cl_xvector] + sampling
                                     + output_options + [cl_candidates, cl_seed],
-                             outputs=[cl_audio, cl_status])
+                             outputs=[cl_audio, cl_status, cl_take_1, cl_take_2, cl_take_3, cl_take_4,
+                                      cl_takes_note])
 
                 # Transcript/clip fit is a live, non-blocking check: a transcript that does not
                 # match the selection is the worst clone failure mode we measured, and it is

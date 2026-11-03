@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## 2026-11-03 — Clone tab reads as three steps; every candidate is auditionable
+
+Two usability problems, both real: *Save this reference as a voice* sat between the
+reference section and the synthesis section (so people looked for it in the wrong place),
+and *Target text* named nothing (it is the line to synthesise, and it sat under a box that
+is also a text box about the clip).
+
+- The tab is now three numbered sections in the order the workflow actually runs: **1 · The
+  reference** (upload, waveform, trim, transcribe, transcript, x-vector, fit check) → **2 ·
+  What it should say** (renamed *Say this in the cloned voice*, language, candidates, seed,
+  generate, output) → **3 · Keep it** (save + the saved-voices list together, where the
+  save button can be seen next to what it feeds). The two text boxes now say which is which.
+- **Best-of-N no longer throws away the losers.** The callback returns one audio player per
+  take, each labelled with its scores (`take_label`) and marked `(kept)`, alongside
+  **Generated audio (the auto-pick)**. Every player has its own download icon, so the scorer
+  is a suggestion rather than a gate. With one candidate the players and the explanation row
+  stay hidden.
+- Documented what the scorer is and is not good at, from the measurements: it rejects dud
+  takes (WER 0.133 vs 0.000 on identical inputs), but among correctly-pronounced takes SIM
+  varies by ~0.001 and neither metric measures naturalness - so ties are for the human.
+- Tests: CPU tier 37 -> 40 (reading order + box labels, take labels, player wiring). The
+  GPU tier asserts 3 visible labelled takes with exactly one `(kept)`, and none when N=1.
+  Gradio 6 gotchas caught by the CPU tier on the way: `gr.File` and `gr.Audio` accept no
+  `info=`.
+
 ## 2026-11-03 — output post-processing: the "digital" edge is imaging, not sample rate
 
 The vocoder is fixed at 24kHz (`output_sample_rate: 24000`), so no post-filter can add

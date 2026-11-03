@@ -252,9 +252,15 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
     ref_wav, ref_sr = sf.read(ref_path, dtype="float32")
 
     webui.ASR = webui.Transcriber()
+
+    def clone(*args, **kwargs):
+        """The callback returns (audio, status, take1..4, takes_note); most checks want two."""
+        result = webui.generate_voice_clone(*args, **kwargs)
+        return result[0], result[1], list(result[2:6]), result[6]
+
     try:
         t0 = time.time()
-        audio, status = webui.generate_voice_clone(
+        audio, status, takes, takes_note = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=3, seed=cfg["seed"])
         took = time.time() - t0
@@ -267,7 +273,23 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         assert sr == webui.POSTPROCESS_SR, \
             f"the listening copy should come back at {webui.POSTPROCESS_SR}Hz, got {sr}Hz"
         assert "Post-processing" in status, f"the status should say what was applied:\n{status}"
-        raw_pair, _ = webui.generate_voice_clone(
+        # Every candidate must stay auditionable — the auto-pick is only defensible if the
+        # human can hear the alternatives and keep a different one.
+        visible = [t for t in takes if isinstance(t, dict) and t.get("visible")]
+        assert len(visible) == 3, f"expected 3 visible takes, got {len(visible)}"
+        assert all("Take #" in (t.get("label") or "") for t in visible), \
+            f"takes must be labelled with their scores: {[t.get('label') for t in visible]}"
+        assert any("(kept)" in (t.get("label") or "") for t in visible), \
+            f"the auto-picked take must be marked: {[t.get('label') for t in visible]}"
+        assert all(t.get("value") is not None for t in visible), "each take carries audio"
+        assert takes_note.get("visible") is True, "the explanation should show when there are takes"
+        _, _, single_takes, single_note = clone((ref_sr, ref_wav), cfg["ref_text"], cfg["text"],
+                                                "English", False, 0.9, 1.0, 50, 1.05,
+                                                candidates=1, seed=cfg["seed"])
+        assert not any(isinstance(t, dict) and t.get("visible") for t in single_takes), \
+            "a single candidate must not leave four empty players on screen"
+        assert single_note.get("visible") is False, "and no explanation row either"
+        raw_pair, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, postproc="off", candidates=1, seed=cfg["seed"])
         raw_sr, raw = raw_pair
@@ -280,10 +302,10 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         check_audio(path, wav, sr)
 
         # The seed field promises reproducibility; two identical calls must agree bitwise.
-        first, _ = webui.generate_voice_clone(
+        first, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=99)
-        second, _ = webui.generate_voice_clone(
+        second, _, _, _ = clone(
             (ref_sr, ref_wav), cfg["ref_text"], cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=99)
         assert first[1].shape == second[1].shape, "same seed changed the clip length"
@@ -293,12 +315,12 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         # The fit guard is a plausibility check on words-per-second, so it catches the
         # failure that was actually measured (transcript of the whole upload, or a stub left
         # in) — not a same-length text with the wrong words. Assert exactly that.
-        _, too_short = webui.generate_voice_clone(
+        _, too_short, _, _ = clone(
             (ref_sr, ref_wav), "No.", cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=5)
         assert "WARNING" in too_short and "too short" in too_short, \
             f"a one-word transcript for a multi-second clip was not flagged:\n{too_short}"
-        _, too_long = webui.generate_voice_clone(
+        _, too_long, _, _ = clone(
             (ref_sr, ref_wav), " ".join(["padding"] * 160), cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=5)
         assert "too long" in too_long, \

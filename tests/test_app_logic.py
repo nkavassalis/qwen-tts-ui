@@ -785,13 +785,15 @@ def test_build_ui_constructs() -> None:
 
     audios = [b for b in demo.blocks.values() if isinstance(b, gr.Audio)]
     by_label = {b.label: b for b in audios}
-    check(len(audios) == 4, f"three outputs + one reference input, found {len(audios)}")
-    for label in ("Reference clip (trimmed selection lands here)", "Generated voice"):
+    # CustomVoice + VoiceDesign + Clone output + Clone reference box + the four candidate
+    # players that make best-of-N auditionable.
+    check(len(audios) == 8, f"three outputs, one reference input, four take players — found {len(audios)}")
+    for label in ("Reference clip (the trimmed selection lands here)", "Generated voice"):
         check(label in by_label, f"{label} exists")
     # Anything we read back from the browser is filepath-typed so that we open it
     # ourselves, after resolve_input_path; with type="numpy" Gradio opens the client's
     # path before our code runs, so we never get a chance to check it.
-    check(by_label["Reference clip (trimmed selection lands here)"].type == "filepath",
+    check(by_label["Reference clip (the trimmed selection lands here)"].type == "filepath",
           "the reference box is filepath-typed so resolve_input_path can guard it")
     check(by_label["Generated voice"].type == "filepath",
           "the Voice Design box is filepath-typed: 'Save as voice' reads it back")
@@ -1179,6 +1181,69 @@ def test_output_options_are_wired() -> None:
     check("s_postproc" in source and "output_options" in source, "the dropdown exists")
     check(source.count("+ output_options") == 3,
           "all three generation tabs (CustomVoice, VoiceDesign, Clone) receive the choice")
+
+
+def test_clone_tab_reads_top_to_bottom() -> None:
+    """The Clone tab must read as the three steps it actually is.
+
+    It used to put 'Save this reference as a voice' between the reference section and the
+    synthesis section, which made people hunt for the save button in the wrong place and
+    wonder what 'Target text' meant. Order is the documentation here, so pin it.
+    """
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+
+    def at(needle: str) -> int:
+        index = source.find(needle)
+        assert index >= 0, f"missing {needle!r} in the Clone tab"
+        return index
+
+    steps = [at("#### 1 · The reference"), at("#### 2 · What it should say"),
+             at("#### 3 · Keep it")]
+    check(steps == sorted(steps), "the three step headings appear in order")
+    check(at('cl_text = gr.Textbox') > at("#### 2 · What it should say"),
+          "the text to synthesise sits under step 2, not the reference section")
+    check(at('cl_voice_name = gr.Textbox') > at('cl_text = gr.Textbox'),
+          "the save controls come after the synthesis controls, not between them")
+    check(at('cl_voice_name = gr.Textbox') > at("#### 3 · Keep it"),
+          "saving lives in the library step, next to Load/Delete")
+    check(at('cl_save_btn = gr.Button') < at('cl_voice = gr.Dropdown'),
+          "Save sits directly above the saved-voices list it feeds")
+    check(at('cl_audio = gr.Audio') < at('cl_voice_name = gr.Textbox'),
+          "the generated audio stays next to the button that produced it")
+
+    # The two text boxes must not be confusable.
+    check("Say this in the cloned voice" in source, "the synthesis box says what it is for")
+    check("The reference clip says" in source, "the transcript box says it is what the clip says")
+    check('label="Target text"' not in source, "'Target text' is gone — it named nothing")
+
+
+def test_take_labels_explain_the_pick() -> None:
+    """The scorer's decision has to be arguable, so the numbers go on the player."""
+    full = webui.take_label(2, 0.133, 0.993, True)
+    check(full.startswith("Take #2"), f"names the take: {full}")
+    check("WER 0.13" in full and "SIM 0.993" in full, f"shows both scores: {full}")
+    check("(kept)" in full, "marks the one that was auto-picked")
+    check("(kept)" not in webui.take_label(1, 0.0, 0.99, False), "only the winner is marked")
+    noscore = webui.take_label(3, None, None, False)
+    check(noscore == "Take #3", f"unscored candidates still get a sane label: {noscore}")
+    check("WER" in webui.take_label(1, 0.0, None, False) and "SIM" not in webui.take_label(1, 0.0, None, False),
+          "a missing similarity is omitted rather than printed as None")
+    check("WER" not in webui.take_label(1, None, 0.9, False),
+          "a missing WER (transcription off) is omitted too")
+
+
+def test_candidate_players_are_wired() -> None:
+    """Every take must reach the page — otherwise 'best of N' is a black box."""
+    import inspect
+
+    source = inspect.getsource(webui.build_ui)
+    for n in (1, 2, 3, 4):
+        check(f"cl_take_{n} = gr.Audio" in source, f"take player {n} exists")
+    check("cl_take_1, cl_take_2, cl_take_3, cl_take_4" in source,
+          "the four players are outputs of Clone & generate")
+    check("cl_takes_note" in source, "the row that explains the auto-pick exists")
 
 
 if __name__ == "__main__":

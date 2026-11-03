@@ -40,23 +40,48 @@ do in a text editor:
 
 ### Cloning a voice, start to finish
 
-1. **Voice Clone (Base)** tab → *Upload video or audio*. Video is fine; only its audio
-   track is used.
-2. **Extract audio & show waveform**. The whole upload is drawn and the first ~6s lands in
+The tab is three numbered steps, top to bottom, and they are the whole workflow.
+
+**1 · The reference** — the clip the voice is taken from
+
+1. *Upload video or audio*. Video is fine; only its audio track is used.
+2. **Extract audio & show waveform**. The whole upload is drawn; the first ~6s lands in
    *Reference clip*.
 3. Drag **Start (s)** / **End (s)** so the shaded region covers the cleanest stretch
    (3–10s, one speaker, no music) — or press **Auto-pick best clip** for the loudest 6s.
-4. **Transcribe selected clip**, then fix anything Whisper got wrong in *Reference
-   transcript*. This step matters: ICL cloning conditions on the transcript matching the
-   clip. Skip it only with *x-vector only* (lower similarity).
-5. Type the **Target text**, set **Language**, press **Clone & generate**.
-6. Keep what you want — these are two different buttons:
-   - the **generated audio**: the download icon on the *Generated audio* player. Files
-     under `/tmp/gradio/` are ephemeral, so download rather than pathing to them.
-   - the **voice itself**: name it in *Save this reference as a voice (name)* and press
-     **Save to voice library**. It goes to `voices/<slug>.wav` + `.json` and appears in
-     *Saved voices* on this and every later run. **Load** restores clip + transcript,
-     **Delete** removes both files.
+4. **Transcribe selected clip**, then fix anything Whisper got wrong in *The reference clip
+   says…*. This matters: ICL cloning conditions on that transcript matching the clip, and
+   the *Fit check* line warns when it obviously does not. Skip it only with *x-vector only*
+   (lower similarity).
+
+**2 · What it should say**
+
+5. Type **Say this in the cloned voice** — the new line, not what the reference says — set
+   **Language**, and press **Clone & generate**. Raise **Candidates (best of N)** for
+   several takes; see below.
+
+**3 · Keep it**
+
+6. Two different things to keep, two different controls:
+   - the **audio**: the download icon on its player. Files under `/tmp/gradio/` are
+     ephemeral, so download rather than pathing to them.
+   - the **voice**: name it and press **Save to voice library** → `voices/<slug>.wav` +
+     `.json`, listed in *Saved voices* on every later run. **Load** restores clip +
+     transcript; **Delete** removes both files.
+
+#### Auditioning candidates
+
+With *Candidates (best of N)* above 1 you get **one player per take**, labelled with its
+scores, plus **Generated audio (the auto-pick)** above them. The pick is
+`choose_best_candidate`: lowest Whisper WER against the text you asked for, ties broken by
+speaker similarity. Listen to them all and keep whichever you like — every player has its
+own download icon, so the scorer's choice is a suggestion, not a gate.
+
+What that scorer is genuinely good at, from the measurements below: rejecting a dud take
+(WER 0.133 against 0.000 on identical inputs). What it is not good at: choosing between
+takes that are all correctly pronounced — SIM spread only 0.001 there, so the tie-break is
+close to noise, and neither metric measures naturalness, prosody or emotion at all. Trust
+your ears whenever the labels read as a tie.
 
 ## Quick start
 
@@ -95,7 +120,7 @@ setup.sh            reproducible env + weight/Whisper download
 run.sh              launcher (handles self-signed certs for HTTPS)
 requirements.txt    direct deps; torch and transformers are pinned elsewhere on purpose
 webui/app.py        the Gradio UI + VRAM/RAM-aware model manager + voice library
-tests/test_app_logic.py   CPU-only unit tests (35 cases) for UI helpers and guards
+tests/test_app_logic.py   CPU-only unit tests (40 cases) for UI helpers and guards
 tests/smoke_test.py       GPU end-to-end: 6 flows, generates audio and validates the wav
 AGENTS.md           the agent doc: design rationale, invariants, do-not-touch list
 CLAUDE.md           pointer to AGENTS.md
@@ -181,7 +206,7 @@ boundaries are worth stating:
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 35 cases
+.venv/bin/python tests/test_app_logic.py   # ~10s, no weights needed, 40 cases
 .venv/bin/python tests/smoke_test.py       # ~90s, needs the GPU + downloaded weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```

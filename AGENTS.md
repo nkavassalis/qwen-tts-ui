@@ -30,7 +30,7 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 37 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 40 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 6 end-to-end flows, writes tests/output/*.wav
 LICENSE                  Apache-2.0 (matches upstream; app.py derives from their Space)
 README.md              human-facing docs, troubleshooting table
@@ -58,12 +58,12 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `Runtime:` lin
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 37 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 40 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 6 flows, ~90s, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03): **CPU tier 37/37 passing**, run on Python 3.12 with
+Current state (2026-11-03): **CPU tier 40/40 passing**, run on Python 3.12 with
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3. **GPU tier NOT run in that
 session** — the box had no GPU; see *Testing limitations*.
 
@@ -96,6 +96,17 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   `ValueError: Unsupported languages`. Pick the speaker instead. Enforced by
   `test_language_choices_match_checkpoint`. Italian *is* selectable — the hosted Space
   omits it by oversight.
+- **The clone tab is three numbered steps, and the order is load-bearing.** Reference →
+  what it should say → keep it. Save used to sit between the reference and the synthesis
+  controls, which made people look for it in the wrong place and misread *Target text* as
+  something other than "the line to synthesise"; `test_clone_tab_reads_top_to_bottom` pins
+  the order and the two box labels so the layout cannot drift back. `gr.File` and `gr.Audio`
+  take no `info=` in Gradio 6 — put guidance in a Markdown/Textbox instead.
+- **Every best-of-N candidate stays auditionable.** The callback returns one audio player
+  per take (labelled with its WER/SIM, winner marked) alongside the auto-pick, because
+  `choose_best_candidate` is only defensible as a *suggestion*: it rejects dud takes well,
+  but among correctly-pronounced takes SIM varies by ~0.001 and nothing measures
+  naturalness. Do not turn it into a gate that discards the losers.
 - **Output post-processing is listening-only** (`postprocess_output`). The vocoder is fixed
   at 24kHz, so the "digital" character is near-Nyquist imaging (measured 4x excess), not
   missing bandwidth — nothing here can add air above 12kHz, and anything that appears to is
