@@ -120,15 +120,35 @@ def run_voice_library(hub: webui.ModelHub) -> None:
         for stale in os.listdir(tmp):
             os.remove(os.path.join(tmp, stale))
 
-        with hub.lock:
-            designed = hub.acquire("voice_design")
-            wavs, sr = designed.generate_voice_design(
-                text=cfg["text"], language=cfg["language"], instruct=cfg["instruct"],
-                non_streaming_mode=True, max_new_tokens=192)
+        # Through the tab's own callbacks, not save_voice(). Save used to read the audio box,
+        # which holds the post-processed listening copy — so every designed voice was stored
+        # with the Warm EQ baked in at 48kHz, and a saved voice is a future clone reference,
+        # which then gets cloned through the codec a second time.
+        audio, status, state = webui.generate_voice_design(
+            cfg["text"], cfg["language"], cfg["instruct"], 0.9, 1.0, 50, 1.05, postproc="Warm")
+        assert audio is not None, f"design failed: {status}"
+        box_sr, _box_wav = audio
+        assert box_sr == 48000, f"the player should still get the 48kHz copy, got {box_sr}Hz"
+        assert isinstance(state, dict) and state.get("path"), \
+            f"the raw take must reach Save through gr.State: {state}"
+        raw_wav, sr = sf.read(state["path"], dtype="float32")
+        assert sr == 24000, f"the kept take must be the raw decode, got {sr}Hz"
+
         design_path = os.path.join(OUT_DIR, "voice_library_design.wav")
-        sf.write(design_path, wavs[0], sr)
-        check_audio(design_path, wavs[0], sr)
-        webui.save_voice("Smoke Test Narrator", wavs[0], sr, cfg["text"], cfg["instruct"], cfg["language"])
+        sf.write(design_path, raw_wav, sr)
+        check_audio(design_path, raw_wav, sr)
+
+        _, save_msg, _ = webui.save_designed_voice("Smoke Test Narrator", state, cfg["text"],
+                                                   cfg["instruct"], cfg["language"])
+        assert "Saved" in save_msg, f"saving the designed take failed: {save_msg}"
+        saved_wav, saved_sr = sf.read(os.path.join(tmp, "smoke_test_narrator.wav"), dtype="float32")
+        assert saved_sr == 24000, (
+            f"a saved voice is a future clone reference and must be the model's own decode; "
+            f"got {saved_sr}Hz while the player copy is {box_sr}Hz")
+        assert saved_wav.shape == raw_wav.shape and \
+            float(np.max(np.abs(saved_wav - raw_wav))) < 1e-3, \
+            "the saved samples are not the raw decode — something is post-processing the copy " \
+            "(tolerance is PCM_16 quantisation: soundfile writes 16-bit WAV)"
 
         choices = webui.voice_choices()
         assert len(choices) == 1, f"designed voice was not registered: {choices}"
@@ -148,7 +168,9 @@ def run_voice_library(hub: webui.ModelHub) -> None:
                 max_new_tokens=192)
         clone_path = os.path.join(OUT_DIR, "voice_library_clone.wav")
         sf.write(clone_path, outs[0], out_sr)
-        print(f"  [voice_library] designed {len(wavs[0]) / sr:.1f}s -> cloned {len(outs[0]) / out_sr:.1f}s")
+        print(f"  [voice_library] designed {len(raw_wav) / sr:.1f}s raw @ {sr}Hz "
+              f"(player copy @ {box_sr}Hz) -> saved @ {saved_sr}Hz -> cloned "
+              f"{len(outs[0]) / out_sr:.1f}s")
         check_audio(clone_path, outs[0], out_sr)
     finally:
         webui.VOICES_DIR = original
@@ -410,7 +432,7 @@ def run_long_text(hub: webui.ModelHub) -> None:
         webui.ASR = webui.Transcriber()
 
     started = time.time()
-    audio, status = webui.generate_voice_design(
+    audio, status, _state = webui.generate_voice_design(
         text, "English", description, 0.9, 1.0, 50, 1.05, postproc="off")
     took = time.time() - started
     sr, wav = audio

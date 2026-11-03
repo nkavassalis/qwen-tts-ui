@@ -224,47 +224,107 @@ def test_voice_library(tmp_dir=None) -> None:
             webui.VOICES_DIR = original
 
 
-def test_save_designed_voice_uses_the_audio_box() -> None:
-    """'Save as voice' reads the clip from its inputs, never from a process global.
+def test_saving_a_designed_voice_keeps_the_raw_decode() -> None:
+    """Save must persist the model's own decode, never the post-processed listening copy.
 
-    It used to persist a module-level "last design" cache, so with two people on the LAN
-    one person's Save button could persist the other person's clip.
+    Two things used to go wrong here, both found in the real app. The Save handler read the
+    audio box, which holds the *listening* copy — 48kHz, de-imaged, high-shelf, soft-limited —
+    so a designed voice was saved already through an EQ curve, and then used as a clone
+    reference that had been through the codec twice. A voice saved from the browser measured
+    `sample_rate: 48000`, which is how this surfaced. And before that, Save read a module-level
+    "last design" global, so with two people on the LAN one person's Save could persist the
+    other's clip.
+
+    So: the path of the raw decode travels through `gr.State` (JSON-safe, per-request), and
+    this pins that the bytes on disk are the model's, not the EQ's.
     """
-    wav = (np.sin(np.linspace(0, 200, 24000)) * 0.3).astype(np.float32)
+    import threading
+
+    sr = 24000
+    raw = (0.3 * np.sin(2 * np.pi * 150 * np.arange(sr * 3) / sr)).astype(np.float32)
+
+    class FakeTTS:
+        def generate_voice_design(self, **kwargs):
+            return [raw], sr
+
+    class FakeHub:
+        def __init__(self):
+            self.lock = threading.RLock()
+
+        def acquire(self, capability):
+            return FakeTTS()
+
+    original_voices, original_media = webui.VOICES_DIR, webui.MEDIA_DIR
+    original_hub, webui.HUB = webui.HUB, FakeHub()
     with tempfile.TemporaryDirectory() as tmp:
-        original, webui.VOICES_DIR = webui.VOICES_DIR, tmp
-        original_media, webui.MEDIA_DIR = webui.MEDIA_DIR, tmp
+        webui.VOICES_DIR, webui.MEDIA_DIR = tmp, tmp
         try:
-            clip_path = os.path.join(tmp, "design.wav")
-            sf.write(clip_path, wav, 24000)
+            audio, status, state = webui.generate_voice_design(
+                "hello there", "English", "warm and low", 0.9, 1.0, 50, 1.05, postproc="Warm")
+            box_sr, _box_wav = audio
+            check(box_sr == 48000,
+                  f"the player still gets the post-processed copy, got {box_sr}Hz")
+            check(isinstance(state, dict) and state.get("path"),
+                  f"Save gets a path through state, not an array: {state}")
+            check(state.get("text") == "hello there" and state.get("language") == "English",
+                  f"the state carries what the clip says: {state}")
+            kept_sr = sf.read(state["path"], dtype="float32")[1]
+            check(kept_sr == 24000, f"the kept clip is the raw decode, got {kept_sr}Hz")
 
             _, msg, _ = webui.save_designed_voice("nobody", None, "text", "warm", "english")
-            check("Nothing to save yet" in msg, "cannot save without a clip in the box")
-
-            _, msg, _ = webui.save_designed_voice("   ", clip_path, "text", "warm", "english")
+            check("Nothing to save yet" in msg, "cannot save without a generated take")
+            _, msg, _ = webui.save_designed_voice("   ", state, "text", "warm", "english")
             check("name" in msg.lower(), "blank name rejected")
             check(webui.list_voices() == [], "rejected save writes nothing")
-
-            _, msg, _ = webui.save_designed_voice("x", clip_path, "   ", "warm", "english")
-            check("empty" in msg, "a clip with no transcript is rejected (ICL needs it)")
+            _, msg, _ = webui.save_designed_voice("x", state, "   ", "warm", "english")
+            check("empty" in msg, "a take with no transcript is rejected (ICL needs it)")
             check(webui.list_voices() == [], "rejected save writes nothing")
 
-            _, msg, update = webui.save_designed_voice("Warm Narrator", clip_path,
-                                                       "hello", "warm", "english")
-            check("Saved" in msg, "saving the clip in the box works")
-            check(update["choices"][0][1] == "warm_narrator", "clone tab dropdown is refreshed with the new voice")
-            saved = webui.list_voices()[0]
-            check(saved["text"] == "hello" and saved["instruct"] == "warm",
+            _, msg, update = webui.save_designed_voice("Warm Narrator", state, "hello",
+                                                       "warm", "english")
+            check("Saved" in msg, f"saving the take works: {msg}")
+            saved_wav, saved_sr = sf.read(os.path.join(tmp, "warm_narrator.wav"), dtype="float32")
+            check(saved_sr == 24000,
+                  f"the saved voice is the model's decode, not the {box_sr}Hz player copy: "
+                  f"{saved_sr}Hz")
+            check(saved_wav.shape == raw.shape and
+                  float(np.max(np.abs(saved_wav - raw))) < 1e-3,
+                  "the saved samples are the model's decode, EQ-free (the tolerance is "
+                  "PCM_16 quantisation: soundfile writes 16-bit WAV, so 'raw' means "
+                  "unprocessed, not bit-exact)")
+            record = webui.list_voices()[0]
+            check(record["sample_rate"] == 24000 and record["seconds"] == 3.0,
+                  f"the sidecar describes the raw clip: {record}")
+            check(record["text"] == "hello" and record["instruct"] == "warm",
                   "transcript and description come from the Voice Design inputs")
+            check(update["choices"][0][1] == "warm_narrator",
+                  "the voice dropdowns are refreshed with the new voice")
 
-            # A path outside the allowed roots is refused, not read.
-            _, msg, _ = webui.save_designed_voice("spy", "/opt/recordings/take.wav",
+            # A path outside the allowed roots is refused, not read: the state is client-
+            # round-tripped JSON, so whatever arrives here is untrusted.
+            _, msg, _ = webui.save_designed_voice("spy", {"path": "/opt/recordings/take.wav"},
                                                   "hello", "warm", "english")
             check("outside the upload directory" in msg, f"foreign path refused: {msg}")
-            check(webui.list_voices() == [saved], "the refused save added nothing")
+            check(webui.list_voices() == [record], "the refused save added nothing")
+
+            # A failed take-write must not sink the generation, only disable Save.
+            def explode(*a, **k):
+                raise OSError("disk full")
+
+            original_write, webui._write_take = webui._write_take, explode
+            try:
+                audio, status, state = webui.generate_voice_design(
+                    "hello there", "English", "warm and low", 0.9, 1.0, 50, 1.05)
+                check(audio is not None, "audio still comes back when the take cannot be kept")
+                check("could not keep the raw clip" in status, f"the status says why: {status}")
+                check(state is None, "and Save is disabled rather than saving something stale")
+                _, msg, _ = webui.save_designed_voice("Late", state, "hello", "warm", "english")
+                check("Nothing to save yet" in msg, f"stale save refused: {msg}")
+            finally:
+                webui._write_take = original_write
         finally:
-            webui.VOICES_DIR = original
-            webui.MEDIA_DIR = original_media
+            webui.VOICES_DIR, webui.MEDIA_DIR = original_voices, original_media
+            webui.HUB = original_hub
 
 
 def test_save_reference_voice_from_the_clone_tab() -> None:

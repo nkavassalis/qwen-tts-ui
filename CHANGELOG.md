@@ -82,6 +82,34 @@ messy long upload (cleanup is measured; *which window* gets picked is not).
   it now says what a second process can actually cost: up to two ~4.3GB checkpoints plus
   Whisper, ~9GB or more (`--max-cpu-resident` defaults to 2).
 
+### Fixed — what a saved voice actually contains
+
+**Saving a designed voice stored the post-processed listening copy.** `save_designed_voice`
+read the audio box, and the box holds the copy meant for ears: 48kHz, de-imaged, high-shelf,
+soft-limited. So every voice saved from the Design tab went into `voices/` already through an
+EQ curve — and since a saved voice is usually a future clone reference, it then got cloned from
+that, through the codec a second time, on a path that already keeps only ~60% of whatever it is
+handed. A voice saved from the browser measured `sample_rate: 48000`; that was the tell.
+
+`generate_voice_design` now writes the raw decode with `_write_take` and hands back
+`{path, text, language}` as a third output, and Save reads that path through `gr.State` — the
+same shape the Clone tab already uses for its takes, so "what the last generation produced" is
+one pattern rather than two. If the write fails the audio still plays, the status says why, and
+Save is disabled instead of quietly saving something stale.
+
+- **No API break.** The third output is a `gr.State`, and Gradio omits `gr.State` from
+  `/gradio_api/info` — verified against the running server, `/generate_voice_design` still
+  advertises 8 inputs and 2 returns, so scripts are unaffected and the server-side path never
+  leaves the box. (The Clone tab's take-state has always worked this way.)
+- `test_saving_a_designed_voice_keeps_the_raw_decode` replaces the test that pinned the old
+  behaviour (its name was the bug: *uses the audio box*). It stubs the hub, generates with
+  `postproc="Warm"`, and asserts the player gets 48kHz while the saved file is 24kHz and its
+  samples are the model's — plus the confinement check, because that state round-trips through
+  the browser and whatever arrives is untrusted.
+- `voice_library` (GPU tier) now walks the real callbacks rather than calling `save_voice`
+  directly, and asserts `saved @ 24000Hz` against `player copy @ 48000Hz` on real audio.
+  Tier 8/8.
+
 ## [Unreleased] — CustomVoice removed; voices can ship as descriptions
 
 ### Removed

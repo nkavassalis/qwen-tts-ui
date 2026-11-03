@@ -1822,10 +1822,18 @@ ASR: Optional[Transcriber] = None
 # ============================================================================
 def generate_voice_design(text, language, voice_description, temperature, top_p, top_k, rep_penalty,
                           postproc=POSTPROCESS_DEFAULT, progress=gr.Progress(track_tqdm=True)):
+    """Speak a description. Returns (audio, status, take-state).
+
+    The third output is the **raw model decode** as a path under `tmp/media/`, for the Save
+    button. The audio box carries the post-processed listening copy (48kHz, de-imaged, EQ'd),
+    and a saved voice is usually a future clone reference — which should come straight from
+    the model, not through an EQ curve. Paths through `gr.State`, never a module global: the
+    "last generation" global there is what once let one LAN user's Save persist another's clip.
+    """
     if not text or not text.strip():
-        return None, "Error: Text is required."
+        return None, "Error: Text is required.", None
     if not voice_description or not voice_description.strip():
-        return None, "Error: Voice description is required."
+        return None, "Error: Voice description is required.", None
     try:
         budget = _budget(text)
         with HUB.lock:
@@ -1843,9 +1851,18 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
                 return wavs[0], rate
 
             wav, sr, chunk_notes = generate_chunked(text, language, one, progress)
-        return _ok(*_present(wav, sr, budget, "VoiceDesign", postproc, chunk_notes))
+        try:
+            raw_path = _write_take(wav, sr)
+        except (OSError, ValueError) as e:  # the audio still plays; only Save is lost
+            raw_path = None
+            chunk_notes.append(f"⚠️ could not keep the raw clip ({type(e).__name__}), so Save "
+                               f"is unavailable for this take")
+        audio, report = _present(wav, sr, budget, "VoiceDesign", postproc, chunk_notes)
+        state = None if raw_path is None else {
+            "path": raw_path, "text": text.strip(), "language": str(language or "Auto")}
+        return audio, report, state
     except Exception as e:  # noqa: BLE001
-        return None, f"Error: {type(e).__name__}: {e}"
+        return None, f"Error: {type(e).__name__}: {e}", None
 
 
 # Reusable clone prompts, keyed by a hash of the uploaded reference audio, so the
@@ -2026,13 +2043,20 @@ def _find_voice(voice: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     return None, f"Error: no saved voice ‘{wanted}’. Available: {known}"
 
 
-def save_designed_voice(name: str, audio: Any, text: str, voice_description: str,
+def save_designed_voice(name: str, take_state: Any, text: str, voice_description: str,
                         language: str) -> Tuple[Any, str, Any]:
-    """Save the clip currently in the Voice Design audio box as a reusable clone voice.
+    """Save the clip the last Generate produced as a reusable voice.
 
     Clip, transcript and description all arrive as inputs rather than from a module-level
     "last generation" cache: a process-global there meant that with two people on the LAN,
     one person's Save button persisted the other person's clip.
+
+    The clip comes from the **raw decode** written at generation time, not from the audio
+    box. The box holds the post-processed listening copy — 48kHz, de-imaged, high-shelf and
+    soft-limited — and a saved voice is usually a future clone reference, so feeding that
+    copy back in means cloning an EQ curve. It also means the reference has been through the
+    codec twice by the time you clone it, and cloning keeps only ~60% of whatever it is
+    handed (`docs/quality.md`).
     """
     if not (name or "").strip():
         return gr.update(), "Error: give the voice a name first.", gr.update()
@@ -2040,11 +2064,14 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
         return gr.update(), "Error: the text the clip speaks is empty — it is what ICL cloning needs.", gr.update()
     if voice_exists(name):
         return gr.update(), _taken_message(name), gr.update()
+    path = take_state.get("path") if isinstance(take_state, dict) else take_state
+    if not path:
+        return gr.update(), "Nothing to save yet — press Generate first.", gr.update()
     try:
-        parsed = _audio_to_tuple(audio)
-        if parsed is None:
-            return gr.update(), "Nothing to save yet — press Generate first.", gr.update()
-        wav, sr = parsed
+        path = resolve_input_path(path, "generated clip")
+        wav, sr = sf.read(path, dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
         record = save_voice(
             name=name,
             wav=wav,
@@ -2059,8 +2086,9 @@ def save_designed_voice(name: str, audio: Any, text: str, voice_description: str
         return gr.update(), f"Error: {type(e).__name__}: {e}", gr.update()
     return (
         gr.update(),
-        f"Saved ‘{record['name']}’ ({record['seconds']}s) with its description — Speak and "
-        f"Chat will speak it from the description (brighter); Voice Clone can still load the clip.",
+        f"Saved ‘{record['name']}’ ({record['seconds']}s @ {record['sample_rate']}Hz) with its "
+        f"description — the model's own decode, not the post-processed copy. Speak and Chat "
+        f"will speak it from the description (brighter); Voice Clone can load the clip.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -3178,6 +3206,7 @@ def build_ui() -> gr.Blocks:
                     with gr.Column(scale=1):
                         vd_audio = gr.Audio(label="Designed voice", type="filepath")
                         vd_status = gr.Textbox(label="Status", lines=3, interactive=False)
+                        vd_take_state = gr.State()
                         gr.Markdown("#### Save this voice")
                         with gr.Row(equal_height=True):
                             vd_voice_name = gr.Textbox(label="Name", scale=3,
@@ -3185,10 +3214,11 @@ def build_ui() -> gr.Blocks:
                             vd_save_btn = gr.Button("Save voice", scale=1)
                 vd_btn.click(generate_voice_design,
                              inputs=[vd_text, vd_language, vd_instruct] + sampling + output_options,
-                             outputs=[vd_audio, vd_status], api_name="generate_voice_design")
+                             outputs=[vd_audio, vd_status, vd_take_state],
+                             api_name="generate_voice_design")
                 vd_save_evt = vd_save_btn.click(
                     save_designed_voice,
-                    inputs=[vd_voice_name, vd_audio, vd_text, vd_instruct, vd_language],
+                    inputs=[vd_voice_name, vd_take_state, vd_text, vd_instruct, vd_language],
                     outputs=[vd_voice_name, vd_status, cl_library], api_visibility="private")
 
             # ---------------------------------------------------------------- Speak
