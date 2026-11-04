@@ -408,17 +408,39 @@ def run_best_of_n(hub: webui.ModelHub) -> None:
         # The fit guard is a plausibility check on words-per-second, so it catches the
         # failure that was actually measured (transcript of the whole upload, or a stub left
         # in) — not a same-length text with the wrong words. Assert exactly that.
-        _, too_short, _, _, _ = clone(
+        #
+        # It runs here with Whisper *disabled*, which is not a contrivance: that is the
+        # --no-asr clone, and the single-candidate one where the transcript check has no
+        # verdict to give, so the fit guard is the only guard. (With the check available these
+        # same transcripts are refused outright — asserted just below.)
+        webui.ASR.enabled = False
+        try:
+            _, too_short, _, _, _ = clone(
+                (ref_sr, ref_wav), "No.", cfg["text"], "English", False,
+                0.9, 1.0, 50, 1.05, candidates=1, seed=5)
+            assert "WARNING" in too_short and "too short" in too_short, \
+                f"a one-word transcript for a multi-second clip was not flagged:\n{too_short}"
+            _, too_long, _, _, _ = clone(
+                (ref_sr, ref_wav), " ".join(["padding"] * 160), cfg["text"], "English", False,
+                0.9, 1.0, 50, 1.05, candidates=1, seed=5)
+            assert "too long" in too_long, \
+                f"a 160-word transcript for a short clip was not flagged:\n{too_long}"
+            print("  [best_of_n] fit guard flagged both implausible transcripts "
+                  "(Whisper not resident)")
+        finally:
+            webui.ASR.enabled = True
+
+        # And with Whisper resident, a transcript that is not the clip's own words is refused
+        # rather than generated from: measured cost of the old warn-and-hope was 12/12 failed
+        # takes and double the render time. Real Whisper, real confidence, real refusal.
+        audio, refused, _, _, _ = clone(
             (ref_sr, ref_wav), "No.", cfg["text"], "English", False,
             0.9, 1.0, 50, 1.05, candidates=1, seed=5)
-        assert "WARNING" in too_short and "too short" in too_short, \
-            f"a one-word transcript for a multi-second clip was not flagged:\n{too_short}"
-        _, too_long, _, _, _ = clone(
-            (ref_sr, ref_wav), " ".join(["padding"] * 160), cfg["text"], "English", False,
-            0.9, 1.0, 50, 1.05, candidates=1, seed=5)
-        assert "too long" in too_long, \
-            f"a 160-word transcript for a short clip was not flagged:\n{too_long}"
-        print("  [best_of_n] fit guard flagged both implausible transcripts")
+        assert audio is None and "does not match the clip" in refused, \
+            f"a mismatched transcript was generated from anyway:\n{refused}"
+        assert "Whisper hears" in refused, \
+            f"the refusal should say what the clip actually says:\n{refused}"
+        print("  [best_of_n] mismatched transcript refused before the GPU spent a minute on it")
     finally:
         webui.ASR.unload()
         webui.ASR = None

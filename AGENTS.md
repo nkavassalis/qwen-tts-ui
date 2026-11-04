@@ -45,9 +45,11 @@ scripts/say.py             CLI over the assistant API: /speak + /voices_availabl
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
 scripts/multi_clip_lab.py  blind A/B UI (port 7861): your one clip vs several-clip clones
                            clips for a clone. Takes the lock; writes only tests/output/
+scripts/measurements/      the scripts behind every number quoted in the docs — one process
+                           each, run from the project root; they read models/ and voices/
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 91 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 93 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
 docs/quality.md          every quality measurement and what the app does about it
 docs/design.md           the why behind the code shape, including the UI layout rules
@@ -270,14 +272,19 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   reused on the reference (`ASR.assess`). It runs in `generate_voice_clone` only when Whisper
   is loaded or best-of-N will load it anyway, so there is never a surprise 3GB load. Results
   are cached per (clip, transcript), and the checklist shows the cached verdict for exactly
-  that pair. **`REF_TEXT_CONF_WARN = -2.0` warns and never blocks**, and the scale is now
-  measured (`tmp/calibrate_and_first_piece.py`, `tmp/calibrate_2.py`): exact -0.12..-0.51
+  that pair. **Two thresholds, both measured**
+  (`scripts/measurements/calibrate_and_first_piece.py`, `scripts/measurements/calibrate_2.py`): exact -0.12..-0.51
   (noise to SNR 5 dB moves it <0.05), one word wrong -1.11..-1.34, half wrong -2.79..-3.18,
-  unrelated -4.59..-5.09. -2.0 clears a single wrong word by 0.66 and fires around 40-50%
-  wrong, so it is right as a warn line. It is **not** a safe block line: the half-wrong class
-  straddles it. If it ever blocks, block at **-3.5** — 3.0 below the worst correct transcript
-  measured, above every half-wrong case, so it fires only on "that is not this clip".
-  `smoke_test.py --only media_pipeline` prints the right-vs-wrong pair.
+  unrelated -4.59..-5.09. **`REF_TEXT_CONF_WARN = -2.0` warns and generates** — it clears a
+  single wrong word by 0.66 and fires around 40-50% wrong, and an imperfect transcript is a
+  thing to edit, not an error to obey. **`REF_TEXT_CONF_BLOCK = -3.5` refuses**: 3.0 below the
+  worst correct transcript measured, above every half-wrong case (the half-wrong class straddles
+  -2.0, which is exactly why the warn line must not block), so it fires only on "that is not
+  this clip". The cost that justifies refusing is measured, not inferred — a mismatched
+  transcript failed 12/12 takes and doubled render time, on a clean clip as well
+  (`scripts/measurements/replicate_wer.py`). Absence of a verdict (Whisper not resident, single
+  candidate) is **not** a pass: it generates uncheck-blocked, and the docs say so rather than
+  pretending otherwise. `smoke_test.py --only media_pipeline` prints the right-vs-wrong pair.
 - **Each voice can choose its Speak/Chat route** (`prefer`: auto/clip/description,
   `voice_route`). Auto keeps the measured default (description when present); a frozen clip
   is the steadier identity across a multi-sentence reply because a description is re-rolled
@@ -393,6 +400,11 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
     `test_render_cache_never_stores_a_bad_take_and_stays_bounded`.
 21. Chat's quick start only ever cuts the first piece, losslessly, at punctuation.
     `test_quick_start_cuts_only_the_first_piece_short`.
+22. A reference whose transcript is not the clip's own words is **refused**, never generated
+    with: below `REF_TEXT_CONF_BLOCK` (-3.5) `generate_voice_clone` returns a status naming the
+    confidence and what Whisper heard. Measured cost of not doing it: 12/12 takes failed to say
+    the line and render time doubled, on a clean clip too. The warn band (-2.0 to -3.5) still
+    generates. `test_reference_transcript_check`.
 
 ## Conventions
 
@@ -547,7 +559,7 @@ Run on 2026-11-03 on the same RTX 5070 Ti, covering the length study and chunkin
   pieces, 17.0s of speech, log text identical to the input.
 - **One GPU assertion was corrected, and it is on the record here because it touches the
   do-not-touch list.** `long_text`'s gap check asserted `longest quiet run < 1.0s` with the
-  message "joins were not trimmed". It failed at 1.04s. A probe (`tmp/gap_probe.py`, generates
+  message "joins were not trimmed". It failed at 1.04s. A probe (`scripts/measurements/gap_probe.py`, generates
   the same 16 pieces and mirrors `stitch_clips` to record seam offsets) showed the longest quiet
   run on a clean run was **0.64s and 1.76s away from the nearest join** — the model pausing
   inside a sentence. The bound was measuring prosody and blaming stitching. It is now 1.6s with
@@ -603,7 +615,7 @@ Run on 2026-11-03 (UI and clone-quality review) on a **CPU-only box, no GPU, no 
   `conf −0.02`/`−0.06` (the buggy scale read ~−1.9), a saved Japanese take `−0.51`, fox's
   shipped clip `−0.03`. `CONF_GOOD = −1.00` sits clear of every real measurement and is no
   longer provisional — see `docs/quality.md`.
-- **Reference cleanup measured** (`tmp/clean_reference_ab.py`, three seeds per arm, identity
+- **Reference cleanup measured** (`scripts/measurements/clean_reference_ab.py`, three seeds per arm, identity
   vs the raw reference): SIM 0.9870 → 0.9886, WER 0.000 both arms, energy above 9kHz 0.0472 →
   0.0470, the reference's own embedding 0.9991. Neutral-to-marginally-better, and specifically
   no top-end cost — the claim in `docs/quality.md`, which now carries the table.
