@@ -202,6 +202,32 @@ Same three lines, raw 24kHz decode, energy above 9kHz:
 The practical advice is to clone from a **real recording** where you can. If you save a
 generated take, keep it for Speak and Chat, not as the next clone's reference.
 
+## Several clips: an experiment, not a result yet
+
+Qwen3-TTS conditions on one reference: one clip's codec codes plus transcript, and one
+speaker embedding. More clips can only help by filling those two slots better.
+`scripts/multi_clip_lab.py` tests the candidates:
+
+| arm | codes + transcript from | embedding from |
+|---|---|---|
+| `other` | one build clip (not the most typical) | that clip |
+| `medoid` (baseline) | the most typical build clip | that clip |
+| `medoid_mean` | the most typical build clip | average of all build clips |
+| `concat` | all build clips joined (≤20s) | the joined clip |
+| `xvec_mean` | nothing (x-vector mode) | average of all build clips |
+
+**How it is scored.** Each fold holds one clip out. The primary score is SIM against that
+held-out clip, plus your blind ratings against it. SIM against the build centroid is also
+reported, but it is biased: the encoder that grades it also made the average, so it
+favours the averaging arms by construction. Takes in a trial share a seed, so every
+comparison is paired. The table reports wins/ties/losses against `medoid`, because the
+question is whether averaging beats the *best* single clip, not a random one.
+
+**Caveat.** Clips cut from one long recording share a mic and room, so their held-out
+scores are kinder than clips from different days would give.
+
+No numbers yet: record the results here once it has run on the GPU box.
+
 ## Output post-processing
 
 The vocoder is fixed at 24kHz, so nothing can add real bandwidth above 12kHz. What *can* be

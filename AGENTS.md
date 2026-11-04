@@ -43,9 +43,11 @@ run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
                            through paplay/ffplay/aplay/afplay
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
+scripts/multi_clip_lab.py  experiment + blind-listening UI (port 7861): one clip vs several
+                           clips for a clone. Takes the lock; writes only tests/output/
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 88 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 91 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
 docs/quality.md          every quality measurement and what the app does about it
 docs/design.md           the why behind the code shape, including the UI layout rules
@@ -75,7 +77,7 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 88 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 91 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~2 min, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -449,6 +451,16 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   the reference's codec codes, x-vector does not); an opt-in denoiser A/B on noisy
   references (noise was the biggest SIM loss, −0.020); a `say.py --warm` to pre-render
   common lines.
+- **Multi-clip clones: experiment built, never run on a GPU.** The model takes one
+  reference (one clip's codes + one embedding), so `scripts/multi_clip_lab.py` compares the
+  ways several clips can fill those two slots — the most typical clip, its codes with the
+  averaged embedding, all clips joined, averaged embedding alone — against one clip, scored
+  on a held-out clip and by blind listener ratings. Nothing in the main UI or the saved-voice
+  format changes unless an arm wins on *both* held-out SIM and ratings. SIM against the build
+  centroid is graded by the same encoder that made the average; it is shown, labelled
+  biased, and must not be the deciding number. CPU tests cover the plumbing with a fake
+  model (`test_multi_clip_lab_end_to_end_with_a_fake_model`); the hand-built
+  `VoiceClonePromptItem` matches upstream's fields but has not met the real model yet.
 - **`webui/app.py` is ~3,800 lines.** Natural seams for a split: `hub.py` (ModelHub,
   memory guards, lock), `media.py` (ingest, path guards, reference analysis/cleanup),
   `asr.py` (Transcriber), `scoring.py` (penalty, defects, labels), `chunking.py`,

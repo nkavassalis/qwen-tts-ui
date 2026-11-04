@@ -2787,6 +2787,177 @@ def test_cjk_is_scored_per_character() -> None:
     check("too long" in webui.transcript_fit(3.0, exact * 3), "30 characters do not")
 
 
+
+def _lab():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "scripts"))
+    import multi_clip_lab
+    return multi_clip_lab
+
+
+def test_multi_clip_helpers() -> None:
+    """Folds, medoid, averaged embedding, screening, concat, loudness, the summary."""
+    import random
+    lab = _lab()
+    try:
+        lab.make_folds(2, 4)
+        check(False, "two clips cannot make a held-out fold")
+    except ValueError:
+        pass
+    folds = lab.make_folds(6, 4)
+    check(len(folds) == 4 and len({h for h, _ in folds}) == 4, f"4 distinct held-out: {folds}")
+    check(all(h not in b and len(b) == 5 for h, b in folds), "held-out never in its build set")
+    check(len(lab.make_folds(3, 10)) == 3, "folds capped at the clip count")
+
+    e = [np.array([1.0, 0.0, 0.0]), np.array([0.9, 0.1, 0.0]), np.array([0.8, 0.2, 0.1]),
+         np.array([0.0, 0.0, 1.0])]
+    check(lab.medoid_index(e[:3]) == 1, "the middle vector is the medoid")
+    check(lab.other_index(3, 0) == 1 and lab.other_index(3, 2) == 0, "other is never the medoid")
+    big = [np.array([10.0, 0.0]), np.array([0.0, 1.0])]
+    m = lab.mean_embedding(big)
+    check(abs(np.linalg.norm(m) - 5.5) < 1e-4, f"rescaled to the mean norm: {np.linalg.norm(m)}")
+    check(abs(m[0] - m[1]) < 1e-4, "averages directions, so the big-norm clip does not dominate")
+    check(m.dtype == np.float32, "float32 out")
+    flags = lab.screen_clips(e)
+    check(flags[3]["outlier"] and not any(f["outlier"] for f in flags[:3]),
+          f"the orthogonal clip is the outlier: {flags}")
+
+    sr = 1000
+    wavs = [np.ones(8000, np.float32), np.ones(8000, np.float32), np.ones(8000, np.float32)]
+    joined, text, used = lab.concat_clips(wavs, ["a", "b", "c"], sr, max_seconds=20.0, gap=0.5)
+    check(used == 2 and text == "a b" and len(joined) == 16500, f"capped at 20s: {used} {len(joined)}")
+    joined, _, used = lab.concat_clips([np.ones(30000, np.float32)], ["long"], sr, max_seconds=20.0)
+    check(used == 1 and len(joined) == 30000, "always keeps the first clip")
+
+    rng = np.random.default_rng(0)
+    quiet, loud = 0.01 * rng.standard_normal(24000), 0.5 * rng.standard_normal(24000)
+    a, b = lab.loudness_match(quiet), lab.loudness_match(loud)
+    check(abs(np.sqrt(np.mean(a ** 2)) - np.sqrt(np.mean(b ** 2))) < 1e-3, "same RMS")
+    check(np.max(np.abs(b)) <= 0.95 + 1e-6, "peak-limited without clipping")
+    check(not np.any(lab.loudness_match(np.zeros(10))), "silence stays silence")
+    t = np.arange(48000) / 48000.0
+    check(lab.high_band_milli(np.sin(2 * np.pi * 200 * t), 48000) < 1, "a 200Hz tone has no top end")
+    check(lab.high_band_milli(np.sin(2 * np.pi * 12000 * t), 48000) > 990, "a 12kHz tone is all top")
+    check(lab.high_band_milli(np.ones(100), 16000) is None, "no band above Nyquist")
+
+    trials = lab.build_trials(2, 2, [1, 2], lab.ARM_KEYS, random.Random(0))
+    check(len(trials) == 8 and len({t["id"] for t in trials}) == 8, "one trial per fold×sent×seed")
+    check(all(sorted(t["order"]) == sorted(lab.ARM_KEYS) for t in trials), "every arm in each")
+    check(len({tuple(t["order"]) for t in trials}) > 1, "orders are shuffled")
+
+    takes = [{"trial": "t1", "arm": a, "sim_heldout": s, "wer": 0.0}
+             for a, s in (("medoid", 0.80), ("medoid_mean", 0.85), ("other", 0.70))]
+    ratings = {"t1": {"scores": {"medoid": 3, "medoid_mean": 4, "other": 3}, "best": "medoid_mean"}}
+    rows = {r["arm"]: r for r in lab.summarise(takes, ratings)}
+    check(rows["medoid_mean"]["listen_wtl"] == (1, 0, 0), "a listener win against the baseline")
+    check(rows["other"]["listen_wtl"] == (0, 1, 0) and rows["other"]["sim_wtl"] == (0, 0, 1),
+          "a tie on ears, a loss on SIM")
+    check("listen_wtl" not in rows["medoid"], "the baseline is not compared with itself")
+    check(rows["medoid_mean"]["best_share"] == 1.0, "picked best every time")
+    md = lab.summary_markdown(list(rows.values()), 1)
+    check("biased" in md and "medoid_mean" in md, "the table says which column is biased")
+
+
+def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
+    """Screen, render every arm, rate blind through the UI's own handlers, read the results."""
+    import threading
+    import torch
+    lab = _lab()
+    sr = 24000
+
+    def embed(wav):
+        spec = np.abs(np.fft.rfft(np.asarray(wav, np.float64)[:24000], n=24000))[:2000]
+        return torch.tensor(spec.reshape(16, -1).sum(axis=1), dtype=torch.bfloat16)
+
+    seen_prompts: list = []
+
+    class FakeModel:
+        def extract_speaker_embedding(self, audio, sr):
+            assert sr == 24000
+            return embed(audio)
+
+    class FakeTTS:
+        model = FakeModel()
+
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+            wav, _ = ref_audio
+            return [VoiceClonePromptItem(ref_code=torch.zeros(len(wav) // 1920, 16),
+                                         ref_spk_embedding=embed(wav), x_vector_only_mode=False,
+                                         icl_mode=True, ref_text=ref_text)]
+
+        def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens, **kw):
+            item = voice_clone_prompt[0]
+            seen_prompts.append(item)
+            assert item.ref_spk_embedding.dtype == torch.bfloat16, "mean cast back to model dtype"
+            hz = 120 + float(item.ref_spk_embedding.float().argmax()) * 7 + torch.rand(1).item()
+            n = int(sr * 1.5)
+            return [(0.3 * np.sin(2 * np.pi * hz * np.arange(n) / sr)).astype(np.float32)], sr
+
+    class FakeHub:
+        lock = threading.RLock()
+
+        def acquire(self, capability):
+            assert capability == "voice_clone"
+            return FakeTTS()
+
+    def speech(hz, seconds=4.0):
+        t = np.arange(int(sr * seconds)) / sr
+        env = (np.sin(2 * np.pi * 1.5 * t) > -0.3).astype(np.float32)
+        return (0.3 * env * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        clips = [{"name": f"c{i}.wav", "wav": speech(hz), "sr": sr, "text": f"clip number {i}"}
+                 for i, hz in enumerate((150, 155, 160, 900))]
+        lab_obj = lab.Lab(FakeHub(), asr=None, out_root=tmp)
+        clips = lab_obj.screen(clips, "English")
+        check(all("embedding" in c and "report" in c for c in clips), "screened")
+        run_dir = lab_obj.render(clips, ["One sentence.", "", "Two sentences."], [7], 4,
+                                 "English", True)
+        run = lab.load_run(os.path.basename(run_dir), tmp)
+        check(len(run["trials"]) == 4 * 2, f"4 folds × 2 sentences: {len(run['trials'])}")
+        check(len(run["takes"]) == 8 * len(lab.ARM_KEYS), "one take per arm per trial")
+        check(all(os.path.isfile(os.path.join(run_dir, d, t["file"]))
+                  for t in run["takes"] for d in ("takes", "listen")), "raw and listening copies")
+        check(all(t["sim_heldout"] is not None and t["sim_build"] is not None for t in run["takes"]),
+              "every take scored against held-out and centroid")
+        xv = [p for p in seen_prompts if p.x_vector_only_mode]
+        check(xv and all(p.ref_code is None and p.ref_text is None for p in xv),
+              "x-vector arm carries no codes and no transcript")
+        for f in run["folds"]:
+            check(f["heldout"] not in f["build"] and f["medoid"] != f["other"], f"fold sane: {f}")
+
+        demo = lab.build_lab_ui(lab_obj, [])
+        fns = {getattr(bf.fn, "__name__", ""): bf.fn for bf in demo.fns.values()}
+        run_id = os.path.basename(run_dir)
+        out = fns["show_trial"](run_id)
+        check(out[0] and "Trial 1 of 8" in out[1] and os.path.isfile(out[2]), "first trial shown")
+        n = len(lab.ARM_KEYS)
+        out = fns["save_and_next"](run_id, out[0], None, "", *(["3"] * n))
+        check("Rate every take" in out[1] and not lab.load_ratings(run_id, tmp),
+              "an incomplete rating is refused, nothing saved")
+        for i in range(8):
+            trial_id = out[0]
+            check(bool(trial_id), f"trial {i} available")
+            trial = next(t for t in run["trials"] if t["id"] == trial_id)
+            scores = ["5" if arm == "medoid_mean" else "2" for arm in trial["order"]]
+            best = "ABCDE"[trial["order"].index("medoid_mean")]
+            out = fns["save_and_next"](run_id, trial_id, best, "", *scores)
+        check(out[0] is None and "All 8 trials rated" in out[1], "done after the last trial")
+        ratings = lab.load_ratings(run_id, tmp)
+        check(all(r["best"] == "medoid_mean" and r["scores"]["medoid_mean"] == 5
+                  for r in ratings.values()), "letters were mapped back to the right arms")
+        md = lab.results_markdown(run_id, tmp)
+        check("8/0/0" in md and "100%" in md, f"results reflect the ratings:\n{md}")
+        check(any(c["outlier"] for c in run["clips"]) and "outlier" in md,
+              "the 900Hz clip is flagged and reported")
+        try:
+            lab.load_run("../" + run_id, tmp)
+            check(False, "a run id cannot walk out of the output dir")
+        except ValueError:
+            pass
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

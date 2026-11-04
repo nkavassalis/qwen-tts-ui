@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Newest first.
 
 ### Added
 
+- **`scripts/multi_clip_lab.py` — does a clone from several clips beat one?** An experiment
+  with its own web UI (port 7861, same login options and single-owner lock as the app). Give
+  it 3+ clips of one person. It screens them (Whisper transcripts you can correct, outlier
+  and reference-quality flags). Then it renders five arms on the same sentences and seeds:
+  one clip, the most typical clip, that clip's codes with the averaged speaker embedding,
+  all clips joined, and the averaged embedding alone. Each fold holds one clip out. The
+  **Listen** tab plays that real held-out clip, then the arms' takes, blind, shuffled and
+  loudness-matched. You rate each 1–5 and pick a favourite. **Results** puts your ratings
+  beside held-out SIM, WER, top-end energy and paired wins/ties/losses against the most
+  typical clip. `--render-only` runs headless; `--listen-only` rates an old run with no GPU.
+  Nothing in the app or saved voices changes yet.
+
 - **A render cache for Speak and Chat.** Every sentence they render is kept per voice. The
   same sentence in the same voice, language, sampling settings and weights replays from disk
   instead of costing 7–11s of generation. "Tests passed." is instant the second time, and a

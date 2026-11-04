@@ -301,6 +301,7 @@ requirements.txt       direct deps (torch and transformers are pinned in setup.s
 webui/app.py           the Gradio UI, model manager, scoring, media and voice library
 scripts/say.py         speak a line through the running server (the /speak API)
 scripts/make_voice.py  create a described voice from the shell
+scripts/multi_clip_lab.py  experiment: is a clone from several clips better? (blind listening UI)
 tests/test_app_logic.py  CPU tier: no GPU or weights needed
 tests/smoke_test.py      GPU tier: end-to-end flows that generate and check real audio
 docs/                  quality measurements and design rationale
@@ -328,7 +329,7 @@ non-clipping and of plausible length. A skipped case counts as a failure unless 
 
 | Symptom | Cause / fix |
 |---|---|
-| `Another Qwen3-TTS process is already holding the weights` | Only one process may own the weights. Stop the web UI before the smoke test or `make_voice.py` |
+| `Another Qwen3-TTS process is already holding the weights` | Only one process may own the weights. Stop the web UI before the smoke test, `make_voice.py` or `multi_clip_lab.py` |
 | `MemoryError: … would leave less than the …MB floor` | RAM is genuinely tight: close other GPU/LLM processes or use `--max-cpu-resident 1` |
 | The whole machine hard-locks | WSL2 ballooning — see *Memory safety* |
 | Generation takes minutes, GPU ~35% busy | The speech tokenizer is on the CPU; something bypassed `ModelHub._move()` ([design.md](docs/design.md)) |
