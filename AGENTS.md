@@ -43,7 +43,7 @@ run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
                            through paplay/ffplay/aplay/afplay
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
-scripts/multi_clip_lab.py  experiment + blind-listening UI (port 7861): one clip vs several
+scripts/multi_clip_lab.py  blind A/B UI (port 7861): your one clip vs several-clip clones
                            clips for a clone. Takes the lock; writes only tests/output/
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
@@ -452,15 +452,21 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   references (noise was the biggest SIM loss, −0.020); a `say.py --warm` to pre-render
   common lines.
 - **Multi-clip clones: experiment built, never run on a GPU.** The model takes one
-  reference (one clip's codes + one embedding), so `scripts/multi_clip_lab.py` compares the
-  ways several clips can fill those two slots — the most typical clip, the cleanest clip, its codes with the
-  averaged embedding, all clips joined, averaged embedding alone — against one clip, scored
-  on a held-out clip and by blind listener ratings. Nothing in the main UI or the saved-voice
-  format changes unless an arm wins on *both* held-out SIM and ratings. SIM against the build
-  centroid is graded by the same encoder that made the average; it is shown, labelled
-  biased, and must not be the deciding number. CPU tests cover the plumbing with a fake
-  model (`test_multi_clip_lab_end_to_end_with_a_fake_model`); the hand-built
-  `VoiceClonePromptItem` matches upstream's fields but has not met the real model yet.
+  reference (one clip's codes + one embedding), so `scripts/multi_clip_lab.py` compares
+  several ways of filling those slots from several clips against the listener's own clip:
+  - the same codes with an averaged embedding (`single_mean`, which isolates averaging);
+  - all clips joined;
+  - the cleanest clip;
+  - the averaged embedding alone.
+
+  It runs as blind A/B pairs against a held-out real clip, scored with an exact sign test,
+  plus paired held-out SIM. Nothing in the main UI or the saved-voice format changes unless
+  a version wins on the listener verdict and SIM does not disagree. SIM against the build
+  average is graded by the encoder that made the average, so it is not reported. CPU tests
+  drive it with a fake model through the UI's own handlers:
+  `test_multi_clip_lab_end_to_end_with_a_fake_model`. Serving the A/B audio was checked
+  against a live server. The hand-built `VoiceClonePromptItem`s match upstream's fields but
+  have not met the real model yet.
 - **`webui/app.py` is ~3,800 lines.** Natural seams for a split: `hub.py` (ModelHub,
   memory guards, lock), `media.py` (ingest, path guards, reference analysis/cleanup),
   `asr.py` (Transcriber), `scoring.py` (penalty, defects, labels), `chunking.py`,

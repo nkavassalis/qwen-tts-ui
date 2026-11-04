@@ -6,17 +6,26 @@ All notable changes to this project are documented here. Newest first.
 
 ### Added
 
-- **`scripts/multi_clip_lab.py` — does a clone from several clips beat one?** An experiment
-  with its own web UI (port 7861, same login options and single-owner lock as the app). Give
-  it 3+ clips of one person. It screens them (Whisper transcripts you can correct, outlier
-  and reference-quality flags). Then it renders six arms on the same sentences and seeds:
-  one clip, the most typical clip, the cleanest clip by the reference checks, the typical clip's codes with the averaged speaker embedding,
-  all clips joined, and the averaged embedding alone. Each fold holds one clip out. The
-  **Listen** tab plays that real held-out clip, then the arms' takes, blind, shuffled and
-  loudness-matched. You rate each 1–5 and pick a favourite. **Results** puts your ratings
-  beside held-out SIM, WER, top-end energy and paired wins/ties/losses against the most
-  typical clip. `--render-only` runs headless; `--listen-only` rates an old run with no GPU.
-  Nothing in the app or saved voices changes yet.
+- **`scripts/multi_clip_lab.py` — is a clone from several clips better than your one clip?**
+  An experiment with its own web UI (port 7861, the same login options and single-owner lock
+  as the app). Add 3+ clips of one person, or one long recording, cut into ~6s clips. Pick
+  the clip you'd use in the Clone tab, which becomes the baseline and is never held out.
+  **Screen** runs Whisper for transcripts you can correct, flags outliers and reference
+  problems, and gives each clip a cleanliness score. **Render** makes, on the same sentences
+  and seeds:
+  - your clip;
+  - your clip's codes with the averaged speaker embedding, so only the embedding differs;
+  - all clips joined;
+  - the cleanest clip;
+  - the averaged embedding alone.
+
+  **Listen** is a blind A/B. You hear the real person (a held-out clip), then your clip's take
+  and one other version, in random order and loudness-matched, and click A, B or *can't
+  tell*. Undo is there for a misclick. **Results** gives each version's tally against your
+  clip with an exact sign test, and the same paired comparison on held-out SIM. It also
+  checks the listener: identical pairs, and a bias toward one side. `--render-only` runs
+  headless and `--listen-only` A/Bs an old run without a GPU. Nothing in the app or saved
+  voices changes yet.
 
 - **A render cache for Speak and Chat.** Every sentence they render is kept per voice. The
   same sentence in the same voice, language, sampling settings and weights replays from disk

@@ -206,32 +206,46 @@ generated take, keep it for Speak and Chat, not as the next clone's reference.
 
 Qwen3-TTS conditions on one reference: one clip's codec codes plus transcript, and one
 speaker embedding. More clips can only help by filling those two slots better.
-`scripts/multi_clip_lab.py` tests the candidates:
+`scripts/multi_clip_lab.py` tests each candidate against **the clip you would use today**:
 
-| arm | codes + transcript from | embedding from |
+| version | codes + transcript from | embedding from |
 |---|---|---|
-| `other` | one build clip (not the most typical) | that clip |
-| `medoid` (baseline) | the most typical build clip | that clip |
-| `cleanest` | the build clip that scores best on the reference checks | that clip |
-| `medoid_mean` | the most typical build clip | average of all build clips |
+| `single` (baseline) | your clip | your clip |
+| `single_mean` | your clip | average of all build clips |
 | `concat` | all build clips joined (≤20s) | the joined clip |
+| `cleanest` | the clip that does best on the reference checks | that clip |
 | `xvec_mean` | nothing (x-vector mode) | average of all build clips |
 
-**How it is scored.** Each fold holds one clip out. The primary score is SIM against that
-held-out clip, plus your blind ratings against it. SIM against the build centroid is also
-reported, but it is biased: the encoder that grades it also made the average, so it
-favours the averaging arms by construction. Takes in a trial share a seed, so every
-comparison is paired. The table reports wins/ties/losses against `medoid`, because the
-question is whether averaging beats the *best* single clip, not a random one.
+`single_mean` differs from `single` only in the embedding, so its pair isolates the effect of
+averaging. `cleanest` asks a different question: would picking a better single clip have
+done as well?
 
-**Caveat.** Clips cut from one long recording share a mic and room, so their held-out
-scores are kinder than clips from different days would give.
+**How it is judged.** Each round holds out one clip, never yours, and builds every version
+from the rest. The listener gets one forced choice per pair. They hear the held-out real
+clip, then A and B: your clip's take and one other version, on the same sentence and seed,
+in random order and loudness-matched. The answer is A, B or *can't tell*. A forced choice
+against a reference is what listeners are reliable at. Rating several takes at once on a
+1–5 scale was not: the scale drifts, and it never asks "better than what I have?"
 
-`cleanest` ranks clips on the reference checks. A transcript that doesn't fit counts
-most, then noise (SNR, capped at 40dB), then clipping, speech coverage and edges, the order
-they were measured to cost. When it picks the same clip as `medoid`, the medoid's take is
-reused rather than re-rendered. The listener then hears the same take twice, which shows
-how consistent the ratings are.
+Each version gets a tally against your clip and an exact two-sided sign test. There is no
+verdict under 10 decided pairs; 7 of 10 is p≈0.34, so not a finding. Held-out SIM gets the
+same paired comparison. SIM against the build-clip average is deliberately not reported: the
+encoder that made the average would be grading it.
+
+Two checks on the listener are built in:
+- **Identical pairs.** When the cleanest clip *is* your clip, its pair plays the same take
+  twice, and the honest answer is *can't tell*.
+- **Side bias.** The results show how often A was chosen.
+
+**When it is worth building.** A version earns a place in the app only if:
+- the listener verdict is **better**;
+- held-out SIM doesn't disagree;
+- WER is no worse.
+
+"No clear difference" after 20+ pairs is an answer too.
+
+**Caveat.** Clips cut from one long recording share a mic and room, so they are a kinder
+test than clips from different days.
 
 No numbers yet: record the results here once it has run on the GPU box.
 

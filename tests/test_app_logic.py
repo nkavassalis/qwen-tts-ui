@@ -2796,23 +2796,25 @@ def _lab():
 
 
 def test_multi_clip_helpers() -> None:
-    """Folds, medoid, averaged embedding, screening, concat, loudness, the summary."""
+    """Rounds, medoid, averaged embedding, screening, concat, loudness, A/B maths."""
     import random
     lab = _lab()
     try:
         lab.make_folds(2, 4)
-        check(False, "two clips cannot make a held-out fold")
+        check(False, "two clips cannot make a held-out round")
     except ValueError:
         pass
     folds = lab.make_folds(6, 4)
     check(len(folds) == 4 and len({h for h, _ in folds}) == 4, f"4 distinct held-out: {folds}")
     check(all(h not in b and len(b) == 5 for h, b in folds), "held-out never in its build set")
-    check(len(lab.make_folds(3, 10)) == 3, "folds capped at the clip count")
+    check(len(lab.make_folds(3, 10)) == 3, "rounds capped at the clip count")
+    kept = lab.make_folds(4, 10, keep=2)
+    check(len(kept) == 3 and all(h != 2 and 2 in b for h, b in kept),
+          f"your clip is never held out, always built from: {kept}")
 
     e = [np.array([1.0, 0.0, 0.0]), np.array([0.9, 0.1, 0.0]), np.array([0.8, 0.2, 0.1]),
          np.array([0.0, 0.0, 1.0])]
     check(lab.medoid_index(e[:3]) == 1, "the middle vector is the medoid")
-    check(lab.other_index(3, 0) == 1 and lab.other_index(3, 2) == 0, "other is never the medoid")
     big = [np.array([10.0, 0.0]), np.array([0.0, 1.0])]
     m = lab.mean_embedding(big)
     check(abs(np.linalg.norm(m) - 5.5) < 1e-4, f"rescaled to the mean norm: {np.linalg.norm(m)}")
@@ -2840,20 +2842,6 @@ def test_multi_clip_helpers() -> None:
     check(lab.high_band_milli(np.sin(2 * np.pi * 12000 * t), 48000) > 990, "a 12kHz tone is all top")
     check(lab.high_band_milli(np.ones(100), 16000) is None, "no band above Nyquist")
 
-    trials = lab.build_trials(2, 2, [1, 2], lab.ARM_KEYS, random.Random(0))
-    check(len(trials) == 8 and len({t["id"] for t in trials}) == 8, "one trial per fold×sent×seed")
-    check(all(sorted(t["order"]) == sorted(lab.ARM_KEYS) for t in trials), "every arm in each")
-    check(len({tuple(t["order"]) for t in trials}) > 1, "orders are shuffled")
-
-    takes = [{"trial": "t1", "arm": a, "sim_heldout": s, "wer": 0.0}
-             for a, s in (("medoid", 0.80), ("medoid_mean", 0.85), ("other", 0.70))]
-    ratings = {"t1": {"scores": {"medoid": 3, "medoid_mean": 4, "other": 3}, "best": "medoid_mean"}}
-    rows = {r["arm"]: r for r in lab.summarise(takes, ratings)}
-    check(rows["medoid_mean"]["listen_wtl"] == (1, 0, 0), "a listener win against the baseline")
-    check(rows["other"]["listen_wtl"] == (0, 1, 0) and rows["other"]["sim_wtl"] == (0, 0, 1),
-          "a tie on ears, a loss on SIM")
-    check("listen_wtl" not in rows["medoid"], "the baseline is not compared with itself")
-    check(rows["medoid_mean"]["best_share"] == 1.0, "picked best every time")
     q_clean = lab.reference_quality(np.zeros(100, np.float32), 24000)
     check(q_clean["coverage"] == 0.0, "silence has no speech")
     good = {"snr": 35.0, "coverage": 0.7, "edges_ok": True, "clipped": 0.0}
@@ -2863,12 +2851,30 @@ def test_multi_clip_helpers() -> None:
     check(lab.clean_score(good, -1.0) > lab.clean_score(good, -3.0), "a misfit transcript costs most")
     check(lab.clean_score(dict(good, snr=90.0)) == lab.clean_score(dict(good, snr=40.0)),
           "SNR is capped")
-    md = lab.summary_markdown(list(rows.values()), 1)
-    check("biased" in md and "medoid_mean" in md, "the table says which column is biased")
+
+    trials = lab.build_trials(2, 2, [1, 2])
+    check(len(trials) == 8 and len({t["id"] for t in trials}) == 8, "one trial per round×sent×seed")
+    pairs = lab.build_pairs(trials, lab.CHALLENGERS, random.Random(0))
+    check(len(pairs) == 8 * len(lab.CHALLENGERS), "one pair per trial per challenger")
+    sides = [p["single_side"] for p in pairs]
+    check(0 < sides.count("A") < len(sides), "your clip lands on both sides")
+    check(all(p["challenger"] != lab.BASELINE for p in pairs), "your clip is never a challenger")
+
+    check(lab.sign_test_p(0, 0) == 1.0, "no data, no evidence")
+    check(abs(lab.sign_test_p(5, 5) - 1.0) < 1e-9, "an even split is no evidence")
+    check(abs(lab.sign_test_p(10, 0) - 2 / 1024) < 1e-9, "10-0 is p≈0.002")
+    check(lab.sign_test_p(7, 3) > 0.3, "7 of 10 is not a finding")
+    check(lab.sign_test_p(3, 7) == lab.sign_test_p(7, 3), "two-sided")
+    check("too few" in lab.verdict(6, 0), "under 10 decided pairs: no verdict")
+    check("better" in lab.verdict(15, 3) and "worse" in lab.verdict(3, 15), "clear splits")
+    check("no clear difference" in lab.verdict(12, 9), "a close split")
+
+    clips = lab.unique_names([{"name": "take.wav"}, {"name": "take.wav"}, {"name": "x.wav"}])
+    check([c["name"] for c in clips] == ["take.wav", "take.wav (2)", "x.wav"], "names stay unique")
 
 
 def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
-    """Screen, render every arm, rate blind through the UI's own handlers, read the results."""
+    """Screen, render every version, A/B through the UI's own handlers, undo, read results."""
     import threading
     import torch
     lab = _lab()
@@ -2910,67 +2916,98 @@ def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
             assert capability == "voice_clone"
             return FakeTTS()
 
-    def speech(hz, seconds=4.0):
+    def speech(hz, seconds=4.0, noise=0.0):
         t = np.arange(int(sr * seconds)) / sr
         env = (np.sin(2 * np.pi * 1.5 * t) > -0.3).astype(np.float32)
-        return (0.3 * env * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+        hiss = noise * np.random.default_rng(int(hz)).standard_normal(t.size)
+        return (0.3 * env * np.sin(2 * np.pi * hz * t) + hiss).astype(np.float32)
 
     with tempfile.TemporaryDirectory() as tmp:
-        clips = [{"name": f"c{i}.wav", "wav": speech(hz), "sr": sr, "text": f"clip number {i}"}
-                 for i, hz in enumerate((150, 155, 160, 900))]
+        # Clip 0 is "yours" and noisy, so the cleanest clip is a different one.
+        clips = [{"name": f"c{i}.wav", "wav": speech(hz, noise=0.05 if i == 0 else 0.0), "sr": sr,
+                  "text": f"clip number {i}"} for i, hz in enumerate((150, 155, 160, 900))]
         lab_obj = lab.Lab(FakeHub(), asr=None, out_root=tmp)
         clips = lab_obj.screen(clips, "English")
-        check(all("embedding" in c and "report" in c for c in clips), "screened")
+        check(all("embedding" in c and "clean_score" in c for c in clips), "screened")
         run_dir = lab_obj.render(clips, ["One sentence.", "", "Two sentences."], [7], 4,
-                                 "English", True)
-        run = lab.load_run(os.path.basename(run_dir), tmp)
-        check(len(run["trials"]) == 4 * 2, f"4 folds × 2 sentences: {len(run['trials'])}")
-        check(len(run["takes"]) == 8 * len(lab.ARM_KEYS), "one take per arm per trial")
+                                 "English", single=0)
+        run_id = os.path.basename(run_dir)
+        run = lab.load_run(run_id, tmp)
+        check(len(run["folds"]) == 3 and all(f["heldout"] != "c0.wav" and f["single"] == "c0.wav"
+                                             for f in run["folds"]),
+              "your clip is the baseline every round and never held out")
+        check(len(run["trials"]) == 3 * 2, f"3 rounds × 2 sentences: {len(run['trials'])}")
+        check(len(run["takes"]) == 6 * len(lab.ARM_KEYS), "one take per version per trial")
+        check(len(run["pairs"]) == 6 * len(lab.CHALLENGERS), "one pair per challenger per trial")
         check(all(os.path.isfile(os.path.join(run_dir, d, t["file"]))
                   for t in run["takes"] for d in ("takes", "listen")), "raw and listening copies")
-        check(all(t["sim_heldout"] is not None and t["sim_build"] is not None for t in run["takes"]),
-              "every take scored against held-out and centroid")
         xv = [p for p in seen_prompts if p.x_vector_only_mode]
         check(xv and all(p.ref_code is None and p.ref_text is None for p in xv),
-              "x-vector arm carries no codes and no transcript")
-        for f in run["folds"]:
-            check(f["heldout"] not in f["build"] and f["medoid"] != f["other"], f"fold sane: {f}")
-            check(f["cleanest"] in f["build"], f"cleanest comes from the build set: {f}")
-        check(all(c.get("clean_score") is not None for c in run["clips"]), "every clip scored")
-        by_trial = {}
-        for t in run["takes"]:
-            by_trial.setdefault(t["trial"], {})[t["arm"]] = t
-        for f_i, f in enumerate(run["folds"]):
-            for tid, arms in by_trial.items():
-                if tid.startswith(f"f{f_i}_") and f["cleanest"] == f["medoid"]:
-                    check(arms["cleanest"].get("same_as") == "medoid"
-                          and arms["cleanest"]["file"] == arms["medoid"]["file"],
-                          "cleanest == medoid reuses the take instead of re-rendering")
+              "x-vector version carries no codes and no transcript")
+        mean_item = [p for p in seen_prompts if not p.x_vector_only_mode
+                     and p.ref_text == "clip number 0"]
+        codes = {id(p.ref_code) for p in mean_item}
+        check(len(mean_item) >= 2 and len(codes) == 1,
+              "the averaged version reuses your clip's own codes and transcript")
+
+        # The same-clip case: with your clip also the cleanest, its pairs are identical.
+        twin_dir = lab_obj.render(clips, ["One sentence."], [7], 2, "English",
+                                  single=max(range(4), key=lambda i: clips[i]["clean_score"]))
+        twin = lab.load_run(os.path.basename(twin_dir), tmp)
+        same = [p for p in twin["pairs"] if p["challenger"] == "cleanest"]
+        check(same and all(p["identical"] for p in same), "cleanest == yours: identical pairs")
+        check(all(t.get("same_as") == "single" for t in twin["takes"] if t["arm"] == "cleanest"),
+              "and its take is reused, not re-rendered")
 
         demo = lab.build_lab_ui(lab_obj, [])
-        fns = {getattr(bf.fn, "__name__", ""): bf.fn for bf in demo.fns.values()}
-        run_id = os.path.basename(run_dir)
-        out = fns["show_trial"](run_id)
-        check(out[0] and "Trial 1 of 8" in out[1] and os.path.isfile(out[2]), "first trial shown")
-        n = len(lab.ARM_KEYS)
-        out = fns["save_and_next"](run_id, out[0], None, "", *(["3"] * n))
-        check("Rate every take" in out[1] and not lab.load_ratings(run_id, tmp),
-              "an incomplete rating is refused, nothing saved")
-        for i in range(8):
-            trial_id = out[0]
-            check(bool(trial_id), f"trial {i} available")
-            trial = next(t for t in run["trials"] if t["id"] == trial_id)
-            scores = ["5" if arm == "medoid_mean" else "2" for arm in trial["order"]]
-            best = lab.LETTERS[trial["order"].index("medoid_mean")]
-            out = fns["save_and_next"](run_id, trial_id, best, "", *scores)
-        check(out[0] is None and "All 8 trials rated" in out[1], "done after the last trial")
-        ratings = lab.load_ratings(run_id, tmp)
-        check(all(r["best"] == "medoid_mean" and r["scores"]["medoid_mean"] == 5
-                  for r in ratings.values()), "letters were mapped back to the right arms")
+        h = demo.lab_handlers
+        arms = list(lab.CHALLENGERS)
+        out = h["show_pair"](run_id, arms)
+        check(out[0] and "Pair 1 of" in out[1] and all(os.path.isfile(x) for x in out[2:]),
+              f"first pair shown with three players: {out[1]}")
+        check(out[3] != out[4], "A and B are different takes")
+        # Always prefer the averaged version, prefer your clip over everything else.
+        answered = 0
+        while out[0]:
+            pair = next(p for p in run["pairs"] if p["id"] == out[0])
+            want_challenger = pair["challenger"] == "single_mean"
+            single_side = pair["single_side"]
+            picked = ({"A": "B", "B": "A"}[single_side]) if want_challenger else single_side
+            if pair["challenger"] == "xvec_mean" and answered % 2:
+                picked = "tie"
+            out = h["answer"](run_id, arms, out[0], picked)
+            answered += 1
+            if answered == 3:
+                undone = h["undo"](run_id, arms)
+                check("Undone" in undone[1] and undone[0] is not None, "undo shows the pair again")
+                check(len(lab.load_answers(run_id, tmp)) == 2, "undo removed one answer")
+                again = next(p for p in run["pairs"] if p["id"] == undone[0])
+                re_pick = (({"A": "B", "B": "A"}[again["single_side"]])
+                           if again["challenger"] == "single_mean" else again["single_side"])
+                if again["challenger"] == "xvec_mean":
+                    re_pick = "tie" if answered % 2 else re_pick
+                out = h["answer"](run_id, arms, undone[0], re_pick)
+            check(answered < 100, "terminates")
+        check("All 24 pairs answered" in out[1], f"done: {out[1]}")
+        answers = lab.load_answers(run_id, tmp)
+        check(len(answers) == 24, "one answer per pair")
+        by = {}
+        for p in run["pairs"]:
+            by.setdefault(p["challenger"], []).append(answers[p["id"]]["choice"])
+        check(set(by["single_mean"]) == {"challenger"} and set(by["concat"]) == {"single"},
+              f"clicks map back to the right version whatever side it was on: {by}")
         md = lab.results_markdown(run_id, tmp)
-        check("8/0/0" in md and "100%" in md, f"results reflect the ratings:\n{md}")
-        check(any(c["outlier"] for c in run["clips"]) and "outlier" in md,
-              "the 900Hz clip is flagged and reported")
+        check("6 / 0 / 0" in md and "0 / 6 / 0" in md, f"tallies:\n{md}")
+        check("too few to tell" in md, "6 pairs per version is too few for a verdict")
+        check("baseline: c0.wav" in md, "the results say which clip was the baseline")
+
+        out = h["show_pair"](run_id, ["concat"])
+        check(out[0] is None and "All 6 pairs" in out[1], "a version filter narrows the queue")
+        old = os.path.join(tmp, "old")
+        os.makedirs(old)
+        with open(os.path.join(old, "run.json"), "w") as fh:
+            fh.write('{"id": "old", "takes": [], "trials": []}')
+        check("older version" in h["show_pair"]("old", arms)[1], "an old-format run is refused")
         try:
             lab.load_run("../" + run_id, tmp)
             check(False, "a run id cannot walk out of the output dir")

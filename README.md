@@ -301,7 +301,7 @@ requirements.txt       direct deps (torch and transformers are pinned in setup.s
 webui/app.py           the Gradio UI, model manager, scoring, media and voice library
 scripts/say.py         speak a line through the running server (the /speak API)
 scripts/make_voice.py  create a described voice from the shell
-scripts/multi_clip_lab.py  experiment: is a clone from several clips better? (blind listening UI)
+scripts/multi_clip_lab.py  experiment: A/B a several-clip clone against your one clip
 tests/test_app_logic.py  CPU tier: no GPU or weights needed
 tests/smoke_test.py      GPU tier: end-to-end flows that generate and check real audio
 docs/                  quality measurements and design rationale
