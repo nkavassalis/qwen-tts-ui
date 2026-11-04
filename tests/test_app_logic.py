@@ -2873,6 +2873,95 @@ def test_multi_clip_helpers() -> None:
     check([c["name"] for c in clips] == ["take.wav", "take.wav (2)", "x.wav"], "names stay unique")
 
 
+def test_multi_clip_results_do_not_read_noise_as_signal() -> None:
+    """The results table's statistics: SIM dead band, noise floor, paired WER, stop hint.
+
+    Measured on the GPU box: takes of ONE version, same conditioning and text, different
+    seed, spread by SD ~0.005, while the whole gap between five arms was 0.0027. Counting any
+    positive delta as a win printed "13/3 (p=0.02)" for a difference the listener could not
+    hear, and the table's own advice ("only if held-out SIM does not disagree") then argued
+    against the ears. These are the numbers that decide whether averaging ships, so the
+    tie rule and the noise floor are pinned here.
+    """
+    lab = _lab()
+    arms = [a for a, _ in lab.ARMS if a != lab.BASELINE]
+    trials = [{"id": f"t{i}"} for i in range(12)]
+
+    def run_with(deltas: Dict[str, List[float]], wers: Dict[str, List[float]],
+                 base_wer: List[float], base_sim: List[float]) -> Dict[str, Any]:
+        takes = [{"trial": t["id"], "arm": lab.BASELINE, "sim_heldout": s, "wer": w}
+                 for t, s, w in zip(trials, base_sim, base_wer)]
+        pairs = []
+        for arm in arms:
+            for i, t in enumerate(trials):
+                takes.append({"trial": t["id"], "arm": arm,
+                              "sim_heldout": base_sim[i] + deltas[arm][i], "wer": wers[arm][i]})
+                pairs.append({"id": f"{t['id']}__{arm}", "trial": t["id"], "challenger": arm,
+                              "single_side": "A"})
+        return {"takes": takes, "trials": trials, "pairs": pairs}
+
+    flat = [0.001 if i % 2 else -0.001 for i in range(12)]      # inside the dead band
+    clear = [0.01] * 12                                          # well outside it
+    # Your clip wobbles from seed to seed too, so the fixture gives it a spread; the reported
+    # noise floor is the pooled take-to-take SD across every version, baseline included.
+    base_sim = [0.974 + (0.0012 if i % 2 else -0.0012) for i in range(12)]
+    answers = {}
+    for arm in arms:
+        for i, t in enumerate(trials):
+            answers[f"{t['id']}__{arm}"] = {"choice": "challenger" if i < 6 else "single",
+                                            "picked": "A" if i < 6 else "B"}
+
+    # A delta smaller than a re-render's own wobble is not a win, and must not be counted as
+    # one: 12/12 deltas of +0.001 used to read 12/0 (p=0.0005).
+    s = lab.summarise(run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                              [0.0] * 12, base_sim), answers)
+    for r in s["rows"]:
+        check(r["sim_wl"] == (0, 0) and r["sim_flat"] == 12,
+              f"deltas under the dead band are neither wins nor losses: {r['arm']} {r['sim_wl']}")
+        check(r["sim_p"] == 1.0, f"so no verdict is manufactured: {r['arm']} p={r['sim_p']}")
+    # The same takes, re-rendered with another seed, move by roughly this much, which is why
+    # the deltas above are not a difference. Recomputed here from the fixture so the check is
+    # "it reports the take-to-take SD", not "it reports some SD".
+    fixture = run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                       [0.0] * 12, base_sim)
+    expected = float(np.mean([np.std([t["sim_heldout"] for t in fixture["takes"]
+                                      if t["arm"] == a], ddof=1)
+                              for a in {t["arm"] for t in fixture["takes"]}]))
+    check(abs(s["sim_noise"] - expected) < 1e-9,
+          f"take-to-take noise reported: {s['sim_noise']} vs {expected}")
+
+    s2 = lab.summarise(run_with({a: clear for a in arms}, {a: [0.0] * 12 for a in arms},
+                                [0.0] * 12, base_sim), answers)
+    check(all(r["sim_wl"] == (12, 0) for r in s2["rows"]),
+          f"a real difference still clears the band: {[r['sim_wl'] for r in s2['rows']]}")
+
+    # The column that actually moved: takes that failed to say the line at all, tested
+    # against your clip on the pairs where the two disagree (McNemar's exact, which is the
+    # sign test on the discordant pairs).
+    s3 = lab.summarise(run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                                [0.5] * 12, base_sim), answers)
+    for r in s3["rows"]:
+        check(r["wer_bad"] == (0, 12) and r["base_bad"] == 12,
+              f"your clip mis-said every take, this one none: {r['wer_bad']} {r['base_bad']}")
+        check(r["wer_p"] < 0.001, f"and that is not noise: p={r['wer_p']}")
+
+    md = lab.summary_markdown(s3)
+    check("mis-said the sentence" in md and "(p=" in md, "the failure count is in the table")
+    check("Re-rendering the *same* version" in md and f"{s3['sim_noise']:.4f}" in md,
+          "the table says how big 'bigger' has to be")
+
+    # Rating 64 pairs is work. When every version is flat on both measures the answer is in
+    # hand, and the UI should say so instead of asking for more.
+    check(lab.stop_hint(s) is not None and "You can stop rating" in lab.stop_hint(s),
+          f"flat on both measures: {lab.stop_hint(s)}")
+    check(lab.stop_hint(s2) is None, "a version that wins on SIM is not a stop")
+    half = {k: v for i, (k, v) in enumerate(answers.items()) if i < 6}
+    check(lab.stop_hint(lab.summarise(run_with({a: flat for a in arms},
+                                               {a: [0.0] * 12 for a in arms},
+                                               [0.0] * 12, base_sim), half)) is None,
+          "too few answered pairs is not a stop either")
+
+
 def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
     """Screen, render every version, A/B through the UI's own handlers, undo, read results."""
     import threading

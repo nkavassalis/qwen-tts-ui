@@ -45,6 +45,37 @@ All notable changes to this project are documented here. Newest first.
   is about to load it, and the result is cached per clip and transcript. The threshold
   (`REF_TEXT_CONF_WARN = -2.0`) warns and never blocks; it is calibrated below.
 
+### Fixed — the multi-clip lab was reading noise as signal
+
+The first real run of the lab (one speaker, 24 clips from a single long recording, Japanese,
+16 takes per version, 51 of 64 pairs rated by ear) produced a table that argued against the
+listener, and the two causes were both in the scoring layer:
+
+- **SIM wins/losses counted any delta above `1e-9`.** Re-rendering one version with only the
+  seed changed moves held-out SIM by SD **0.0055**, while the whole spread between five
+  versions was **0.0027** — so a +0.0001 wobble was tallied as a win, and the table printed
+  `13/3 (p=0.02)` for a difference no one could hear. Its own advice ("only if held-out SIM
+  does not disagree") then told the reader the ears were wrong. There is a `SIM_DEADBAND` of
+  0.0025 now; the same run reads 6/1 (p=0.12), which agrees with the listener. A sign test on
+  a continuous measure needs a dead band, or it manufactures significance against any baseline.
+- **The column that mattered was hidden.** Mean WER showed `0.10` against `0.00` and looked
+  like a rounding story, when in fact the baseline clip failed to say the sentence in **12 of
+  16** takes and the cleanest clip in **0 of 16**. The table now counts failed takes and tests
+  them paired (McNemar's exact on the pairs where the two disagree): p=0.003, 0.002, <0.001.
+
+It also prints the take-to-take noise next to the deltas, so a reader can see whether a delta
+is bigger than a re-render, and says **"you can stop rating"** once every version is flat on
+both measures — 64 pairs was never going to resolve a zero effect, and someone gives up an
+hour to rate them.
+
+The experiment's own answer, recorded in [docs/quality.md](docs/quality.md): **averaging the
+speaker embedding does nothing you can hear** (every ear verdict "no clear difference", every
+Δ SIM inside one take's noise), but **which clip you pick matters a lot for getting the words
+right** — the most *typical* clip mis-said the line three times in four, the *cleanest* never
+did. Typicality does not predict intelligibility; cleanliness does.
+
+CPU tier 92/92 (`test_multi_clip_results_do_not_read_noise_as_signal`).
+
 ### Tests
 
 - CPU tier 88/88 (four new tests: quick start, cache replay/invalidation/deletion, cache

@@ -82,6 +82,12 @@ AUTO_SINGLE = "(most typical clip)"
 MIN_CLIPS = 3                 # one held out + at least two to build from
 MIN_DECIDED = 10              # fewer decided pairs than this: no verdict either way
 SIGNIFICANCE = 0.05
+# A SIM delta only counts as a win or a loss past this. Measured on the 5070 Ti: takes of
+# ONE version, same conditioning and text, different seed, spread by SD 0.0047-0.0059, while
+# the whole gap between five arms was 0.0027. Counting any positive delta (the old `d>1e-9`)
+# read that noise as signal and printed p=0.02 for a difference nobody could hear.
+SIM_DEADBAND = 0.0025
+WER_BAD = 0.05                # a take that did not say the sentence, for the failure count
 CONCAT_MAX_SECONDS = 20.0     # past REF_MAX_SECONDS on purpose: length is what this arm tests
 CONCAT_GAP_SECONDS = 0.3
 LISTEN_RMS_DB = -23.0
@@ -299,26 +305,71 @@ def summarise(run: Dict[str, Any], answers: Dict[str, Dict[str, Any]]) -> Dict[s
         ties = sum(a["choice"] == "tie" for a in got)
         sim_w = sim_l = 0
         deltas, wers = [], []
+        arm_bad = base_bad = arm_worse = arm_better = 0
         for t in run["trials"]:
             c, s = takes.get((t["id"], arm)), takes.get((t["id"], BASELINE))
             if not c or not s or c.get("same_as") == BASELINE:
                 continue
             wers.append(c.get("wer"))
+            if c.get("wer") is not None and s.get("wer") is not None:
+                cb, sb = float(c["wer"]) > WER_BAD, float(s["wer"]) > WER_BAD
+                arm_bad += cb
+                base_bad += sb
+                arm_worse += cb and not sb      # the discordant pairs: McNemar's whole sample
+                arm_better += sb and not cb
             if c.get("sim_heldout") is not None and s.get("sim_heldout") is not None:
                 d = float(c["sim_heldout"]) - float(s["sim_heldout"])
                 deltas.append(d)
-                sim_w += d > 1e-9
-                sim_l += d < -1e-9
+                sim_w += d > SIM_DEADBAND
+                sim_l += d < -SIM_DEADBAND
         rows.append({"arm": arm, "label": ARM_LABELS[arm], "pairs": len(real),
                      "answered": len(got), "wins": wins, "losses": losses, "ties": ties,
                      "verdict": verdict(wins, losses) if got else "not listened to yet",
                      "sim_delta": _stats(deltas), "sim_wl": (sim_w, sim_l),
+                     "sim_flat": len(deltas) - sim_w - sim_l,
                      "sim_p": sign_test_p(sim_w, sim_l), "wer": _stats(wers),
+                     "wer_bad": (arm_bad, len(wers)), "base_bad": base_bad,
+                     "wer_p": sign_test_p(arm_better, arm_worse),
                      "identical": len(mine) - len(real)})
     base_wer = _stats([t.get("wer") for t in run["takes"] if t["arm"] == BASELINE])
+    # Take-to-take noise: how much SIM moves between two renders of the *same* version with
+    # nothing but the seed changed. Every delta in the table has to clear this to mean
+    # anything, so it is printed next to them instead of leaving the reader to guess.
+    by_arm: Dict[str, List[float]] = {}
+    for t in run["takes"]:
+        if t.get("sim_heldout") is not None and t.get("same_as") != BASELINE:
+            by_arm.setdefault(t["arm"], []).append(float(t["sim_heldout"]))
+    sds = [float(np.std(v, ddof=1)) for v in by_arm.values() if len(v) > 1]
     return {"rows": rows, "identical": identical, "base_wer": base_wer,
+            "sim_noise": (float(np.mean(sds)) if sds else None),
             "side_bias": (side_a, side_total), "answered": len(answers),
             "pairs": len(run["pairs"])}
+
+
+def stop_hint(s: Dict[str, Any]) -> Optional[str]:
+    """Say "stop rating" when more ratings cannot change the answer.
+
+    Rating 64 pairs by ear is real work, and it was spent on an experiment whose every arm
+    was flat on both measures with the deltas inside take-to-take noise. Once that is true
+    for every version, another round is the same answer twice, so the UI should say so.
+    """
+    rows = [r for r in s["rows"] if r["pairs"]]
+    if not rows or s["answered"] == 0 or any(r["answered"] < MIN_DECIDED for r in rows):
+        return None
+    noise = s.get("sim_noise")
+    for r in rows:
+        mean = r["sim_delta"][0]
+        if "no clear difference" not in r["verdict"] or r["sim_p"] < SIGNIFICANCE:
+            return None
+        if mean is not None and noise is not None and abs(mean) >= noise:
+            return None
+    return (f"**You can stop rating.** {s['answered']} of {s['pairs']} pairs answered, and "
+            f"every version is flat on both measures: your preferences show no verdict, "
+            f"held-out SIM shows no verdict, and every delta is inside the "
+            f"\u00b1{noise:.4f} a re-render moves by on its own. Another round gives the same "
+            f"answer twice \u2014 "
+            f"*\"no clear difference\" after 20+ pairs is a real answer: averaging is not worth "
+            f"the complexity.*")
 
 
 def summary_markdown(s: Dict[str, Any]) -> str:
@@ -330,14 +381,18 @@ def summary_markdown(s: Dict[str, Any]) -> str:
 
     lines = [f"**{s['answered']} of {s['pairs']}** pairs answered.", "",
              "| version | you: preferred it / your clip / can't tell | verdict | "
-             "SIM vs held-out, minus your clip's | SIM wins/losses | WER |",
-             "|---|---|---|---|---|---|"]
+             "SIM vs held-out, minus your clip's | SIM wins/losses | mis-said the sentence | "
+             "WER |",
+             "|---|---|---|---|---|---|---|"]
     for r in s["rows"]:
+        bad, n = r["wer_bad"]
         lines.append(f"| **{r['label']}** (`{r['arm']}`) | {r['wins']} / {r['losses']} / "
                      f"{r['ties']} of {r['pairs']} | {r['verdict']} | "
                      f"{ms(r['sim_delta'], signed=True)} | {r['sim_wl'][0]}/{r['sim_wl'][1]} "
-                     f"(p={r['sim_p']:.2f}) | {ms(r['wer'], 2)} |")
-    lines.append(f"| *your clip* | | | | | {ms(s['base_wer'], 2)} |")
+                     f"(p={r['sim_p']:.2f}) | {bad}/{n} (p={r['wer_p']:.3f}) | "
+                     f"{ms(r['wer'], 2)} |")
+    lines.append(f"| *your clip* | | | | | {s['rows'][0]['base_bad'] if s['rows'] else ''} "
+                 f"| {ms(s['base_wer'], 2)} |")
     ident = s["identical"]
     a, total = s["side_bias"]
     lines += [""]
@@ -349,10 +404,25 @@ def summary_markdown(s: Dict[str, Any]) -> str:
     if total >= 10:
         lines.append(f"**Side bias:** you picked A {a} of {total} times "
                      f"(p={sign_test_p(a, total - a):.2f} against 50/50).")
+    noise = s.get("sim_noise")
+    if noise is not None:
+        lines.append(f"**How big is 'bigger'?** Re-rendering the *same* version with only the "
+                     f"seed changed moves held-out SIM by **\u00b1{noise:.4f}** (SD), and the "
+                     f"whole spread between versions here is smaller than that. A delta under "
+                     f"it is not a difference, so SIM wins/losses ignore every delta under "
+                     f"{SIM_DEADBAND}.")
+    hint = stop_hint(s)
+    if hint:
+        lines.append(hint)
     lines += ["", "How to read it: a version is worth building into the app only if *you* "
               "prefer it over your clip with a verdict of **better**, held-out SIM does not "
               "disagree, and its WER is no worse. \"No clear difference\" after 20+ pairs is a "
-              "real answer too: averaging is not worth the complexity."]
+              "real answer too: averaging is not worth the complexity. The *mis-said the "
+              "sentence* column is the one that has actually moved: it counts takes that "
+              "failed to say the line at all (WER > \u00b7{}\u00b7), tested against your clip on "
+              "the pairs where the two disagree (McNemar's exact). A reference that gets the "
+              "words right is worth more than one that is marginally more typical.".format(
+                  WER_BAD)]
     return "\n".join(lines)
 
 
