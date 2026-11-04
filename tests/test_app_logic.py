@@ -266,22 +266,28 @@ def test_saving_a_designed_voice_keeps_the_raw_decode() -> None:
                   f"the player still gets the post-processed copy, got {box_sr}Hz")
             check(isinstance(state, dict) and state.get("path"),
                   f"Save gets a path through state, not an array: {state}")
-            check(state.get("text") == "hello there" and state.get("language") == "English",
-                  f"the state carries what the clip says: {state}")
+            check(state.get("text") == "hello there" and state.get("language") == "English"
+                  and state.get("description") == "warm and low",
+                  f"the state carries what the clip says and how it was made: {state}")
             kept_sr = sf.read(state["path"], dtype="float32")[1]
             check(kept_sr == 24000, f"the kept clip is the raw decode, got {kept_sr}Hz")
 
-            _, msg, _ = webui.save_designed_voice("nobody", None, "text", "warm", "english")
+            _, msg, _ = webui.save_designed_voice("nobody", None)
             check("Nothing to save yet" in msg, "cannot save without a generated take")
-            _, msg, _ = webui.save_designed_voice("   ", state, "text", "warm", "english")
+            _, msg, _ = webui.save_designed_voice("nobody", state["path"])
+            check("Nothing to save yet" in msg, "a bare path carries no transcript: refused")
+            _, msg, _ = webui.save_designed_voice("   ", state)
             check("name" in msg.lower(), "blank name rejected")
             check(webui.list_voices() == [], "rejected save writes nothing")
-            _, msg, _ = webui.save_designed_voice("x", state, "   ", "warm", "english")
+            _, msg, _ = webui.save_designed_voice("x", dict(state, text="   "))
             check("empty" in msg, "a take with no transcript is rejected (ICL needs it)")
             check(webui.list_voices() == [], "rejected save writes nothing")
 
-            _, msg, update = webui.save_designed_voice("Warm Narrator", state, "hello",
-                                                       "warm", "english")
+            # The user edits the boxes after Generate (types the next line, tweaks the
+            # description) and then saves the take they liked. Save takes no box inputs at
+            # all, so what it stores is what the clip was generated from.
+            _, msg, update = webui.save_designed_voice("Warm Narrator", state)
+            check("hello there" in msg, f"the status says which transcript was saved: {msg}")
             check("Saved" in msg, f"saving the take works: {msg}")
             saved_wav, saved_sr = sf.read(os.path.join(tmp, "warm_narrator.wav"), dtype="float32")
             check(saved_sr == 24000,
@@ -295,15 +301,17 @@ def test_saving_a_designed_voice_keeps_the_raw_decode() -> None:
             record = webui.list_voices()[0]
             check(record["sample_rate"] == 24000 and record["seconds"] == 3.0,
                   f"the sidecar describes the raw clip: {record}")
-            check(record["text"] == "hello" and record["instruct"] == "warm",
-                  "transcript and description come from the Voice Design inputs")
+            check(record["text"] == "hello there" and record["description"] == "warm and low"
+                  and record["instruct"] == "warm and low" and record["language"] == "English",
+                  f"transcript, description and language are the ones the clip was generated "
+                  f"from: {record}")
             check(update["choices"][0][1] == "warm_narrator",
                   "the voice dropdowns are refreshed with the new voice")
 
             # A path outside the allowed roots is refused, not read: the state is client-
             # round-tripped JSON, so whatever arrives here is untrusted.
-            _, msg, _ = webui.save_designed_voice("spy", {"path": "/opt/recordings/take.wav"},
-                                                  "hello", "warm", "english")
+            _, msg, _ = webui.save_designed_voice(
+                "spy", {"path": "/opt/recordings/take.wav", "text": "hello"})
             check("outside the upload directory" in msg, f"foreign path refused: {msg}")
             check(webui.list_voices() == [record], "the refused save added nothing")
 
@@ -318,7 +326,7 @@ def test_saving_a_designed_voice_keeps_the_raw_decode() -> None:
                 check(audio is not None, "audio still comes back when the take cannot be kept")
                 check("could not keep the raw clip" in status, f"the status says why: {status}")
                 check(state is None, "and Save is disabled rather than saving something stale")
-                _, msg, _ = webui.save_designed_voice("Late", state, "hello", "warm", "english")
+                _, msg, _ = webui.save_designed_voice("Late", state)
                 check("Nothing to save yet" in msg, f"stale save refused: {msg}")
             finally:
                 webui._write_take = original_write
@@ -865,6 +873,11 @@ def test_build_ui_constructs() -> None:
         check(name in names, f"/{name} stays a public endpoint")
     speak = next(d for d in demo.config["dependencies"] if d.get("api_name") == "speak")
     check(len(speak["inputs"]) == 8, "/speak keeps its 8 positional inputs (scripts/say.py)")
+    design_save = [b for b in demo.fns.values() if b.fn is webui.save_designed_voice]
+    check(len(design_save) == 1 and len(design_save[0].inputs) == 2
+          and isinstance(design_save[0].inputs[1], gr.State),
+          "Design's Save reads only the name and the take-state, never the text boxes "
+          "(they may have been edited since Generate)")
 
     statuses = [b for b in demo.blocks.values()
                 if isinstance(b, gr.Textbox) and b.label == "Status"]
@@ -2278,7 +2291,7 @@ def test_saving_never_overwrites() -> None:
             _, msg = webui.save_clone_voice(webui.SAVE_REFERENCE, "memo", clip, "other", "English", None)
             check("already in the library" in msg, f"a second save under the same name is refused: {msg}")
             check(webui.list_voices()[0]["text"] == "hello there", "and the original is untouched")
-            _, msg, _ = webui.save_designed_voice("Memo", (sr, wav), "t", "a voice", "English")
+            _, msg, _ = webui.save_designed_voice("Memo", {"path": clip, "text": "t"})
             check("already in the library" in msg, "Design refuses it too")
 
             take = os.path.join(webui.MEDIA_DIR, "take.wav")

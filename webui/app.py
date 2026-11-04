@@ -1858,8 +1858,12 @@ def generate_voice_design(text, language, voice_description, temperature, top_p,
             chunk_notes.append(f"⚠️ could not keep the raw clip ({type(e).__name__}), so Save "
                                f"is unavailable for this take")
         audio, report = _present(wav, sr, budget, "VoiceDesign", postproc, chunk_notes)
+        # Everything Save stores is captured here, at Generate. Reading the text boxes at
+        # Save time stored whatever had been typed since: a transcript that does not match
+        # the clip is the worst clone failure measured (docs/quality.md).
         state = None if raw_path is None else {
-            "path": raw_path, "text": text.strip(), "language": str(language or "Auto")}
+            "path": raw_path, "text": text.strip(), "language": str(language or "Auto"),
+            "description": voice_description.strip()}
         return audio, report, state
     except Exception as e:  # noqa: BLE001
         return None, f"Error: {type(e).__name__}: {e}", None
@@ -2043,13 +2047,15 @@ def _find_voice(voice: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     return None, f"Error: no saved voice ‘{wanted}’. Available: {known}"
 
 
-def save_designed_voice(name: str, take_state: Any, text: str, voice_description: str,
-                        language: str) -> Tuple[Any, str, Any]:
+def save_designed_voice(name: str, take_state: Any) -> Tuple[Any, str, Any]:
     """Save the clip the last Generate produced as a reusable voice.
 
-    Clip, transcript and description all arrive as inputs rather than from a module-level
-    "last generation" cache: a process-global there meant that with two people on the LAN,
-    one person's Save button persisted the other person's clip.
+    Clip, transcript, description and language all come from `take_state`, which
+    `generate_voice_design` filled in at Generate time. Not from the text boxes: they may
+    have been edited since, and a transcript that does not match its clip is the worst clone
+    failure measured (17s of audio for a 5s line at WER 1.0). Not from a module-level "last
+    generation" cache either: with two people on the LAN, that let one person's Save persist
+    the other person's clip. Same rule as the Clone tab's `save_generated_voice`.
 
     The clip comes from the **raw decode** written at generation time, not from the audio
     box. The box holds the post-processed listening copy — 48kHz, de-imaged, high-shelf and
@@ -2060,13 +2066,16 @@ def save_designed_voice(name: str, take_state: Any, text: str, voice_description
     """
     if not (name or "").strip():
         return gr.update(), "Error: give the voice a name first.", gr.update()
-    if not (text or "").strip():
-        return gr.update(), "Error: the text the clip speaks is empty — it is what ICL cloning needs.", gr.update()
     if voice_exists(name):
         return gr.update(), _taken_message(name), gr.update()
-    path = take_state.get("path") if isinstance(take_state, dict) else take_state
-    if not path:
+    if not isinstance(take_state, dict) or not take_state.get("path"):
         return gr.update(), "Nothing to save yet — press Generate first.", gr.update()
+    path = take_state["path"]
+    text = str(take_state.get("text") or "").strip()
+    description = str(take_state.get("description") or "").strip()
+    language = str(take_state.get("language") or "Auto")
+    if not text:
+        return gr.update(), "Error: the text the clip speaks is empty — it is what ICL cloning needs.", gr.update()
     try:
         path = resolve_input_path(path, "generated clip")
         wav, sr = sf.read(path, dtype="float32")
@@ -2076,10 +2085,10 @@ def save_designed_voice(name: str, take_state: Any, text: str, voice_description
             name=name,
             wav=wav,
             sr=sr,
-            text=text.strip(),
-            instruct=(voice_description or ""),
+            text=text,
+            instruct=description,
             language=language,
-            description=(voice_description or "").strip(),
+            description=description,
             kind="design",
         )
     except (MediaError, OSError, ValueError) as e:
@@ -2087,8 +2096,9 @@ def save_designed_voice(name: str, take_state: Any, text: str, voice_description
     return (
         gr.update(),
         f"Saved ‘{record['name']}’ ({record['seconds']}s @ {record['sample_rate']}Hz) with its "
-        f"description — the model's own decode, not the post-processed copy. Speak and Chat "
-        f"will speak it from the description (brighter); Voice Clone can load the clip.",
+        f"description — the model's own decode, not the post-processed copy. It says "
+        f"“{_short(text)}”, as generated (later edits to the boxes are not saved). Speak "
+        f"and Chat will speak it from the description (brighter); Voice Clone can load the clip.",
         gr.update(choices=voice_choices(), value=record["slug"]),
     )
 
@@ -3218,7 +3228,7 @@ def build_ui() -> gr.Blocks:
                              api_name="generate_voice_design")
                 vd_save_evt = vd_save_btn.click(
                     save_designed_voice,
-                    inputs=[vd_voice_name, vd_take_state, vd_text, vd_instruct, vd_language],
+                    inputs=[vd_voice_name, vd_take_state],
                     outputs=[vd_voice_name, vd_status, cl_library], api_visibility="private")
 
             # ---------------------------------------------------------------- Speak

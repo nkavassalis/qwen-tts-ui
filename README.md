@@ -127,7 +127,8 @@ These are in order of how much they matter. The numbers are in
 Describe the voice (timbre, age, gender, accent, emotion, pace), give it a line, press
 **Generate**. **Save voice** keeps both the description and the clip — the clip as the model
 decoded it (24kHz, no EQ), not the copy in the player, because a saved voice is usually a
-future clone reference. Speak and Chat talk
+future clone reference. It saves the text and description that clip was generated from, so
+editing the boxes after Generate does not change what gets saved. Speak and Chat talk
 from the description, which is the brighter sound. The clip can be cloned like any reference,
 and that is the steadier identity across a long reply. The Voices tab lets you choose per
 voice.

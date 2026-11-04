@@ -82,6 +82,16 @@ messy long upload (cleanup is measured; *which window* gets picked is not).
   it now says what a second process can actually cost: up to two ~4.3GB checkpoints plus
   Whisper, ~9GB or more (`--max-cpu-resident` defaults to 2).
 
+### Fixed — a saved designed voice keeps the transcript it was generated from
+
+Design's Save read the transcript, description and language from the text boxes at the moment
+you clicked Save, not from the Generate that produced the clip. Generate, type your next line,
+then save the take you liked: the voice was stored with a transcript that does not match its
+audio — the worst clone failure measured (17s of audio for a 5s line, WER 1.0) the next time
+it is used as a reference. The take-state now also records the description, and
+`save_designed_voice(name, take_state)` takes no box inputs at all; the status quotes the
+transcript it saved. The Clone tab's take save already worked this way.
+
 ### Fixed — what a saved voice actually contains
 
 **Saving a designed voice stored the post-processed listening copy.** `save_designed_voice`

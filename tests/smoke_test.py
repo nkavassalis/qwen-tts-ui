@@ -138,8 +138,7 @@ def run_voice_library(hub: webui.ModelHub) -> None:
         sf.write(design_path, raw_wav, sr)
         check_audio(design_path, raw_wav, sr)
 
-        _, save_msg, _ = webui.save_designed_voice("Smoke Test Narrator", state, cfg["text"],
-                                                   cfg["instruct"], cfg["language"])
+        _, save_msg, _ = webui.save_designed_voice("Smoke Test Narrator", state)
         assert "Saved" in save_msg, f"saving the designed take failed: {save_msg}"
         saved_wav, saved_sr = sf.read(os.path.join(tmp, "smoke_test_narrator.wav"), dtype="float32")
         assert saved_sr == 24000, (

@@ -183,8 +183,10 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   soft-limited — so every designed voice was stored through an EQ curve and then cloned from
   that, through the codec a second time. A voice saved from the browser measured
   `sample_rate: 48000`, which is how it surfaced. `generate_voice_design` now also writes the
-  raw decode with `_write_take` and returns `{path, text, language}` as a **`gr.State`** output,
-  and Save reads that path from state — same shape as the Clone tab's `build_take_state`, so
+  raw decode with `_write_take` and returns `{path, text, language, description}` as a
+  **`gr.State`** output, and Save reads the clip *and its metadata* from state — never from
+  the text boxes, which may have been edited since Generate (a transcript that does not match
+  its clip is the worst clone failure measured) — same shape as the Clone tab's `build_take_state`, so
   there is one pattern for "what the last generation produced", not two. Being a `gr.State`,
   that output is browser-only: it is absent from the public API, so the server-side path never
   leaves the box and scripts see the same two outputs as before. If the write fails the audio
@@ -344,8 +346,9 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
 17. Saving never replaces an existing voice. `test_saving_never_overwrites`.
 18. Every model-loading entry point takes the single-owner lock — the web UI, the smoke
     test and `make_voice.py` (without `--no-clip`). (make_voice: not automated)
-19. No Save path may read an audio box: a saved voice is the raw decode, reached through a
-    `gr.State` path. `test_saving_a_designed_voice_keeps_the_raw_decode`, and the GPU tier's
+19. No Save path may read an audio box or a text box: a saved voice is the raw decode, and its
+    transcript/description/language are the ones it was generated from, all reached through
+    `gr.State`. `test_build_ui_constructs` pins Design's Save to (name, state); `test_saving_a_designed_voice_keeps_the_raw_decode`, and the GPU tier's
     `voice_library`, which asserts saved @ 24kHz while the player copy is 48kHz.
 
 ## Conventions
