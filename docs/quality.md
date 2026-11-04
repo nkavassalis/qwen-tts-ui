@@ -56,10 +56,25 @@ Here is what follows from that, and what the app does about each finding:
    | unrelated (>100%) | −4.59 .. −5.09 |
 
    −2.0 is a good warn line: it clears a single wrong word by 0.66 and fires around 40–50%
-   wrong. It is **not** a safe block line — the half-wrong class straddles it. If this ever
-   blocks, block at **−3.5**: 3.0 below the worst correct transcript measured, 2.2 below the
-   worst one-word-wrong, and above every half-wrong case, so it fires only on "that is not
-   this clip at all". It warns, it never blocks.
+   wrong. It is **not** a safe block line — the half-wrong class straddles it, so blocking
+   there would be a coin flip at the boundary. Generation therefore refuses at
+   **`REF_TEXT_CONF_BLOCK = −3.5`**: 3.0 below the worst correct transcript measured, 2.2
+   below the worst one-word-wrong, and above every half-wrong case, so it fires only on "that
+   is not this clip at all". Between the two lines it warns and generates, which matters — an
+   imperfect Whisper transcript is a thing to edit, not an error to obey.
+
+   The threshold is not a guess about how bad "bad" is. A reference whose transcript is not
+   its own words failed to say the target line in **12 of 12** takes and took **twice** as
+   long to render (5.6s of speech became 9.5–11.1s, worst 18.2s) — and it did that to a
+   *clean* clip too, so a good recording is no defence. Accurate transcripts in that same test
+   read −0.40 and −0.43; the mismatched pairs read −3.95 and −3.99, leaving the two
+   populations 3.4 apart at their closest. `scripts/measurements/replicate_wer.py` reproduces
+   it. The refusal names the confidence and prints what Whisper heard, so the fix is obvious
+   from the status box: correct the transcript in step 1, or press Transcribe and edit it.
+
+   One honest limit: the check runs when Whisper is resident (best-of-N loads it, Transcribe
+   loads it, and the checklist loads it on request). On a single-candidate clone with Whisper
+   not yet loaded there is **no verdict, and so no block** — absence of a check is not a pass.
 
    CJK works on every signal: confidence (the Japanese clip reads −0.51 exact), and the WER
    and length checks, which count kana, Han and Hangul per character. (One calibration row
@@ -93,7 +108,7 @@ It is conservative on purpose, because nothing in it may change the voice:
 If cleanup would leave less than the clone minimum, or fails for any reason, the original
 clip is used.
 
-**Measured on the GPU box, 2026-11-03** (`tmp/clean_reference_ab.py`: same reference, same
+**Measured on the GPU box, 2026-11-03** (`scripts/measurements/clean_reference_ab.py`: same reference, same
 target line, same three seeds per arm, identity scored by the model's own speaker encoder
 against the *raw* reference so both arms face the same target):
 

@@ -2709,7 +2709,9 @@ def test_reference_transcript_check() -> None:
             asked.append(intended)
             if intended == "the right words here":
                 return "the right words here", -0.04
-            return "the right words here", -4.2
+            if intended == "nearly the right words":
+                return "the right words here", -2.5      # warn band: bad, not fatal
+            return "the right words here", -4.2          # below REF_TEXT_CONF_BLOCK
 
     class FakeTTS:
         model = None
@@ -2737,19 +2739,31 @@ def test_reference_transcript_check() -> None:
             out = webui.generate_voice_clone(path, "wrong words over here", "Hello.", "English",
                                              False, 0.9, 1.0, 50, 1.05, postproc="off")
             status = out[1]
-            check(status.splitlines()[1].startswith("WARNING: Whisper does not hear"),
-                  f"a mismatched transcript is the first thing the status says: {status}")
-            check("the right words here" in status, "and it shows what Whisper heard")
-            check(out[0] is not None, "it warns, it does not block (the threshold is provisional)")
+            check(out[0] is None,
+                  f"a transcript that is not the clip's own words is refused: {status}")
+            check("does not match the clip" in status and "-4.20" in status,
+                  f"the refusal says why, with the number: {status}")
+            check("the right words here" in status,
+                  f"and shows what Whisper actually heard: {status}")
 
+            # The block belongs at -3.5, not at the warn line: a bad-but-not-wrong transcript
+            # must still generate, or every imperfect Whisper transcript becomes an error.
             checklist = webui.reference_check(path, "wrong words over here")
             check("⚠️ Whisper does not hear" in checklist,
                   f"the checklist shows the verdict for this clip + transcript: {checklist}")
             check("Whisper" not in webui.reference_check(path, "something else entirely"),
                   "an edited transcript has no verdict yet: nothing stale is shown")
 
+            webui._REF_TEXT_CHECKS.clear()
+            out = webui.generate_voice_clone(path, "nearly the right words", "Hello.", "English",
+                                             False, 0.9, 1.0, 50, 1.05, postproc="off")
+            check(out[0] is not None,
+                  f"the warn band still generates: {out[1]}")
+            check("WARNING: Whisper does not hear" in out[1],
+                  f"and says so in the status: {out[1]}")
+
             asked.clear()
-            webui.generate_voice_clone(path, "wrong words over here", "Hello again.", "English",
+            webui.generate_voice_clone(path, "nearly the right words", "Hello again.", "English",
                                        False, 0.9, 1.0, 50, 1.05, postproc="off")
             check(asked == [], "a retake with the same reference does not re-run the check")
 
@@ -2767,9 +2781,11 @@ def test_reference_transcript_check() -> None:
 
             webui._REF_TEXT_CHECKS.clear()
             webui.ASR.loaded = False
-            webui.generate_voice_clone(path, "fresh words", "Hello.", "English", False,
-                                       0.9, 1.0, 50, 1.05, postproc="off", candidates=1)
+            out = webui.generate_voice_clone(path, "fresh words", "Hello.", "English", False,
+                                             0.9, 1.0, 50, 1.05, postproc="off", candidates=1)
             check(asked == [], "one take with Whisper unloaded: no surprise 3GB load")
+            check(out[0] is not None,
+                  "and with no verdict there is no block — the check is absent, not passed")
         finally:
             webui.ASR, webui.HUB, webui.MEDIA_DIR = saved
             webui._REF_TEXT_CHECKS.clear()

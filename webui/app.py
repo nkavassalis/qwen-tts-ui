@@ -1900,7 +1900,7 @@ ASR: Optional[Transcriber] = None
 # (-2.79 on one clip, -3.18 on another). If this ever blocks generation, block at -3.5: that
 # is 3.0 below the worst correct transcript ever measured here, 2.2 below the worst
 # one-word-wrong, and above every "half wrong" case, so it fires only on "that is not this
-# clip at all". It warns, it never blocks, until that is decided.
+# clip at all" — and that line is now `REF_TEXT_CONF_BLOCK` below, which refuses to generate.
 
 # CJK references are fine on all three signals: confidence (the Japanese clip reads -0.51
 # exact), and `word_error_rate` / `transcript_fit`, which count kana, Han and Hangul per
@@ -1908,6 +1908,16 @@ ASR: Optional[Transcriber] = None
 # its "one word wrong" variant with str.split() changes nothing in a script without spaces —
 # that, not the app, is what made one calibration row read identical to exact.
 REF_TEXT_CONF_WARN = -2.00
+# Refuse to generate when the reference's transcript is not the clip's own words. The cost is
+# measured, not inferred: with a mismatched transcript, 12 of 12 takes failed to say the target
+# line and render time doubled (5.6s of speech became 9.5-11.1s on average, worst 18.2s) — and
+# it did that to a *clean* clip as well, so a good recording is no defence. Accurate
+# transcripts measured -0.12..-0.51 (and -0.40/-0.43 on the two clips in that very test); the
+# mismatched pairs read -3.95 and -3.99, so the two populations are 3.4 apart at their closest.
+# scripts/measurements/replicate_wer.py reproduces it. It only fires when the check actually
+# ran: Whisper is loaded lazily, so on a single-candidate clone with Whisper not yet resident
+# there is no verdict and no block — see `reference_check` for the explicit way to get one.
+REF_TEXT_CONF_BLOCK = -3.50
 _REF_TEXT_CHECKS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 REF_TEXT_CHECK_CACHE = 32
 
@@ -2873,6 +2883,20 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
     if not use_xvector_only:
         # On the selection as it stands (before cleanup), so the checklist can find it again.
         text_check = check_reference_transcript(ref_wav, ref_sr, ref_text or "", may_load=n > 1)
+        if (text_check or {}).get("confidence") is not None and \
+                text_check["confidence"] < REF_TEXT_CONF_BLOCK:
+            # Measured, not guessed: a reference whose transcript does not match its audio
+            # failed to say the target line in 12 of 12 takes and doubled the render time
+            # (5.6s of speech became 9.5-11.1s, worst 18.2s), and it did that to a *clean*
+            # clip too. Accurate transcripts read -0.12..-0.51 here; the mismatched pairs read
+            # -3.95 and -3.99. So this refuses rather than spending a minute of GPU on audio
+            # that is very likely to be wrong. See scripts/measurements/replicate_wer.py.
+            heard = (text_check.get("heard") or "").strip()
+            return _clone_failure(
+                f"Error: that transcript does not match the clip (confidence "
+                f"{text_check['confidence']:.2f}). Whisper hears: “{heard[:120]}”. Correct the "
+                f"transcript in step 1 — or press Transcribe and edit the result — then "
+                f"generate again.")
     if clean_reference:
         ref_wav = prepare_reference(ref_wav, ref_sr)
     asr_language = None if (not language or language == "Auto") else str(language)

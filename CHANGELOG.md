@@ -2,6 +2,45 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — a mismatched reference transcript is now refused, not warned about
+
+### Changed
+
+- **`generate_voice_clone` refuses a reference whose transcript isn't the clip's own words.**
+  Below **`REF_TEXT_CONF_BLOCK = -3.5`** it returns a status naming the confidence and printing
+  what Whisper heard, instead of spending a minute of GPU on audio that is very likely wrong.
+  The warn line stays at **−2.0** and still generates: an imperfect transcript is a thing to
+  edit, not an error to obey, and blocking there would be a coin flip — the half-wrong class
+  straddles −2.0 (−2.79 on one clip, −3.18 on another).
+
+  The threshold was previously recommended on statistical grounds. It now has a **cost**: with a
+  mismatched transcript, **12 of 12** takes failed to say the target line and render time
+  doubled (5.6s of speech became 9.5–11.1s, worst 18.2s) — and that happened to a *clean* clip
+  too, so a good recording is no defence. Accurate transcripts in the same test read −0.40 and
+  −0.43; the mismatched pairs −3.95 and −3.99, leaving the populations 3.4 apart at their
+  closest. `scripts/measurements/replicate_wer.py` reproduces it.
+
+  Honest limit, documented rather than papered over: the check runs when Whisper is resident
+  (best-of-N, Transcribe, or the checklist load it). A single-candidate clone with Whisper not
+  yet loaded gets **no verdict, and therefore no block** — absence of a check is not a pass.
+
+### Added
+
+- **`scripts/measurements/` — the scripts behind every number in the docs.** They lived in
+  gitignored `tmp/` while `AGENTS.md` and `docs/quality.md` cited them by path, so on a fresh
+  clone the evidence for those numbers did not exist. Now tracked, and each walks up to the
+  project root so it runs from anywhere. `calibrate_and_first_piece.py` no longer names a
+  private Japanese voice — it discovers whatever is in `voices/`, and its docstring says which
+  row of the published table needs a clip you supply yourself.
+
+### Tests
+
+- CPU tier **93/93**. `test_reference_transcript_check` asserted the old behaviour ("it warns,
+  it does not block"); it now asserts the refusal, that the refusal names the number and what
+  Whisper heard, that the **warn band still generates** (proving the line is at −3.5, not −2.0),
+  and that no verdict means no block.
+- GPU tier: see below.
+
 ## [Unreleased] — Snappier Speak/Chat; reference transcript check
 
 ### Added

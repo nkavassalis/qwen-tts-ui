@@ -330,6 +330,7 @@ non-clipping and of plausible length. A skipped case counts as a failure unless 
 | Symptom | Cause / fix |
 |---|---|
 | `Another Qwen3-TTS process is already holding the weights` | Only one process may own the weights. Stop the web UI before the smoke test, `make_voice.py` or `multi_clip_lab.py` |
+| `that transcript does not match the clip` | The reference's transcript isn't what the clip says, and generating from it wastes a minute of GPU on audio that will be wrong (measured: 12/12 failed takes, double the render time). **Correct the transcript in step 1**, or press **Transcribe** and edit the result. The status shows what Whisper heard. If you disagree, tick *x-vector only* — it ignores the transcript entirely |
 | `MemoryError: … would leave less than the …MB floor` | RAM is genuinely tight: close other GPU/LLM processes or use `--max-cpu-resident 1` |
 | The whole machine hard-locks | WSL2 ballooning — see *Memory safety* |
 | Generation takes minutes, GPU ~35% busy | The speech tokenizer is on the CPU; something bypassed `ModelHub._move()` ([design.md](docs/design.md)) |
