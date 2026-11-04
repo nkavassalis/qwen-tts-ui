@@ -2787,6 +2787,350 @@ def test_cjk_is_scored_per_character() -> None:
     check("too long" in webui.transcript_fit(3.0, exact * 3), "30 characters do not")
 
 
+
+def _lab():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                    "scripts"))
+    import multi_clip_lab
+    return multi_clip_lab
+
+
+def test_multi_clip_helpers() -> None:
+    """Rounds, medoid, averaged embedding, screening, concat, loudness, A/B maths."""
+    import random
+    lab = _lab()
+    try:
+        lab.make_folds(2, 4)
+        check(False, "two clips cannot make a held-out round")
+    except ValueError:
+        pass
+    folds = lab.make_folds(6, 4)
+    check(len(folds) == 4 and len({h for h, _ in folds}) == 4, f"4 distinct held-out: {folds}")
+    check(all(h not in b and len(b) == 5 for h, b in folds), "held-out never in its build set")
+    check(len(lab.make_folds(3, 10)) == 3, "rounds capped at the clip count")
+    kept = lab.make_folds(4, 10, keep=2)
+    check(len(kept) == 3 and all(h != 2 and 2 in b for h, b in kept),
+          f"your clip is never held out, always built from: {kept}")
+
+    e = [np.array([1.0, 0.0, 0.0]), np.array([0.9, 0.1, 0.0]), np.array([0.8, 0.2, 0.1]),
+         np.array([0.0, 0.0, 1.0])]
+    check(lab.medoid_index(e[:3]) == 1, "the middle vector is the medoid")
+    big = [np.array([10.0, 0.0]), np.array([0.0, 1.0])]
+    m = lab.mean_embedding(big)
+    check(abs(np.linalg.norm(m) - 5.5) < 1e-4, f"rescaled to the mean norm: {np.linalg.norm(m)}")
+    check(abs(m[0] - m[1]) < 1e-4, "averages directions, so the big-norm clip does not dominate")
+    check(m.dtype == np.float32, "float32 out")
+    flags = lab.screen_clips(e)
+    check(flags[3]["outlier"] and not any(f["outlier"] for f in flags[:3]),
+          f"the orthogonal clip is the outlier: {flags}")
+
+    sr = 1000
+    wavs = [np.ones(8000, np.float32), np.ones(8000, np.float32), np.ones(8000, np.float32)]
+    joined, text, used = lab.concat_clips(wavs, ["a", "b", "c"], sr, max_seconds=20.0, gap=0.5)
+    check(used == 2 and text == "a b" and len(joined) == 16500, f"capped at 20s: {used} {len(joined)}")
+    joined, _, used = lab.concat_clips([np.ones(30000, np.float32)], ["long"], sr, max_seconds=20.0)
+    check(used == 1 and len(joined) == 30000, "always keeps the first clip")
+
+    rng = np.random.default_rng(0)
+    quiet, loud = 0.01 * rng.standard_normal(24000), 0.5 * rng.standard_normal(24000)
+    a, b = lab.loudness_match(quiet), lab.loudness_match(loud)
+    check(abs(np.sqrt(np.mean(a ** 2)) - np.sqrt(np.mean(b ** 2))) < 1e-3, "same RMS")
+    check(np.max(np.abs(b)) <= 0.95 + 1e-6, "peak-limited without clipping")
+    check(not np.any(lab.loudness_match(np.zeros(10))), "silence stays silence")
+    t = np.arange(48000) / 48000.0
+    check(lab.high_band_milli(np.sin(2 * np.pi * 200 * t), 48000) < 1, "a 200Hz tone has no top end")
+    check(lab.high_band_milli(np.sin(2 * np.pi * 12000 * t), 48000) > 990, "a 12kHz tone is all top")
+    check(lab.high_band_milli(np.ones(100), 16000) is None, "no band above Nyquist")
+
+    q_clean = lab.reference_quality(np.zeros(100, np.float32), 24000)
+    check(q_clean["coverage"] == 0.0, "silence has no speech")
+    good = {"snr": 35.0, "coverage": 0.7, "edges_ok": True, "clipped": 0.0}
+    check(lab.clean_score(good) > lab.clean_score(dict(good, snr=12.0)), "noise costs")
+    check(lab.clean_score(good) > lab.clean_score(dict(good, clipped=0.01)), "clipping costs")
+    check(lab.clean_score(good) > lab.clean_score(dict(good, edges_ok=False)), "mid-word edges cost")
+    check(lab.clean_score(good, -1.0) > lab.clean_score(good, -3.0), "a misfit transcript costs most")
+    check(lab.clean_score(dict(good, snr=90.0)) == lab.clean_score(dict(good, snr=40.0)),
+          "SNR is capped")
+
+    trials = lab.build_trials(2, 2, [1, 2])
+    check(len(trials) == 8 and len({t["id"] for t in trials}) == 8, "one trial per round×sent×seed")
+    pairs = lab.build_pairs(trials, lab.CHALLENGERS, random.Random(0))
+    check(len(pairs) == 8 * len(lab.CHALLENGERS), "one pair per trial per challenger")
+    sides = [p["single_side"] for p in pairs]
+    check(0 < sides.count("A") < len(sides), "your clip lands on both sides")
+    check(all(p["challenger"] != lab.BASELINE for p in pairs), "your clip is never a challenger")
+
+    check(lab.sign_test_p(0, 0) == 1.0, "no data, no evidence")
+    check(abs(lab.sign_test_p(5, 5) - 1.0) < 1e-9, "an even split is no evidence")
+    check(abs(lab.sign_test_p(10, 0) - 2 / 1024) < 1e-9, "10-0 is p≈0.002")
+    check(lab.sign_test_p(7, 3) > 0.3, "7 of 10 is not a finding")
+    check(lab.sign_test_p(3, 7) == lab.sign_test_p(7, 3), "two-sided")
+    check("too few" in lab.verdict(6, 0), "under 10 decided pairs: no verdict")
+    check("better" in lab.verdict(15, 3) and "worse" in lab.verdict(3, 15), "clear splits")
+    check("no clear difference" in lab.verdict(12, 9), "a close split")
+
+    clips = lab.unique_names([{"name": "take.wav"}, {"name": "take.wav"}, {"name": "x.wav"}])
+    check([c["name"] for c in clips] == ["take.wav", "take.wav (2)", "x.wav"], "names stay unique")
+
+
+def test_multi_clip_results_do_not_read_noise_as_signal() -> None:
+    """The results table's statistics: SIM dead band, noise floor, paired WER, stop hint.
+
+    Measured on the GPU box: takes of ONE version, same conditioning and text, different
+    seed, spread by SD ~0.005, while the whole gap between five arms was 0.0027. Counting any
+    positive delta as a win printed "13/3 (p=0.02)" for a difference the listener could not
+    hear, and the table's own advice ("only if held-out SIM does not disagree") then argued
+    against the ears. These are the numbers that decide whether averaging ships, so the
+    tie rule and the noise floor are pinned here.
+    """
+    lab = _lab()
+    arms = [a for a, _ in lab.ARMS if a != lab.BASELINE]
+    trials = [{"id": f"t{i}"} for i in range(12)]
+
+    def run_with(deltas: Dict[str, List[float]], wers: Dict[str, List[float]],
+                 base_wer: List[float], base_sim: List[float]) -> Dict[str, Any]:
+        takes = [{"trial": t["id"], "arm": lab.BASELINE, "sim_heldout": s, "wer": w}
+                 for t, s, w in zip(trials, base_sim, base_wer)]
+        pairs = []
+        for arm in arms:
+            for i, t in enumerate(trials):
+                takes.append({"trial": t["id"], "arm": arm,
+                              "sim_heldout": base_sim[i] + deltas[arm][i], "wer": wers[arm][i]})
+                pairs.append({"id": f"{t['id']}__{arm}", "trial": t["id"], "challenger": arm,
+                              "single_side": "A"})
+        return {"takes": takes, "trials": trials, "pairs": pairs}
+
+    flat = [0.001 if i % 2 else -0.001 for i in range(12)]      # inside the dead band
+    clear = [0.01] * 12                                          # well outside it
+    # Your clip wobbles from seed to seed too, so the fixture gives it a spread; the reported
+    # noise floor is the pooled take-to-take SD across every version, baseline included.
+    base_sim = [0.974 + (0.0012 if i % 2 else -0.0012) for i in range(12)]
+    answers = {}
+    for arm in arms:
+        for i, t in enumerate(trials):
+            answers[f"{t['id']}__{arm}"] = {"choice": "challenger" if i < 6 else "single",
+                                            "picked": "A" if i < 6 else "B"}
+
+    # A delta smaller than a re-render's own wobble is not a win, and must not be counted as
+    # one: 12/12 deltas of +0.001 used to read 12/0 (p=0.0005).
+    s = lab.summarise(run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                              [0.0] * 12, base_sim), answers)
+    for r in s["rows"]:
+        check(r["sim_wl"] == (0, 0) and r["sim_flat"] == 12,
+              f"deltas under the dead band are neither wins nor losses: {r['arm']} {r['sim_wl']}")
+        check(r["sim_p"] == 1.0, f"so no verdict is manufactured: {r['arm']} p={r['sim_p']}")
+    # The same takes, re-rendered with another seed, move by roughly this much, which is why
+    # the deltas above are not a difference. Recomputed here from the fixture so the check is
+    # "it reports the take-to-take SD", not "it reports some SD".
+    fixture = run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                       [0.0] * 12, base_sim)
+    expected = float(np.mean([np.std([t["sim_heldout"] for t in fixture["takes"]
+                                      if t["arm"] == a], ddof=1)
+                              for a in {t["arm"] for t in fixture["takes"]}]))
+    check(abs(s["sim_noise"] - expected) < 1e-9,
+          f"take-to-take noise reported: {s['sim_noise']} vs {expected}")
+
+    s2 = lab.summarise(run_with({a: clear for a in arms}, {a: [0.0] * 12 for a in arms},
+                                [0.0] * 12, base_sim), answers)
+    check(all(r["sim_wl"] == (12, 0) for r in s2["rows"]),
+          f"a real difference still clears the band: {[r['sim_wl'] for r in s2['rows']]}")
+
+    # The column that actually moved: takes that failed to say the line at all, tested
+    # against your clip on the pairs where the two disagree (McNemar's exact, which is the
+    # sign test on the discordant pairs).
+    s3 = lab.summarise(run_with({a: flat for a in arms}, {a: [0.0] * 12 for a in arms},
+                                [0.5] * 12, base_sim), answers)
+    for r in s3["rows"]:
+        check(r["wer_bad"] == (0, 12) and r["base_bad"] == 12,
+              f"your clip mis-said every take, this one none: {r['wer_bad']} {r['base_bad']}")
+        check(r["wer_p"] < 0.001, f"and that is not noise: p={r['wer_p']}")
+
+    md = lab.summary_markdown(s3)
+    check("mis-said the sentence" in md and "(p=" in md, "the failure count is in the table")
+    check("Re-rendering the *same* version" in md and f"{s3['sim_noise']:.4f}" in md,
+          "the table says how big 'bigger' has to be")
+
+    # Rating 64 pairs is work. When every version is flat on both measures the answer is in
+    # hand, and the UI should say so instead of asking for more.
+    check(lab.stop_hint(s) is not None and "You can stop rating" in lab.stop_hint(s),
+          f"flat on both measures: {lab.stop_hint(s)}")
+    check(lab.stop_hint(s2) is None, "a version that wins on SIM is not a stop")
+    half = {k: v for i, (k, v) in enumerate(answers.items()) if i < 6}
+    check(lab.stop_hint(lab.summarise(run_with({a: flat for a in arms},
+                                               {a: [0.0] * 12 for a in arms},
+                                               [0.0] * 12, base_sim), half)) is None,
+          "too few answered pairs is not a stop either")
+
+
+def test_multi_clip_lab_lists_runs_rendered_after_startup() -> None:
+    """A run rendered after the server started must survive a page reload.
+
+    The Run dropdowns are populated once, when the UI is built. Without the load handler a
+    reloaded page offers only the runs that existed at boot, so Listen and Results cannot
+    reach a run whose WAVs are sitting on disk -- it looks like the render never happened.
+    """
+    lab = _lab()
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        lab_obj = lab.Lab(hub=None, asr=None, out_root=tmp)
+        demo = lab.build_lab_ui(lab_obj, [])
+        refresh = demo.lab_handlers["refresh_runs"]
+        run_dd, res_dd = refresh()
+        check(run_dd["choices"] == [] and run_dd["value"] is None,
+              f"an empty lab lists no runs: {run_dd}")
+        for name in ("20260101-000000", "20260101-000001"):
+            os.makedirs(os.path.join(tmp, name), exist_ok=True)
+            with open(os.path.join(tmp, name, "run.json"), "w", encoding="utf-8") as fh:
+                json.dump({"format": lab.RUN_FORMAT, "id": name}, fh)
+        run_dd, res_dd = refresh()
+        check(run_dd["choices"] == ["20260101-000001", "20260101-000000"],
+              f"runs rendered after startup are listed, newest first: {run_dd['choices']}")
+        check(run_dd["value"] == "20260101-000001" and res_dd["value"] == run_dd["value"],
+              f"both tabs select it: {run_dd['value']} / {res_dd['value']}")
+
+
+def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
+    """Screen, render every version, A/B through the UI's own handlers, undo, read results."""
+    import threading
+    import torch
+    lab = _lab()
+    sr = 24000
+
+    def embed(wav):
+        spec = np.abs(np.fft.rfft(np.asarray(wav, np.float64)[:24000], n=24000))[:2000]
+        return torch.tensor(spec.reshape(16, -1).sum(axis=1), dtype=torch.bfloat16)
+
+    seen_prompts: list = []
+
+    class FakeModel:
+        def extract_speaker_embedding(self, audio, sr):
+            assert sr == 24000
+            return embed(audio)
+
+    class FakeTTS:
+        model = FakeModel()
+
+        def create_voice_clone_prompt(self, ref_audio, ref_text, x_vector_only_mode):
+            from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+            wav, _ = ref_audio
+            return [VoiceClonePromptItem(ref_code=torch.zeros(len(wav) // 1920, 16),
+                                         ref_spk_embedding=embed(wav), x_vector_only_mode=False,
+                                         icl_mode=True, ref_text=ref_text)]
+
+        def generate_voice_clone(self, text, language, voice_clone_prompt, max_new_tokens, **kw):
+            item = voice_clone_prompt[0]
+            seen_prompts.append(item)
+            assert item.ref_spk_embedding.dtype == torch.bfloat16, "mean cast back to model dtype"
+            hz = 120 + float(item.ref_spk_embedding.float().argmax()) * 7 + torch.rand(1).item()
+            n = int(sr * 1.5)
+            return [(0.3 * np.sin(2 * np.pi * hz * np.arange(n) / sr)).astype(np.float32)], sr
+
+    class FakeHub:
+        lock = threading.RLock()
+
+        def acquire(self, capability):
+            assert capability == "voice_clone"
+            return FakeTTS()
+
+    def speech(hz, seconds=4.0, noise=0.0):
+        t = np.arange(int(sr * seconds)) / sr
+        env = (np.sin(2 * np.pi * 1.5 * t) > -0.3).astype(np.float32)
+        hiss = noise * np.random.default_rng(int(hz)).standard_normal(t.size)
+        return (0.3 * env * np.sin(2 * np.pi * hz * t) + hiss).astype(np.float32)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Clip 0 is "yours" and noisy, so the cleanest clip is a different one.
+        clips = [{"name": f"c{i}.wav", "wav": speech(hz, noise=0.05 if i == 0 else 0.0), "sr": sr,
+                  "text": f"clip number {i}"} for i, hz in enumerate((150, 155, 160, 900))]
+        lab_obj = lab.Lab(FakeHub(), asr=None, out_root=tmp)
+        clips = lab_obj.screen(clips, "English")
+        check(all("embedding" in c and "clean_score" in c for c in clips), "screened")
+        run_dir = lab_obj.render(clips, ["One sentence.", "", "Two sentences."], [7], 4,
+                                 "English", single=0)
+        run_id = os.path.basename(run_dir)
+        run = lab.load_run(run_id, tmp)
+        check(len(run["folds"]) == 3 and all(f["heldout"] != "c0.wav" and f["single"] == "c0.wav"
+                                             for f in run["folds"]),
+              "your clip is the baseline every round and never held out")
+        check(len(run["trials"]) == 3 * 2, f"3 rounds × 2 sentences: {len(run['trials'])}")
+        check(len(run["takes"]) == 6 * len(lab.ARM_KEYS), "one take per version per trial")
+        check(len(run["pairs"]) == 6 * len(lab.CHALLENGERS), "one pair per challenger per trial")
+        check(all(os.path.isfile(os.path.join(run_dir, d, t["file"]))
+                  for t in run["takes"] for d in ("takes", "listen")), "raw and listening copies")
+        xv = [p for p in seen_prompts if p.x_vector_only_mode]
+        check(xv and all(p.ref_code is None and p.ref_text is None for p in xv),
+              "x-vector version carries no codes and no transcript")
+        mean_item = [p for p in seen_prompts if not p.x_vector_only_mode
+                     and p.ref_text == "clip number 0"]
+        codes = {id(p.ref_code) for p in mean_item}
+        check(len(mean_item) >= 2 and len(codes) == 1,
+              "the averaged version reuses your clip's own codes and transcript")
+
+        # The same-clip case: with your clip also the cleanest, its pairs are identical.
+        twin_dir = lab_obj.render(clips, ["One sentence."], [7], 2, "English",
+                                  single=max(range(4), key=lambda i: clips[i]["clean_score"]))
+        twin = lab.load_run(os.path.basename(twin_dir), tmp)
+        same = [p for p in twin["pairs"] if p["challenger"] == "cleanest"]
+        check(same and all(p["identical"] for p in same), "cleanest == yours: identical pairs")
+        check(all(t.get("same_as") == "single" for t in twin["takes"] if t["arm"] == "cleanest"),
+              "and its take is reused, not re-rendered")
+
+        demo = lab.build_lab_ui(lab_obj, [])
+        h = demo.lab_handlers
+        arms = list(lab.CHALLENGERS)
+        out = h["show_pair"](run_id, arms)
+        check(out[0] and "Pair 1 of" in out[1] and all(os.path.isfile(x) for x in out[2:]),
+              f"first pair shown with three players: {out[1]}")
+        check(out[3] != out[4], "A and B are different takes")
+        # Always prefer the averaged version, prefer your clip over everything else.
+        answered = 0
+        while out[0]:
+            pair = next(p for p in run["pairs"] if p["id"] == out[0])
+            want_challenger = pair["challenger"] == "single_mean"
+            single_side = pair["single_side"]
+            picked = ({"A": "B", "B": "A"}[single_side]) if want_challenger else single_side
+            if pair["challenger"] == "xvec_mean" and answered % 2:
+                picked = "tie"
+            out = h["answer"](run_id, arms, out[0], picked)
+            answered += 1
+            if answered == 3:
+                undone = h["undo"](run_id, arms)
+                check("Undone" in undone[1] and undone[0] is not None, "undo shows the pair again")
+                check(len(lab.load_answers(run_id, tmp)) == 2, "undo removed one answer")
+                again = next(p for p in run["pairs"] if p["id"] == undone[0])
+                re_pick = (({"A": "B", "B": "A"}[again["single_side"]])
+                           if again["challenger"] == "single_mean" else again["single_side"])
+                if again["challenger"] == "xvec_mean":
+                    re_pick = "tie" if answered % 2 else re_pick
+                out = h["answer"](run_id, arms, undone[0], re_pick)
+            check(answered < 100, "terminates")
+        check("All 24 pairs answered" in out[1], f"done: {out[1]}")
+        answers = lab.load_answers(run_id, tmp)
+        check(len(answers) == 24, "one answer per pair")
+        by = {}
+        for p in run["pairs"]:
+            by.setdefault(p["challenger"], []).append(answers[p["id"]]["choice"])
+        check(set(by["single_mean"]) == {"challenger"} and set(by["concat"]) == {"single"},
+              f"clicks map back to the right version whatever side it was on: {by}")
+        md = lab.results_markdown(run_id, tmp)
+        check("6 / 0 / 0" in md and "0 / 6 / 0" in md, f"tallies:\n{md}")
+        check("too few to tell" in md, "6 pairs per version is too few for a verdict")
+        check("baseline: c0.wav" in md, "the results say which clip was the baseline")
+
+        out = h["show_pair"](run_id, ["concat"])
+        check(out[0] is None and "All 6 pairs" in out[1], "a version filter narrows the queue")
+        old = os.path.join(tmp, "old")
+        os.makedirs(old)
+        with open(os.path.join(old, "run.json"), "w") as fh:
+            fh.write('{"id": "old", "takes": [], "trials": []}')
+        check("older version" in h["show_pair"]("old", arms)[1], "an old-format run is refused")
+        try:
+            lab.load_run("../" + run_id, tmp)
+            check(False, "a run id cannot walk out of the output dir")
+        except ValueError:
+            pass
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

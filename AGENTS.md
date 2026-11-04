@@ -43,9 +43,11 @@ run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
                            through paplay/ffplay/aplay/afplay
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
+scripts/multi_clip_lab.py  blind A/B UI (port 7861): your one clip vs several-clip clones
+                           clips for a clone. Takes the lock; writes only tests/output/
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 88 checks, no weights, ~10s with deps installed
+tests/test_app_logic.py  CPU tier: 91 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
 docs/quality.md          every quality measurement and what the app does about it
 docs/design.md           the why behind the code shape, including the UI layout rules
@@ -75,7 +77,7 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 88 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 91 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~2 min, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -449,6 +451,37 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   the reference's codec codes, x-vector does not); an opt-in denoiser A/B on noisy
   references (noise was the biggest SIM loss, −0.020); a `say.py --warm` to pre-render
   common lines.
+- **Multi-clip clones: run, and the answer is "don't".** The model takes one reference (one
+  clip's codes + one embedding), so `scripts/multi_clip_lab.py` compares several ways of
+  filling those slots from several clips against the listener's own clip:
+  - the same codes with an averaged embedding (`single_mean`, which isolates averaging);
+  - all clips joined;
+  - the cleanest clip;
+  - the averaged embedding alone.
+
+  It runs as blind A/B pairs against a held-out real clip, scored with an exact sign test,
+  plus paired held-out SIM. SIM against the build average is graded by the encoder that made
+  the average, so it is not reported. CPU tests drive it with a fake model through the UI's own
+  handlers: `test_multi_clip_lab_end_to_end_with_a_fake_model`.
+
+  **Run on the 5070 Ti** (2026-11-04, one speaker, 24 clips from one recording, Japanese, 51
+  of 64 pairs rated): averaging the embedding is **not worth building** — every ear verdict
+  was "no clear difference" and every Δ SIM sat inside the ±0.0055 that a re-render moves by
+  on its own. What *did* move: the baseline (most typical clip) failed to say the sentence in
+  12/16 takes, the cleanest clip in 0/16. Reference **cleanliness predicts intelligibility;
+  typicality does not**. Numbers and caveats in `docs/quality.md`.
+- **A sign test on a continuous measure needs a dead band.** The lab counted any SIM delta
+  above `1e-9` as a win, so with take-to-take SD 0.0055 it printed `13/3 (p=0.02)` for noise
+  and its own advice then argued against the listener's ears. `SIM_DEADBAND` (0.0025) fixes
+  it; the same data reads 6/1 (p=0.12). The table prints the take-to-take noise beside the
+  deltas and says "you can stop rating" once every version is flat on both measures.
+  `test_multi_clip_results_do_not_read_noise_as_signal`. The corollary for any metric added
+  here: **publish the noise floor next to the effect, or the effect is decoration.**
+- `mean_embedding` averages **unit** vectors then rescales to the clips' mean norm, and that
+  is load-bearing, not tidiness: the speaker embedding is spliced raw into the talker's input
+  embeddings (`modeling_qwen3_tts.py:2171`) with no normalisation on the path, so a plain mean
+  hands the model a vector outside its trained range. Measured: ratio 1.0000 to the clips'
+  mean norm (17.334 vs 16.999-17.705); a naive mean would be 17.158.
 - **`webui/app.py` is ~3,800 lines.** Natural seams for a split: `hub.py` (ModelHub,
   memory guards, lock), `media.py` (ingest, path guards, reference analysis/cleanup),
   `asr.py` (Transcriber), `scoring.py` (penalty, defects, labels), `chunking.py`,

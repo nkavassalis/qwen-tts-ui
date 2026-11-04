@@ -6,6 +6,27 @@ All notable changes to this project are documented here. Newest first.
 
 ### Added
 
+- **`scripts/multi_clip_lab.py` — is a clone from several clips better than your one clip?**
+  An experiment with its own web UI (port 7861, the same login options and single-owner lock
+  as the app). Add 3+ clips of one person, or one long recording, cut into ~6s clips. Pick
+  the clip you'd use in the Clone tab, which becomes the baseline and is never held out.
+  **Screen** runs Whisper for transcripts you can correct, flags outliers and reference
+  problems, and gives each clip a cleanliness score. **Render** makes, on the same sentences
+  and seeds:
+  - your clip;
+  - your clip's codes with the averaged speaker embedding, so only the embedding differs;
+  - all clips joined;
+  - the cleanest clip;
+  - the averaged embedding alone.
+
+  **Listen** is a blind A/B. You hear the real person (a held-out clip), then your clip's take
+  and one other version, in random order and loudness-matched, and click A, B or *can't
+  tell*. Undo is there for a misclick. **Results** gives each version's tally against your
+  clip with an exact sign test, and the same paired comparison on held-out SIM. It also
+  checks the listener: identical pairs, and a bias toward one side. `--render-only` runs
+  headless and `--listen-only` A/Bs an old run without a GPU. Nothing in the app or saved
+  voices changes yet.
+
 - **A render cache for Speak and Chat.** Every sentence they render is kept per voice. The
   same sentence in the same voice, language, sampling settings and weights replays from disk
   instead of costing 7–11s of generation. "Tests passed." is instant the second time, and a
@@ -23,6 +44,43 @@ All notable changes to this project are documented here. Newest first.
   both in the status and in the checklist. It runs only when Whisper is loaded or best-of-N
   is about to load it, and the result is cached per clip and transcript. The threshold
   (`REF_TEXT_CONF_WARN = -2.0`) warns and never blocks; it is calibrated below.
+
+### Fixed — the multi-clip lab was reading noise as signal
+
+The first real run of the lab (one speaker, 24 clips from a single long recording, Japanese,
+16 takes per version, 51 of 64 pairs rated by ear) produced a table that argued against the
+listener, and the two causes were both in the scoring layer:
+
+- **SIM wins/losses counted any delta above `1e-9`.** Re-rendering one version with only the
+  seed changed moves held-out SIM by SD **0.0055**, while the whole spread between five
+  versions was **0.0027** — so a +0.0001 wobble was tallied as a win, and the table printed
+  `13/3 (p=0.02)` for a difference no one could hear. Its own advice ("only if held-out SIM
+  does not disagree") then told the reader the ears were wrong. There is a `SIM_DEADBAND` of
+  0.0025 now; the same run reads 6/1 (p=0.12), which agrees with the listener. A sign test on
+  a continuous measure needs a dead band, or it manufactures significance against any baseline.
+- **The column that mattered was hidden.** Mean WER showed `0.10` against `0.00` and looked
+  like a rounding story, when in fact the baseline clip failed to say the sentence in **12 of
+  16** takes and the cleanest clip in **0 of 16**. The table now counts failed takes and tests
+  them paired (McNemar's exact on the pairs where the two disagree): p=0.003, 0.002, <0.001.
+
+It also prints the take-to-take noise next to the deltas, so a reader can see whether a delta
+is bigger than a re-render, and says **"you can stop rating"** once every version is flat on
+both measures — 64 pairs was never going to resolve a zero effect, and someone gives up an
+hour to rate them.
+
+And the Run dropdowns are re-listed on every page load. They were populated once, when the UI
+was built, so a run rendered after the server started vanished from both tabs the moment
+anyone reloaded — Listen and Results could not reach it even though every WAV was on disk, and
+it looked like the render had never happened.
+
+The experiment's own answer, recorded in [docs/quality.md](docs/quality.md): **averaging the
+speaker embedding does nothing you can hear** (every ear verdict "no clear difference", every
+Δ SIM inside one take's noise), but **which clip you pick matters a lot for getting the words
+right** — the most *typical* clip mis-said the line three times in four, the *cleanest* never
+did. Typicality does not predict intelligibility; cleanliness does.
+
+CPU tier 93/93 (`test_multi_clip_results_do_not_read_noise_as_signal`,
+`test_multi_clip_lab_lists_runs_rendered_after_startup`); GPU tier 8/8, no skips.
 
 ### Tests
 

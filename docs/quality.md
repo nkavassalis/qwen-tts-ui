@@ -202,6 +202,100 @@ Same three lines, raw 24kHz decode, energy above 9kHz:
 The practical advice is to clone from a **real recording** where you can. If you save a
 generated take, keep it for Speak and Chat, not as the next clone's reference.
 
+## Several clips: an experiment, and its first result
+
+Qwen3-TTS conditions on one reference: one clip's codec codes plus transcript, and one
+speaker embedding. More clips can only help by filling those two slots better.
+`scripts/multi_clip_lab.py` tests each candidate against **the clip you would use today**:
+
+| version | codes + transcript from | embedding from |
+|---|---|---|
+| `single` (baseline) | your clip | your clip |
+| `single_mean` | your clip | average of all build clips |
+| `concat` | all build clips joined (≤20s) | the joined clip |
+| `cleanest` | the clip that does best on the reference checks | that clip |
+| `xvec_mean` | nothing (x-vector mode) | average of all build clips |
+
+`single_mean` differs from `single` only in the embedding, so its pair isolates the effect of
+averaging. `cleanest` asks a different question: would picking a better single clip have
+done as well?
+
+**How it is judged.** Each round holds out one clip, never yours, and builds every version
+from the rest. The listener gets one forced choice per pair. They hear the held-out real
+clip, then A and B: your clip's take and one other version, on the same sentence and seed,
+in random order and loudness-matched. The answer is A, B or *can't tell*. A forced choice
+against a reference is what listeners are reliable at. Rating several takes at once on a
+1–5 scale was not: the scale drifts, and it never asks "better than what I have?"
+
+Each version gets a tally against your clip and an exact two-sided sign test. There is no
+verdict under 10 decided pairs; 7 of 10 is p≈0.34, so not a finding. Held-out SIM gets the
+same paired comparison. SIM against the build-clip average is deliberately not reported: the
+encoder that made the average would be grading it.
+
+Two checks on the listener are built in:
+- **Identical pairs.** When the cleanest clip *is* your clip, its pair plays the same take
+  twice, and the honest answer is *can't tell*.
+- **Side bias.** The results show how often A was chosen.
+
+**When it is worth building.** A version earns a place in the app only if:
+- the listener verdict is **better**;
+- held-out SIM doesn't disagree;
+- WER is no worse.
+
+"No clear difference" after 20+ pairs is an answer too.
+
+**Caveat.** Clips cut from one long recording share a mic and room, so they are a kinder
+test than clips from different days.
+
+### What it found
+
+Measured on the 5070 Ti (2026-11-04): one speaker, 24 clips cut from a single long recording,
+Japanese, one sentence, 4 seeds × 4 rounds = 16 takes per version, **51 of 64 blind pairs
+answered by ear**.
+
+| version | you preferred it / your clip / can't tell | Δ SIM vs your clip | mis-said the sentence |
+|---|---|---|---|
+| `single` (your clip) | — | — | **12/16** |
+| `single_mean` | 5 / 5 / 5 | +0.002 | 11/16 |
+| `concat` | 2 / 8 / 2 | −0.001 | 2/16 |
+| `cleanest` | 4 / 6 / 2 | +0.002 | **0/16** |
+| `xvec_mean` | 5 / 6 / 1 | +0.002 | 1/16 |
+
+Side bias 21/41 (p=1.00), so the randomisation held and the instrument worked.
+
+**Averaging the speaker embedding does nothing you can hear.** All five versions sit between
+held-out SIM 0.9737 and 0.9764, while re-rendering *one* version with only the seed changed
+moves SIM by **±0.0055** — the entire spread between versions is half the noise of a single
+take. Every ear verdict is "no clear difference", and `single_mean` — the pair that isolates
+averaging — was called *can't tell* 5 times in 16. **Not worth the complexity.**
+
+**What did move is which clip you pick, and it moved on intelligibility, not identity.** The
+baseline, chosen as the most *typical* clip by embedding, failed to say the sentence in 12 of
+16 takes. The clip chosen by the technical reference checks never did, and `xvec_mean` and
+`concat` failed once or twice (paired exact p=0.003, 0.002, <0.001 against the baseline's 12).
+Typicality does not predict getting the words right; **cleanliness does**. That is a
+reference-selection lesson, not an averaging one — and it is the actual finding, sitting in
+the table's last column.
+
+**Caveats on the result.** One speaker, one language, one sentence, all clips from one
+session. The *ranking* is paired on that sentence and stands; the absolute rates do not
+generalise until a second sentence and a second speaker agree.
+
+**Two instrument bugs this run exposed, now fixed** in `summarise` / `summary_markdown`,
+pinned by `test_multi_clip_results_do_not_read_noise_as_signal`:
+
+- SIM wins/losses counted any delta above `1e-9`, so a +0.0001 wobble was a "win" and the
+  table printed `13/3 (p=0.02)` for a difference well inside one take's own noise — then
+  advised itself that held-out SIM disagreed with the ears. There is a `SIM_DEADBAND` of
+  0.0025 now; the same data reads 6/1 (p=0.12), which agrees with the listener.
+- The table showed mean WER only, which hid a 12/16-vs-0/16 failure rate behind two decimals
+  that looked equal. It now counts failed takes and tests them paired (McNemar's exact, on the
+  pairs where the two versions disagree).
+
+It also prints the take-to-take noise beside the deltas, and says **"you can stop rating"**
+once every version is flat on both measures: 64 pairs was never going to resolve a zero
+effect, and rating them is real work someone has to give up an hour for.
+
 ## Output post-processing
 
 The vocoder is fixed at 24kHz, so nothing can add real bandwidth above 12kHz. What *can* be
