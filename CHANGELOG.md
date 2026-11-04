@@ -68,13 +68,19 @@ is bigger than a re-render, and says **"you can stop rating"** once every versio
 both measures — 64 pairs was never going to resolve a zero effect, and someone gives up an
 hour to rate them.
 
+And the Run dropdowns are re-listed on every page load. They were populated once, when the UI
+was built, so a run rendered after the server started vanished from both tabs the moment
+anyone reloaded — Listen and Results could not reach it even though every WAV was on disk, and
+it looked like the render had never happened.
+
 The experiment's own answer, recorded in [docs/quality.md](docs/quality.md): **averaging the
 speaker embedding does nothing you can hear** (every ear verdict "no clear difference", every
 Δ SIM inside one take's noise), but **which clip you pick matters a lot for getting the words
 right** — the most *typical* clip mis-said the line three times in four, the *cleanest* never
 did. Typicality does not predict intelligibility; cleanliness does.
 
-CPU tier 92/92 (`test_multi_clip_results_do_not_read_noise_as_signal`).
+CPU tier 93/93 (`test_multi_clip_results_do_not_read_noise_as_signal`,
+`test_multi_clip_lab_lists_runs_rendered_after_startup`); GPU tier 8/8, no skips.
 
 ### Tests
 

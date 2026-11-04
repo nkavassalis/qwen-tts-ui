@@ -948,6 +948,18 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
             return f"{e}"
 
     runs = list_runs(lab.out_root)
+
+    def refresh_runs():
+        """Re-list the runs on every page load.
+
+        `runs` above is evaluated once, when the UI is built. Without this, a run rendered
+        after the server started disappears from both dropdowns the moment anyone reloads the
+        page -- and Listen and Results cannot reach it again even though every WAV is on disk.
+        """
+        fresh = list_runs(lab.out_root)
+        first = fresh[0] if fresh else None
+        return gr.update(choices=fresh, value=first), gr.update(choices=fresh, value=first)
+
     challenger_choices = [(ARM_LABELS[k], k) for k in CHALLENGERS]
     with gr.Blocks(title="Multi-clip clone lab") as demo:
         gr.Markdown("# Multi-clip clone lab\nIs a clone built from several clips better than "
@@ -1041,9 +1053,10 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
         undo_btn.click(undo, [run_dd, arms_cb], pair_outputs)
         res_btn.click(show_results, res_dd, res_md)
         res_dd.change(show_results, res_dd, res_md)
+        demo.load(refresh_runs, None, [run_dd, res_dd])
     demo.lab_handlers = {"load_uploads": load_uploads, "remove_clip": remove_clip,
                          "show_pair": show_pair, "answer": answer, "undo": undo,
-                         "estimate": estimate}
+                         "estimate": estimate, "refresh_runs": refresh_runs}
     return demo
 
 

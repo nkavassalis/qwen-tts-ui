@@ -2962,6 +2962,33 @@ def test_multi_clip_results_do_not_read_noise_as_signal() -> None:
           "too few answered pairs is not a stop either")
 
 
+def test_multi_clip_lab_lists_runs_rendered_after_startup() -> None:
+    """A run rendered after the server started must survive a page reload.
+
+    The Run dropdowns are populated once, when the UI is built. Without the load handler a
+    reloaded page offers only the runs that existed at boot, so Listen and Results cannot
+    reach a run whose WAVs are sitting on disk -- it looks like the render never happened.
+    """
+    lab = _lab()
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        lab_obj = lab.Lab(hub=None, asr=None, out_root=tmp)
+        demo = lab.build_lab_ui(lab_obj, [])
+        refresh = demo.lab_handlers["refresh_runs"]
+        run_dd, res_dd = refresh()
+        check(run_dd["choices"] == [] and run_dd["value"] is None,
+              f"an empty lab lists no runs: {run_dd}")
+        for name in ("20260101-000000", "20260101-000001"):
+            os.makedirs(os.path.join(tmp, name), exist_ok=True)
+            with open(os.path.join(tmp, name, "run.json"), "w", encoding="utf-8") as fh:
+                json.dump({"format": lab.RUN_FORMAT, "id": name}, fh)
+        run_dd, res_dd = refresh()
+        check(run_dd["choices"] == ["20260101-000001", "20260101-000000"],
+              f"runs rendered after startup are listed, newest first: {run_dd['choices']}")
+        check(run_dd["value"] == "20260101-000001" and res_dd["value"] == run_dd["value"],
+              f"both tabs select it: {run_dd['value']} / {res_dd['value']}")
+
+
 def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
     """Screen, render every version, A/B through the UI's own handlers, undo, read results."""
     import threading
