@@ -2775,6 +2775,18 @@ def test_reference_transcript_check() -> None:
             webui._REF_TEXT_CHECKS.clear()
 
 
+def test_cjk_is_scored_per_character() -> None:
+    """WER and the transcript-length check must work on scripts without spaces."""
+    exact, one_off = "今日はいい天気ですね", "今日は悪い天気ですね"
+    check(webui.word_error_rate(exact, exact) == 0.0, "exact Japanese is WER 0")
+    check(0.05 < webui.word_error_rate(one_off, exact) < 0.3,
+          f"one word changed is a small non-zero WER: {webui.word_error_rate(one_off, exact)}")
+    check(webui.word_error_rate("오늘은 날씨가 좋네요", "오늘은 날씨가 나쁘네요") > 0, "Hangul too")
+    check(webui.transcript_fit(3.0, exact) == "", "10 characters fit a 3s clip")
+    check("too short" in webui.transcript_fit(3.0, "今日は"), "3 characters do not")
+    check("too long" in webui.transcript_fit(3.0, exact * 3), "30 characters do not")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

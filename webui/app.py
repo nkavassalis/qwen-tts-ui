@@ -1902,10 +1902,11 @@ ASR: Optional[Transcriber] = None
 # one-word-wrong, and above every "half wrong" case, so it fires only on "that is not this
 # clip at all". It warns, it never blocks, until that is decided.
 
-# Caveat for CJK references: confidence is fine (the Japanese clip reads -0.51 exact), but
-# `word_error_rate` and the words-per-second fit guards count spaces, so their WER/rate
-# numbers are meaningless without spaces — the same gap `split_for_tts` already handles with
-# CHUNK_MIN_CJK and these do not. Confidence is the only signal here that survives CJK.
+# CJK references are fine on all three signals: confidence (the Japanese clip reads -0.51
+# exact), and `word_error_rate` / `transcript_fit`, which count kana, Han and Hangul per
+# character via `_CJK_RE` (pinned by `test_cjk_is_scored_per_character`). A probe that builds
+# its "one word wrong" variant with str.split() changes nothing in a script without spaces —
+# that, not the app, is what made one calibration row read identical to exact.
 REF_TEXT_CONF_WARN = -2.00
 _REF_TEXT_CHECKS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 REF_TEXT_CHECK_CACHE = 32

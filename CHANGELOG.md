@@ -64,8 +64,9 @@ cold cache left the real `tmp/render_cache` untouched (0 files afterwards).
   `"slug": "../../escape"` could have written outside `tmp/render_cache/`. Now pinned by a test
   alongside the damaged-entry and LRU checks.
 - One probe artifact worth knowing: the Japanese clip's "one word off" row read identical to
-  exact, because `word_error_rate` and the words-per-second guards count spaces. Confidence is
-  the only reference-check signal that survives a script without spaces — noted at the constant.
+  exact. That was the probe (it built the variant by splitting on spaces, a no-op in
+  Japanese), not the app: `word_error_rate` and `transcript_fit` count CJK per character, now
+  pinned by `test_cjk_is_scored_per_character`. An earlier note here blamed the app; corrected.
 
 ## [Unreleased] — UI reorganised; clone quality
 

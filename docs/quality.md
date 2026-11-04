@@ -61,9 +61,10 @@ Here is what follows from that, and what the app does about each finding:
    worst one-word-wrong, and above every half-wrong case, so it fires only on "that is not
    this clip at all". It warns, it never blocks.
 
-   One caveat: confidence survives CJK (the Japanese clip reads −0.51 exact), but the WER and
-   words-per-second guards count spaces, so for a reference with no spaces between words those
-   two numbers are meaningless — confidence is the only signal there that means anything.
+   CJK works on every signal: confidence (the Japanese clip reads −0.51 exact), and the WER
+   and length checks, which count kana, Han and Hangul per character. (One calibration row
+   read identical to exact because the probe made its "one word wrong" variant by splitting
+   on spaces, a no-op in Japanese. That was the probe, not the app.)
    `smoke_test.py --only media_pipeline` prints the right-vs-wrong pair. It runs only when
    Whisper is already loaded or best-of-N is about to load it.
 2. **Noise is the biggest likeness loss** (−0.020). The checklist estimates the SNR from the
