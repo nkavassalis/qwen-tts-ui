@@ -45,6 +45,31 @@ references doesn't re-encode either one.
 An earlier key, (length, float sum), let two different clips share a prompt. On a shared LAN
 that meant answering in someone else's voice.
 
+## Speak and Chat replay what they have already said
+
+`RenderCache` keeps the raw decode of every sentence Speak and Chat render, under
+`tmp/render_cache/<slug>__<hash>.wav`. The hash covers an *identity* plus the sentence. The
+identity is everything that shapes a raw decode:
+
+- the voice's content: the cleaned clip's PCM hash, transcript and mode, or the description;
+- the language;
+- the sampling settings;
+- the weights (checkpoint folder and `config.json` mtime);
+- `RENDER_CACHE_VERSION`.
+
+Because the key is content, nothing ever has to be invalidated. Edit the transcript, change
+`prefer`, move a slider, swap the weights: the identity changes and the old entries age out.
+Deletion is the exception. Renders of a person's voice must not outlive the saved voice, so
+deleting it removes its `<slug>__*` files.
+
+What is stored is the raw decode, and post-processing runs after the cache, so Warm, Clean and
+Off share entries. A take is stored only if it passed the pace and clipping checks, because a
+cached take replays forever. The Clone and Design tabs bypass the cache entirely: a Generate
+button that returned the same take twice would be broken.
+
+The cost is variety. A cached sentence sounds identical every time. For notification lines
+that's a feature, and it also keeps a designed voice from drifting on repeated sentences.
+
 ## Whisper large-v3 through transformers
 
 Whisper runs through transformers rather than faster-whisper. That reuses the torch/CUDA
@@ -52,11 +77,13 @@ stack (ctranslate2 kernels may not cover sm_120), it transcribes 6s in ~3s, and 
 on first use. The padding mask is passed explicitly, so Whisper doesn't hallucinate over the
 30s of zero-padding a short clip gets.
 
-Whisper is used three ways:
+Whisper is used four ways:
 
 - **Transcribe**: beam 4, `no_repeat_ngram_size=4`, on the selection only. It also reports
   the language it detected, which the Clone tab uses to set the target language.
 - **WER** of each best-of-N take against the requested text.
+- **The reference check**: the confidence scorer below, run on the *reference* and its
+  transcript, to catch a transcript of the right length with the wrong words.
 - **Confidence**: one teacher-forced forward pass of the *requested* text. The decoder
   prefix (`<|startoftranscript|><|lang|><|transcribe|><|notimestamps|>`) is built
   explicitly, and the text is tokenised without special tokens. Before this release it was

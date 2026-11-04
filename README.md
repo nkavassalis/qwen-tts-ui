@@ -73,7 +73,10 @@ generate and save.
 4. Read the **checklist** under the transcript. It is recomputed for every selection, and
    each line flags something that was measured to hurt a clone: a transcript that doesn't fit
    the clip, a noisy background, a clip that is too short or too long, an edge that cuts a word
-   in half, clipped peaks.
+   in half, clipped peaks. After a Generate it also shows **Whisper's verdict** on whether
+   the clip actually says your transcript. That catches a transcript of the right length
+   with the wrong words, which the length check can't. It warns and never blocks: its
+   threshold hasn't been calibrated against real wrong transcripts yet.
 
 **Reference options** holds two switches:
 
@@ -189,8 +192,21 @@ touches the filesystem.
 
 **Chat** speaks each sentence as soon as it exists, so the first one plays after a few seconds
 instead of after the whole reply. The model can't stream samples; sentences are the finest
-granularity there is. Overall it runs at about 1.4× realtime. If your browser blocks autoplay,
-each sentence has its own play button.
+granularity there is. The first piece is cut short (4–10 words, at a sentence end or a comma)
+because that's the wait you notice. Overall it runs at about 1.4× realtime. If your browser
+blocks autoplay, each sentence has its own play button.
+
+**Repeats are instant.** Speak and Chat keep every sentence they render, per voice, in
+`tmp/render_cache/`. The same sentence in the same voice, language and sampling settings
+replays from disk instead of regenerating. That makes notification lines like "Tests passed."
+instant after the first time, and replies that share sentences with earlier ones partly
+instant. The trade-off: a cached line sounds the same every time. Changing the voice, its
+transcript or description, the language, the sampling sliders or the weights gives a fresh
+render. Post-processing is applied after the cache, so switching Warm/Clean/Off still
+replays. A take that failed the pace or clipping check is never cached. Deleting a voice
+deletes its renders. The cache is capped at 256MB and drops anything unused for 7 days; see
+*Configuration*. The Clone and Design tabs never use it: Generate there always makes a new
+take.
 
 Everything shares one GPU, and requests run one at a time. A long line from a script queues a
 UI request behind it.
@@ -261,6 +277,8 @@ Flags are listed by `./run.sh --help`. The environment variables are all optiona
 | `QWEN_TTS_MODELS_DIR` | `./models` | Where the `Qwen3-TTS-12Hz-1.7B-*` checkpoints live (`--models-dir` wins) |
 | `QWEN_TTS_ASR_MODEL` | `openai/whisper-large-v3` | Whisper model for Transcribe |
 | `QWEN_TTS_MEDIA_TTL_SECONDS` | 6 hours | Age after which clips in `tmp/media/` are pruned |
+| `QWEN_TTS_RENDER_CACHE_MB` | 256 | Size cap of the Speak/Chat render cache in `tmp/render_cache/`; `0` turns it off |
+| `QWEN_TTS_RENDER_CACHE_TTL_SECONDS` | 7 days | A cached render unused this long is deleted (`0`: only the size cap applies) |
 | `QWEN_TTS_ALLOWED_MEDIA_DIRS` | — | Extra directories the path guard accepts, path-separator separated |
 | `QWEN_TTS_RAM_FLOOR_MB` | 4096 | Refuse to load another model below this much available RAM |
 | `QWEN_TTS_VRAM_MARGIN_MB` | 1024 | VRAM kept free for activations and the vocoder |
@@ -294,7 +312,7 @@ repo/ models/ voices/ tmp/ certs/   upstream checkout, weights, your voices, scr
 ## Tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # ~15s, CPU only, no weights
+.venv/bin/python tests/test_app_logic.py   # ~10s, CPU only, no weights
 .venv/bin/python tests/smoke_test.py       # ~2 min, needs the GPU + weights; stop the server first
 .venv/bin/python tests/smoke_test.py --only best_of_n
 ```

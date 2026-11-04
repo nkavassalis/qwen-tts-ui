@@ -555,6 +555,11 @@ def postprocess_output(wav: np.ndarray, sr: int, mode: str = POSTPROCESS_DEFAULT
 CHUNK_MIN_WORDS, CHUNK_TARGET_WORDS, CHUNK_MAX_WORDS = 12, 18, 26
 CHUNK_MIN_CJK, CHUNK_TARGET_CJK, CHUNK_MAX_CJK = 20, 30, 42
 CHUNK_THRESHOLD = 25      # at or below this many units: one pass, the measured safe zone
+# Chat only: the first piece is cut short so the first audio arrives sooner (generation time
+# tracks audio length). Only at punctuation, never mid-phrase, and only when both halves stay
+# long enough to carry prosody. Unmeasured for quality — see AGENTS.md.
+FIRST_CHUNK_WORDS = (4, 7, 10)      # min, target, max
+FIRST_CHUNK_CJK = (6, 10, 16)
 MAX_CHUNKS = 40           # one GPU, one request — ask for a shorter script instead
 CROSSFADE_MS = 15         # equal-power join; a hard splice clicks
 SILENCE_KEEP_MS = 60      # trim the decode's edge padding, keep consonant air
@@ -687,20 +692,64 @@ def _split_clauses(sentence: str, ceiling: int, depth: int = 0) -> List[str]:
             + _split_clauses(best[1].strip(), ceiling, depth + 1))
 
 
-def split_for_tts(text: str, language: Optional[str] = None) -> List[str]:
+def _quick_first(chunks: List[str], cjk: bool) -> List[str]:
+    """Cut the first chunk short, at a sentence or punctuation boundary, if one fits.
+
+    Sentence boundaries beat clause punctuation; among those, the cut whose first half is
+    closest to the target wins. Word-boundary cuts (" and ", " which ") are not used here:
+    ending the very first thing you hear on "and" sounds broken. Lossless — a slice.
+    """
+    if not chunks:
+        return chunks
+    low, target, high = FIRST_CHUNK_CJK if cjk else FIRST_CHUNK_WORDS
+    first = chunks[0]
+    if _units(first) <= high:
+        return chunks
+    cuts: List[Tuple[int, int]] = []           # (rank, index): rank 0 sentence, 1 clause
+    position = 0
+    for sentence in _split_sentences(first)[:-1]:
+        found = first.find(sentence, position)
+        if found < 0:
+            break
+        position = found + len(sentence)
+        cuts.append((0, position))
+    cuts += [(1, m.end()) for m in re.finditer(r"[,;:—–，；：、]", first)]
+    best: Optional[Tuple[Tuple[int, int], int]] = None
+    for rank, index in cuts:
+        left, right = first[:index].strip(), first[index:].strip()
+        if not left or not right:
+            continue
+        size = _units(left)
+        if not (low <= size <= high) or _units(right) < low:
+            continue
+        score = (rank, abs(size - target))
+        if best is None or score < best[0]:
+            best = (score, index)
+    if best is None:
+        return chunks
+    index = best[1]
+    return [first[:index].strip(), first[index:].strip()] + chunks[1:]
+
+
+def split_for_tts(text: str, language: Optional[str] = None,
+                  quick_start: bool = False) -> List[str]:
     """Slice text into pieces the model speaks without rushing. Lossless.
 
     Sentences first, then the measured length band in both directions: fragments are merged
     (a two-word chunk arrives clipped and toneless — prosody needs context) and over-long
     sentences are cut at their middlest clause boundary. Concatenating the result reproduces
     the input with whitespace ignored; nothing is reworded, reordered or dropped.
+
+    `quick_start` (Chat) additionally cuts the first piece short (`_quick_first`), because
+    in a streamed reply the wait for the first piece is the wait you notice.
     """
     text = (text or "").strip()
     if not text:
         return []
+    cjk = _is_cjk(text.lstrip()[0])
     if _units(text) <= CHUNK_THRESHOLD:
-        return [text]
-    if _is_cjk(text.lstrip()[0]):
+        return _quick_first([text], cjk) if quick_start else [text]
+    if cjk:
         low, target, ceiling = CHUNK_MIN_CJK, CHUNK_TARGET_CJK, CHUNK_MAX_CJK
     else:
         low, target, ceiling = CHUNK_MIN_WORDS, CHUNK_TARGET_WORDS, CHUNK_MAX_WORDS
@@ -730,6 +779,8 @@ def split_for_tts(text: str, language: Optional[str] = None) -> List[str]:
             chunks[-2] = _join(chunks[-2], chunks[-1])
             chunks.pop()
     chunks = [c.strip() for c in chunks if c.strip()]
+    if quick_start:
+        chunks = _quick_first(chunks, cjk)
     if len(chunks) > MAX_CHUNKS:
         raise MediaError(
             f"That is {len(chunks)} chunks — over the {MAX_CHUNKS} allowed in one request on "
@@ -783,14 +834,18 @@ def stitch_clips(clips: List[np.ndarray], sr: int,
 
 
 def iter_chunked(text: str, language: Optional[str], generate_one: Any,
-                 progress: Any = None):
-    """Yield one dict per spoken piece: index, total, text, wav, sr, rerolled.
+                 progress: Any = None, cache: Any = None, quick_start: bool = False):
+    """Yield one dict per spoken piece: index, total, text, wav, sr, rerolled, cached.
 
     A generator rather than a loop that returns a finished clip, because the chat tab wants
     to hand you each piece the moment it exists — the model cannot stream samples, but it can
     stream sentences, and the first one lands in ~6-9s instead of after the whole reply.
+
+    `cache` (a `RenderCache`, Speak/Chat only) is consulted per piece. A take is stored only
+    if it passed the rate and clipping checks — a cached take is replayed every time, so a
+    bad one must never get in.
     """
-    chunks = split_for_tts((text or "").strip(), language)
+    chunks = split_for_tts((text or "").strip(), language, quick_start=quick_start)
     total = len(chunks)
     for index, chunk in enumerate(chunks):
         if progress is not None:
@@ -798,6 +853,11 @@ def iter_chunked(text: str, language: Optional[str], generate_one: Any,
                 progress((index + 1) / (total + 1.0), desc=f"Chunk {index + 1} of {total}")
             except Exception:  # noqa: BLE001 - a progress bar is never a reason to fail
                 pass
+        hit = cache.get(chunk) if cache is not None else None
+        if hit is not None:
+            yield {"index": index, "total": total, "text": chunk, "wav": hit[0], "sr": hit[1],
+                   "rerolled": False, "cached": True}
+            continue
         wav, sr = generate_one(chunk)
         wav = np.asarray(wav, dtype=np.float32).reshape(-1)
         sr = int(sr)
@@ -808,13 +868,17 @@ def iter_chunked(text: str, language: Optional[str], generate_one: Any,
             retry = np.asarray(retry, dtype=np.float32).reshape(-1)
             second = defect_report(retry, retry_sr, chunk)
             if abs(second["rate_ratio"] - 1.0) < abs(report["rate_ratio"] - 1.0):
-                wav, sr, rerolled = retry, int(retry_sr), True
+                wav, sr, rerolled, report = retry, int(retry_sr), True, second
+        if cache is not None:
+            flags = defect_flags(report)
+            if not any(f.startswith("rate") or f == "clipping" for f in flags):
+                cache.put(chunk, wav, sr)
         yield {"index": index, "total": total, "text": chunk, "wav": wav, "sr": sr,
-               "rerolled": rerolled}
+               "rerolled": rerolled, "cached": False}
 
 
 def generate_chunked(text: str, language: Optional[str], generate_one: Any,
-                     progress: Any = None) -> Tuple[np.ndarray, int, List[str]]:
+                     progress: Any = None, cache: Any = None) -> Tuple[np.ndarray, int, List[str]]:
     """Synthesise `text`, in pieces when it is long enough to rush.
 
     `generate_one(chunk_text) -> (wav, sr)` is the model call, injected so this works for all
@@ -826,17 +890,23 @@ def generate_chunked(text: str, language: Optional[str], generate_one: Any,
     seconds: List[str] = []
     notes: List[str] = []
     sr = REF_SAMPLE_RATE
-    for piece in iter_chunked(text, language, generate_one, progress):
+    cached = 0
+    for piece in iter_chunked(text, language, generate_one, progress, cache=cache):
         sr = piece["sr"]
+        cached += bool(piece.get("cached"))
         if piece["rerolled"]:
             notes.append(f"chunk {piece['index'] + 1} re-rolled to hold a natural pace")
         if piece["total"] == 1:
+            if cached:
+                notes.append("From the render cache (said before in this voice)")
             return piece["wav"], sr, notes      # one pass: the model's own decode, untouched
         pieces.append(piece["wav"])
         seconds.append(f"{len(piece['wav']) / sr:.1f}")
     if not pieces:
         return np.zeros(0, dtype=np.float32), sr, notes
     out = stitch_clips(pieces, sr)
+    if cached:
+        notes.append(f"{cached} of {len(pieces)} pieces from the render cache")
     notes.append(f"Chunked: {len(pieces)} pieces ({'+'.join(seconds)}s) stitched with a "
                  f"{CROSSFADE_MS}ms crossfade")
     return out, int(sr), notes
@@ -1486,6 +1556,9 @@ def reference_report(clip: np.ndarray, sr: int, text: str = "",
         fit = transcript_fit(seconds, text or "")
         lines.append(("⚠️ " + fit) if fit else "✅ Transcript length fits the clip — still read "
                      "it against what you hear.")
+        check_line, check_bad = reference_transcript_line(cached_reference_check(clip, sr, text))
+        if check_line:
+            lines.append(("⚠️ " if check_bad else "✅ ") + check_line)
     return "\n\n".join(lines)
 
 
@@ -1811,6 +1884,70 @@ class Transcriber:
 
 
 ASR: Optional[Transcriber] = None
+
+# Whisper's verdict on "does the reference say this transcript?". The length check
+# (`transcript_fit`) cannot catch a transcript of the right length with the wrong words, and
+# a mismatched transcript is the worst clone failure measured (17.4s of audio for a 5s line,
+# WER 1.0). The same teacher-forced scorer that grades takes grades the reference instead.
+# PROVISIONAL: clean speech reads -0.02..-0.06 and a real Japanese take -0.51 on this scale;
+# what a wrong transcript reads has not been measured. It warns, it never blocks, until it is.
+REF_TEXT_CONF_WARN = -2.00
+_REF_TEXT_CHECKS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+REF_TEXT_CHECK_CACHE = 32
+
+
+def check_reference_transcript(wav: np.ndarray, sr: int, text: str,
+                               may_load: bool = False) -> Optional[Dict[str, Any]]:
+    """{confidence, heard, wer} for a reference and its transcript, or None if not run.
+
+    Runs only when Whisper is already loaded, or when `may_load` says this request was going
+    to load it anyway (best-of-N scoring) — never a surprise 3GB load. Results are kept per
+    (clip content, transcript), so retakes do not re-run it and the checklist can show it.
+    """
+    text = str(text or "").strip()
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if not text or not wav.size or ASR is None or not ASR.enabled:
+        return None
+    key = _clone_cache_key((wav, int(sr)), text, False)
+    if key in _REF_TEXT_CHECKS:
+        _REF_TEXT_CHECKS.move_to_end(key)
+        return _REF_TEXT_CHECKS[key]
+    if not (ASR.loaded or may_load):
+        return None
+    try:
+        heard, confidence = ASR.assess(wav, int(sr), text)
+    except Exception:  # noqa: BLE001 - a check that fails is a check not run
+        return None
+    result = {"confidence": confidence, "heard": heard,
+              "wer": word_error_rate(heard, text) if heard else None}
+    _REF_TEXT_CHECKS[key] = result
+    while len(_REF_TEXT_CHECKS) > REF_TEXT_CHECK_CACHE:
+        _REF_TEXT_CHECKS.popitem(last=False)
+    return result
+
+
+def cached_reference_check(wav: np.ndarray, sr: int, text: str) -> Optional[Dict[str, Any]]:
+    """The stored verdict for this exact clip + transcript, without running anything."""
+    text = str(text or "").strip()
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if not text or not wav.size:
+        return None
+    return _REF_TEXT_CHECKS.get(_clone_cache_key((wav, int(sr)), text, False))
+
+
+def reference_transcript_line(result: Optional[Dict[str, Any]]) -> Tuple[str, bool]:
+    """(one line for a status or checklist, whether it is a warning)."""
+    if not result or result.get("confidence") is None:
+        return "", False
+    confidence = float(result["confidence"])
+    if confidence >= REF_TEXT_CONF_WARN:
+        return (f"Whisper hears this transcript in the reference (confidence {confidence:+.2f}).",
+                False)
+    heard = _short(result.get("heard") or "", 90)
+    return (f"Whisper does not hear this transcript in the reference (confidence "
+            f"{confidence:+.2f}; a matching one reads near 0). It heard: “{heard}”. A transcript "
+            f"that does not match its clip is the worst clone failure measured — fix it, or "
+            f"press Transcribe.", True)
 
 # (Uploaded clips are kept on disk under MEDIA_DIR — see the path-containment block
 # above. gr.State travels to the browser as JSON, so only the clip's path/duration live
@@ -2244,7 +2381,10 @@ def delete_saved_voice(slug: str) -> Tuple[Any, str, Any]:
         if os.path.exists(path):
             os.remove(path)
             removed.append(os.path.basename(path))
+    renders = forget_voice_renders(_slug(slug))
     msg = f"Deleted {', '.join(removed)}" if removed else f"Nothing saved under ‘{slug}’."
+    if renders:
+        msg += f" and {renders} cached render{'s' if renders != 1 else ''}"
     # Deleting a library entry used to clear the Clone tab's reference box too, throwing
     # away whatever was loaded there even when it was not the voice being deleted.
     return gr.update(choices=voice_choices(), value=None), msg
@@ -2294,6 +2434,140 @@ def _resolve_voice(voice: str) -> Tuple[Optional[Tuple[Any, int, str]], Optional
     return (ref_wav, int(ref_sr), ref_text), None
 
 
+# ---------------------------------------------------------------------------
+# Render cache: Speak and Chat replay a sentence they have already said in this voice.
+# ---------------------------------------------------------------------------
+RENDER_CACHE_DIR = os.path.join(ROOT, "tmp", "render_cache")
+RENDER_CACHE_MB = int(os.environ.get("QWEN_TTS_RENDER_CACHE_MB", "256"))      # 0 disables it
+RENDER_CACHE_TTL_SECONDS = int(os.environ.get("QWEN_TTS_RENDER_CACHE_TTL_SECONDS",
+                                              str(7 * 24 * 3600)))           # since last use
+RENDER_CACHE_VERSION = 1      # bump when anything that shapes a raw decode changes
+
+
+def _model_tag(capability: str) -> str:
+    """Which weights produced a take: the checkpoint folder plus its config's mtime, so
+    swapping the weights under the same name does not replay the old model's audio."""
+    try:
+        path = HUB._checkpoint(capability) if HUB is not None else ""
+        stamp = os.stat(os.path.join(path, "config.json")).st_mtime_ns if path else 0
+        return f"{os.path.basename(path) or capability}@{stamp}"
+    except Exception:  # noqa: BLE001 - a missing checkpoint fails later, at generation
+        return capability
+
+
+class RenderCache:
+    """Raw per-sentence decodes on disk, for one voice in one configuration.
+
+    Bound by `_voice_synth` to an *identity*: the voice's content (the cleaned clip's PCM
+    hash + transcript + mode, or its description), the language, the sampling settings, the
+    model's weights and `RENDER_CACHE_VERSION`. Anything that would change the audio changes
+    the identity, so a hit can never be stale; it is only ever a take this exact
+    configuration produced. Post-processing runs after the cache, so Warm/Clean/Off share it.
+
+    One take per sentence, replayed verbatim: repeats sound identical. That is the point for
+    notifications ("Tests passed.") and it holds a designed voice steady, but it is a change
+    from re-rolling every time. Files are named `<slug>__<hash>.wav` so deleting a voice can
+    delete its renders — a cache of someone's voice saying things must not outlive the voice.
+    """
+
+    def __init__(self, slug: str, identity: str):
+        self.slug = slug
+        self.identity = identity
+
+    def _path(self, chunk: str) -> str:
+        said = " ".join(str(chunk or "").split())
+        digest = hashlib.sha256(f"{self.identity}\n{said}".encode("utf-8")).hexdigest()[:40]
+        return os.path.join(RENDER_CACHE_DIR, f"{self.slug}__{digest}.wav")
+
+    def get(self, chunk: str) -> Optional[Tuple[np.ndarray, int]]:
+        if RENDER_CACHE_MB <= 0:
+            return None
+        path = self._path(chunk)
+        if not os.path.isfile(path):
+            return None
+        try:
+            wav, sr = sf.read(path, dtype="float32")
+            os.utime(path)                  # the TTL and the size cap both count from last use
+        except Exception:  # noqa: BLE001 - a damaged entry is a miss, never a failure
+            return None
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        return (wav, int(sr)) if wav.size else None
+
+    def put(self, chunk: str, wav: np.ndarray, sr: int) -> None:
+        if RENDER_CACHE_MB <= 0:
+            return
+        try:
+            os.makedirs(RENDER_CACHE_DIR, exist_ok=True)
+            path = self._path(chunk)
+            temp = os.path.join(RENDER_CACHE_DIR, f".{uuid.uuid4().hex}.tmp.wav")
+            sf.write(temp, np.clip(np.asarray(wav, dtype=np.float32).reshape(-1), -1.0, 1.0),
+                     int(sr), subtype="PCM_16")
+            os.replace(temp, path)
+            prune_render_cache()
+        except Exception:  # noqa: BLE001 - failing to cache must not fail the reply
+            return
+
+
+def prune_render_cache(max_age_seconds: Optional[float] = None,
+                       max_mb: Optional[float] = None) -> int:
+    """Drop renders unused for the TTL, then the least recently used until under the cap."""
+    max_age_seconds = RENDER_CACHE_TTL_SECONDS if max_age_seconds is None else max_age_seconds
+    max_mb = RENDER_CACHE_MB if max_mb is None else max_mb
+    try:
+        names = os.listdir(RENDER_CACHE_DIR)
+    except OSError:
+        return 0
+    entries = []
+    for name in names:
+        path = os.path.join(RENDER_CACHE_DIR, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        entries.append((stat.st_mtime, stat.st_size, path))
+    entries.sort()
+    removed = 0
+    now = time.time()
+    total = sum(size for _, size, _ in entries)
+    limit = max(0.0, float(max_mb)) * 1024 * 1024
+    for mtime, size, path in entries:
+        stale = max_age_seconds > 0 and mtime < now - max_age_seconds
+        if not stale and total <= limit:
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+            total -= size
+        except OSError:
+            continue
+    return removed
+
+
+def forget_voice_renders(slug: str) -> int:
+    """Delete every cached render of one voice (called when the voice is deleted)."""
+    removed = 0
+    prefix = f"{slug}__"
+    try:
+        names = os.listdir(RENDER_CACHE_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if name.startswith(prefix):
+            try:
+                os.remove(os.path.join(RENDER_CACHE_DIR, name))
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def _sampling_tag(temperature, top_p, top_k, rep_penalty) -> str:
+    s = _sampling(temperature, top_p, top_k, rep_penalty)
+    return (f"t{s['temperature']:.4f}|p{s['top_p']:.4f}|k{s['top_k']}|"
+            f"r{s['repetition_penalty']:.4f}")
+
+
 def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
                  top_k: int, rep_penalty: float) -> Tuple[Any, str]:
     """Resolve a saved voice into a `generate_one(chunk) -> (wav, sr)` callable.
@@ -2302,12 +2576,17 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
     generator, and a client that walks away mid-reply leaves the generator closed — a lock
     held across yields could then be released late or not at all, and a stuck lock stops the
     whole app. Per-chunk acquisition costs an LRU check and cannot deadlock the box.
+
+    The callable carries a `render_cache` attribute (a `RenderCache` bound to this voice,
+    language and sampling) that `iter_chunked` consults before calling it.
     """
     resolved, error = _find_voice(voice)
     if error:
         raise MediaError(error)
     record = resolved
     description = str(record.get("description") or record.get("instruct") or "").strip()
+    settings = (f"v{RENDER_CACHE_VERSION}|{language or 'Auto'}|"
+                f"{_sampling_tag(temperature, top_p, top_k, rep_penalty)}")
     if voice_route(record) == "design" and description:
         # Speak the description straight: measured 2.67m of energy above 9kHz against 0.57m
         # for cloning a saved take, because cloning keeps only ~60% of whatever reference it
@@ -2323,6 +2602,8 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
                     **_sampling(temperature, top_p, top_k, rep_penalty),
                 )
             return wavs[0], int(rate)
+        one.render_cache = RenderCache(  # type: ignore[attr-defined]
+            record["slug"], f"design|{description}|{settings}|{_model_tag('voice_design')}")
         return one, "described"
 
     resolved, error = _resolve_voice(voice)
@@ -2347,6 +2628,9 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
             )
         return wavs[0], int(rate)
 
+    one.render_cache = RenderCache(  # type: ignore[attr-defined]
+        record["slug"], f"clone|{_clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)}|"
+                        f"{settings}|{_model_tag('voice_clone')}")
     return one, ("x-vector" if use_xvector else "ICL")
 
 
@@ -2369,7 +2653,8 @@ def speak(voice: str, text: str, language: str = "Auto",
     try:
         one, mode = _voice_synth(voice, language, temperature, top_p, top_k, rep_penalty)
         budget = _budget(text)
-        wav, sr, chunk_notes = generate_chunked(text, language, one)
+        wav, sr, chunk_notes = generate_chunked(text, language, one,
+                                                cache=getattr(one, "render_cache", None))
         return _ok(*_present(wav, sr, budget, f"Speak ({mode})", postproc, chunk_notes))
     except MediaError as e:
         return None, f"Error: {e}"
@@ -2430,18 +2715,22 @@ def chat_say(text: str, history: Any, voice: str, language: str = "Auto",
             mode = "test"
         spoken = 0.0
         pieces = 0
-        for piece in iter_chunked(wanted, language, synth, progress):
+        replayed = 0
+        for piece in iter_chunked(wanted, language, synth, progress,
+                                  cache=getattr(synth, "render_cache", None), quick_start=True):
             wav, sr = piece["wav"], piece["sr"]
             listen_wav, listen_sr = postprocess_output(wav, sr, postproc)
             spoken += len(wav) / sr
             pieces += 1
+            replayed += bool(piece.get("cached"))
             messages[-1]["content"] = (piece["text"] if pieces == 1
                                        else f"{messages[-1]['content']} {piece['text']}")
             yield (snapshot(), _audio_html(listen_wav, listen_sr),
                    f"Speaking piece {pieces}/{piece['total']} — {spoken:.1f}s so far "
-                   f"({mode}, {listen_sr}Hz)")
+                   f"({mode}, {listen_sr}Hz{', from cache' if piece.get('cached') else ''})")
+        from_cache = f", {replayed} from the render cache" if replayed else ""
         yield snapshot(), gr.update(), (f"Said {pieces} piece{'s' if pieces != 1 else ''}, "
-                                        f"{spoken:.1f}s of audio in {voice}")
+                                        f"{spoken:.1f}s of audio in {voice}{from_cache}")
     except MediaError as e:
         messages[-1]["content"] = f"⚠ {e}"
         yield snapshot(), None, f"Error: {e}"
@@ -2557,6 +2846,10 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
     ref_wav, ref_sr = audio_tuple
     ref_seconds = len(ref_wav) / float(ref_sr)
     fit = transcript_fit(ref_seconds, ref_text or "", bool(use_xvector_only))
+    text_check = None
+    if not use_xvector_only:
+        # On the selection as it stands (before cleanup), so the checklist can find it again.
+        text_check = check_reference_transcript(ref_wav, ref_sr, ref_text or "", may_load=n > 1)
     if clean_reference:
         ref_wav = prepare_reference(ref_wav, ref_sr)
     asr_language = None if (not language or language == "Auto") else str(language)
@@ -2648,6 +2941,12 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                              " — the clip is worth a listen before you keep it")
         if fit:
             notes.append("WARNING: " + fit)
+        check_line, check_bad = reference_transcript_line(text_check)
+        if check_line:
+            if check_bad:
+                notes.insert(0, "WARNING: " + check_line)
+            else:
+                notes.append(check_line)
         if clean_reference:
             notes.append(f"Reference cleaned: {ref_seconds:.1f}s → {len(ref_wav) / ref_sr:.1f}s "
                          f"(DC, rumble, edge silence)")
@@ -3478,6 +3777,9 @@ def main() -> int:
         removed = prune_media()
         if removed:
             print(f"[webui] pruned {removed} stale clip(s) from {MEDIA_DIR}", flush=True)
+        removed = prune_render_cache()
+        if removed:
+            print(f"[webui] pruned {removed} cached render(s) from {RENDER_CACHE_DIR}", flush=True)
         if args.preload:
             for capability in list(CAPABILITIES)[: HUB.max_cpu_resident]:
                 HUB._get_cpu(capability)

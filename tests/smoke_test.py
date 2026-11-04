@@ -243,6 +243,23 @@ def run_media_pipeline(hub: webui.ModelHub, use_asr: bool = True) -> None:
         print(f"  [media_pipeline] whisper ({took:.1f}s): {transcript!r}")
         assert len(found) >= len(cfg["keywords"]) * 0.6, \
             f"transcript missed too many words ({found} of {cfg['keywords']}): {transcript!r}"
+
+        # Calibration data for REF_TEXT_CONF_WARN (provisional): the reference check on the
+        # right transcript and on a wrong one of similar length. Only the ordering is asserted.
+        clip_sr, clip_wav = clip_audio
+        n_words = max(4, len(transcript.split()))
+        unrelated = ("purple elephants rarely negotiate tax law on thursdays near the old "
+                     "harbour while seven violins quietly rehearse").split()
+        wrong = " ".join((unrelated * 3)[:n_words])
+        webui._REF_TEXT_CHECKS.clear()
+        right_check = webui.check_reference_transcript(clip_wav, clip_sr, transcript, may_load=True)
+        wrong_check = webui.check_reference_transcript(clip_wav, clip_sr, wrong, may_load=True)
+        assert right_check and wrong_check, "the reference transcript check did not run"
+        rc, wc = right_check["confidence"], wrong_check["confidence"]
+        print(f"  [media_pipeline] reference check: right transcript conf {rc:+.2f}, wrong "
+              f"transcript conf {wc:+.2f} (warn below {webui.REF_TEXT_CONF_WARN:+.2f})")
+        assert rc is not None and wc is not None and rc > wc, \
+            f"the right transcript must score above a wrong one: {rc} vs {wc}"
         webui.ASR.unload()
         webui.ASR = None
     else:
@@ -532,6 +549,20 @@ def run_speak_api(hub: webui.ModelHub) -> None:
             assert "ICL" in status, f"a voiced sidecar must select ICL cloning:\n{status}"
             first_status, first_seconds = status, len(wav) / sr
 
+            # The same line again in the same voice is a replay from the render cache. A take
+            # that failed the rate/clipping checks is deliberately not cached, so allow one
+            # fresh render before the replay.
+            for _attempt in range(2):
+                started = time.time()
+                audio, status = webui.speak("Smoke Narrator", "Short sentence, clearly spoken.",
+                                            "English")
+                replay = time.time() - started
+                if audio is not None and "render cache" in status:
+                    break
+            assert audio is not None and "render cache" in status, \
+                f"the repeat should come from the render cache:\n{status}"
+            assert replay < took / 3, f"a replay should be far faster: {replay:.2f}s vs {took:.1f}s"
+
             # A caller that guesses a name gets the list, not a stack trace.
             audio, status = webui.speak("no-such-voice", "hello")
             assert audio is None and status.startswith("Error"), f"unknown voice: {status}"
@@ -562,7 +593,8 @@ def run_speak_api(hub: webui.ModelHub) -> None:
             listing = webui.voices_available()
             assert "smoke_narrator" in listing and "silent_ghost" in listing, listing
             print(f"  [speak_api] {took:.1f}s | one call, name only | "
-                  f"{first_status.splitlines()[0]} ({first_seconds:.1f}s)")
+                  f"{first_status.splitlines()[0]} ({first_seconds:.1f}s) | "
+                  f"repeat from cache {replay:.2f}s")
         finally:
             webui.VOICES_DIR = original_voices
 
@@ -617,8 +649,23 @@ def run_chat_stream(hub: webui.ModelHub) -> None:
             said = turns[-1][0][-1]["content"]
             assert said.replace(" ", "") == text.replace(" ", ""), "the log lost or reordered words"
             assert "Said" in turns[-1][2], f"final status: {turns[-1][2]}"
-            print(f"  [chat_stream] {total:.1f}s | first audio {first_audio:.1f}s | "
+            first_piece = webui.split_for_tts(text, "English", quick_start=True)[0]
+
+            started = time.time()
+            replay_first = None
+            for turn in webui.chat_say(text, [], "Smoke Narrator", "English"):
+                if replay_first is None and str(turn[1]).startswith("<audio"):
+                    replay_first = time.time() - started
+                last = turn
+            replay_total = time.time() - started
+            assert "from the render cache" in last[2], f"a repeated reply should replay: {last[2]}"
+            assert replay_total < total, \
+                f"a replayed reply should be faster: {replay_total:.1f}s vs {total:.1f}s"
+            print(f"  [chat_stream] {total:.1f}s | first audio {first_audio:.1f}s "
+                  f"(first piece {len(first_piece.split())} words: {first_piece!r}) | "
                   f"{len(streamed)} pieces | {turns[-1][2]}")
+            print(f"  [chat_stream] same reply again: first audio {replay_first:.2f}s, "
+                  f"all {replay_total:.2f}s | {last[2]}")
         finally:
             webui.VOICES_DIR = original_voices
 
@@ -737,6 +784,10 @@ def main() -> int:
         hub = webui.ModelHub(args.models_dir, torch.bfloat16, "sdpa", args.max_resident,
                              max_cpu_resident=1)
         webui.HUB = hub
+        # A cold, private render cache: never the server's, and never warm from a previous
+        # run, or the timings above would be replays.
+        webui.RENDER_CACHE_DIR = os.path.join(OUT_DIR, "render_cache")
+        shutil.rmtree(webui.RENDER_CACHE_DIR, ignore_errors=True)
         for capability in (args.only or list(CASES)):
             print(f"* {capability}")
             run_case(hub, capability, args.keep_gpu, use_asr=not args.no_asr)

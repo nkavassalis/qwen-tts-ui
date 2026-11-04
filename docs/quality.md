@@ -42,8 +42,14 @@ Here is what follows from that, and what the app does about each finding:
    sentence, at WER 1.0. The Clone tab checklist runs a plausibility check (words per second
    against the selection length) as you type. That check catches the usual causes: the
    transcript of the whole upload, or a stub left in the box. It can't catch a transcript of
-   the right length with the wrong words, so Transcribe runs on the selection only, and the
-   box stays editable.
+   the right length with the wrong words. For that, Generate also asks Whisper how likely
+   your transcript is given the reference audio. This is the same teacher-forced scorer that
+   grades takes, pointed at the reference instead. A matching transcript should read near 0.
+   Below `REF_TEXT_CONF_WARN` (−2.0) the status and checklist warn and show what Whisper
+   heard. **The threshold is provisional:** a wrong transcript's score has not been
+   measured, so it warns rather than blocks. `smoke_test.py --only media_pipeline` prints
+   the right-vs-wrong pair to calibrate from. It runs only when Whisper is already loaded or
+   best-of-N is about to load it.
 2. **Noise is the biggest likeness loss** (−0.020). The checklist estimates the SNR from the
    level distribution, and warns below 20 dB.
 3. **Length matters, but only so much.** 1.8s → 9s bought +0.006 SIM, most of it in the
@@ -197,6 +203,18 @@ The SIM change, 0.9900 → 0.9879, is inside the seed-to-seed spread. *Warm* end
 than raw because the low-pass is followed by a small high-shelf. Its final soft limiter is a
 `tanh` that runs on every sample, not only on peaks. That is slight colouring at normal
 levels, but it is unmeasured; see AGENTS.md. Saved takes always bypass post-processing.
+
+## Chat: the first piece is the wait you notice
+
+Generation time tracks the length of the audio being generated, and Chat streams one piece at
+a time. So the wait before anything plays is the time to render the first piece: 11.7s
+measured, for a first piece of up to 18 words. Chat now cuts the first piece to 4–10 words, at
+a sentence end or a comma (never mid-phrase, never on "and"). The rest of the reply is
+chunked as before. **Not yet measured:** the new first-audio time, and whether a short first
+piece costs any prosody. Speak is unchanged.
+
+Repeated sentences skip generation entirely: see *render cache* in the README and
+[design.md](design.md#speak-and-chat-replay-what-they-have-already-said).
 
 ## Long text: tempo is the limit, not the token cap
 

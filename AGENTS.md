@@ -45,7 +45,7 @@ scripts/say.py             CLI over the assistant API: /speak + /voices_availabl
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
 requirements.txt       direct deps only (torch/torchaudio and transformers/accelerate are
                        pinned elsewhere — read the file header before adding to it)
-tests/test_app_logic.py  CPU tier: 84 checks, no weights, ~8s with deps installed
+tests/test_app_logic.py  CPU tier: 88 checks, no weights, ~10s with deps installed
 tests/smoke_test.py      GPU tier: 8 end-to-end flows, writes tests/output/*.wav
 docs/quality.md          every quality measurement and what the app does about it
 docs/design.md           the why behind the code shape, including the UI layout rules
@@ -75,12 +75,14 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 84 checks, ~8s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 88 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~2 min, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
 
-Current state (2026-11-03, after the UI/clone-quality rework): **CPU tier 84/84**, Python 3.12,
+Current state (2026-11-04, render cache + quick start + reference transcript check):
+**CPU tier 88/88**; the GPU tier has **not** been run on these changes (see *Testing
+limitations*). Before them (2026-11-03): **CPU tier 84/84**, Python 3.12,
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3, `qwen-tts` from PyPI. **GPU tier
 8/8 on the 5070 Ti** — it was pushed unrun from a CPU-only box and was executed here; see
 *Testing limitations* for what that run confirmed.
@@ -242,6 +244,32 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   heard. **None of this has been A/B-measured on the GPU yet** — see *Testing limitations*.
 - **Best of 3 is the Clone tab default** (was 1). Sampling variance was the one quality
   loss no knob fixed (WER 0.000 on one seed, 0.133 on three); it costs two extra generations.
+- **Speak and Chat replay sentences they have already said** (`RenderCache`, 2026-11-04).
+  Chat's first audio measured 11.7s and every sentence costs 7–11s, while the lines an
+  assistant repeats ("Tests passed.") are the same every time. Per chunk, keyed by an
+  *identity* that covers everything that shapes the raw decode: the voice's content (cleaned
+  clip PCM hash + transcript + mode via `_clone_cache_key`, or the description), language,
+  sampling, the weights (`_model_tag`: folder + config mtime) and `RENDER_CACHE_VERSION`.
+  So a hit is never stale and nothing needs invalidating, except on delete, where
+  `forget_voice_renders` removes `<slug>__*.wav` because renders of someone's voice must not
+  outlive the voice. Raw decodes are stored and post-processing runs after. Only takes that
+  pass the rate and clipping checks are stored, since a cached take replays forever. The
+  Clone and Design tabs never use it: Generate there must re-roll. **Bump
+  `RENDER_CACHE_VERSION` if anything that shapes a raw decode changes** (`_budget`, chunk
+  generation, `prepare_reference`), or old takes will replay.
+- **Chat cuts its first piece short** (`split_for_tts(quick_start=True)` → `_quick_first`,
+  4–10 words). Generation time tracks audio length, so the first piece is the wait you
+  notice. Only at a sentence end or punctuation (never " and " and never mid-phrase), and
+  only when both halves are ≥4 words. Speak is unchanged. Unmeasured for prosody.
+- **The reference transcript is graded by Whisper** (`check_reference_transcript`,
+  2026-11-04). The length check (`transcript_fit`) cannot catch the right length with the
+  wrong words, and a mismatched transcript is the worst failure measured. The take scorer is
+  reused on the reference (`ASR.assess`). It runs in `generate_voice_clone` only when Whisper
+  is loaded or best-of-N will load it anyway, so there is never a surprise 3GB load. Results
+  are cached per (clip, transcript), and the checklist shows the cached verdict for exactly
+  that pair. **`REF_TEXT_CONF_WARN = -2.0` is provisional and only warns:** what a wrong
+  transcript scores has not been measured. `smoke_test.py --only media_pipeline` prints
+  right-vs-wrong confidences; calibrate from those, and consider blocking once the gap is known.
 - **Each voice can choose its Speak/Chat route** (`prefer`: auto/clip/description,
   `voice_route`). Auto keeps the measured default (description when present); a frozen clip
   is the steadier identity across a multi-sentence reply because a description is re-rolled
@@ -350,6 +378,13 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
     transcript/description/language are the ones it was generated from, all reached through
     `gr.State`. `test_build_ui_constructs` pins Design's Save to (name, state); `test_saving_a_designed_voice_keeps_the_raw_decode`, and the GPU tier's
     `voice_library`, which asserts saved @ 24kHz while the player copy is 48kHz.
+20. A render-cache hit is only ever a take the exact same configuration produced (voice
+    content, language, sampling, weights); a take that failed the rate/clipping checks is
+    never stored; deleting a voice deletes its renders.
+    `test_render_cache_replays_a_line_already_said`,
+    `test_render_cache_never_stores_a_bad_take_and_stays_bounded`.
+21. Chat's quick start only ever cuts the first piece, losslessly, at punctuation.
+    `test_quick_start_cuts_only_the_first_piece_short`.
 
 ## Conventions
 
@@ -397,8 +432,18 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   a peak-only limiter and A/B it.
 - **Designed voices drift across a long reply**: Speak/Chat re-roll the description per
   chunk (pairwise SIM 0.974). The `prefer: clip` route is the workaround; a better fix is to
-  render the first chunk by description and clone it for the rest — untried.
-- **`webui/app.py` is ~3,300 lines.** Natural seams for a split: `hub.py` (ModelHub,
+  render the first chunk by description and clone it for the rest — untried. The render
+  cache helps for *repeated* sentences only (each replays the same take).
+- **A cache hit still waits in the GPU queue.** `default_concurrency_limit=1` applies to
+  the whole event, so a replayed `/speak` queues behind a running generation even though it
+  needs no GPU. Fixing that means a separate, unqueued fast path; not done.
+- **Ideas not yet tried for clone quality** (from the 2026-11-04 review): best-of-N for
+  Speak/Chat clone voices (pairs naturally with the render cache: spend the extra takes
+  once); measuring whether x-vector-only clones keep more top end than ICL (ICL continues
+  the reference's codec codes, x-vector does not); an opt-in denoiser A/B on noisy
+  references (noise was the biggest SIM loss, −0.020); a `say.py --warm` to pre-render
+  common lines.
+- **`webui/app.py` is ~3,800 lines.** Natural seams for a split: `hub.py` (ModelHub,
   memory guards, lock), `media.py` (ingest, path guards, reference analysis/cleanup),
   `asr.py` (Transcriber), `scoring.py` (penalty, defects, labels), `chunking.py`,
   `library.py`, `ui.py`. Not done yet because the tests import `app` as one module.
@@ -539,6 +584,15 @@ Run on 2026-11-03 (UI and clone-quality review) on a **CPU-only box, no GPU, no 
   the Voices-tab row-click (`gr.SelectData.row_value`), the two-step delete, and the
   speech-coverage auto-pick / pause snapping on a real messy upload (cleanup is measured; the
   *window choice* is not — it needs a long upload with several candidate stretches).
+
+Changed on 2026-11-04 on the CPU-only box (render cache, Chat quick start, reference
+transcript check). **CPU tier 88/88; GPU tier NOT run.** `smoke_test.py` was edited again:
+`speak_api` and `chat_stream` now repeat their line/reply and assert it replays from the
+cache, faster; `media_pipeline` prints the reference check's confidence for the right
+transcript and a wrong one (asserting only right > wrong); the run uses a private, cold
+`tests/output/render_cache`. Needs the GPU box: the whole tier; the right/wrong confidence
+numbers to set `REF_TEXT_CONF_WARN`; how much the quick start cuts Chat's first-audio time
+(11.7s before), and whether a 4–10 word first piece sounds worse.
 
 ## Do-not-touch list
 

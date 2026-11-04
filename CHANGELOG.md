@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — Snappier Speak/Chat; reference transcript check
+
+### Added
+
+- **A render cache for Speak and Chat.** Every sentence they render is kept per voice. The
+  same sentence in the same voice, language, sampling settings and weights replays from disk
+  instead of costing 7–11s of generation. "Tests passed." is instant the second time, and a
+  reply that shares sentences with an earlier one is partly instant. The key is content, so a
+  hit is never stale. Post-processing runs after it. Takes that failed the pace or clipping
+  check are never stored. Deleting a voice deletes its renders. Capped by
+  `QWEN_TTS_RENDER_CACHE_MB` (256, `0` disables) and `QWEN_TTS_RENDER_CACHE_TTL_SECONDS`
+  (7 days since last use). The Clone and Design tabs never use it. Trade-off: a cached line
+  sounds identical every time.
+- **Chat's first piece is short** (4–10 words, cut at a sentence end or punctuation), so the
+  first audio arrives sooner. It measured 11.7s before; the new figure is not yet measured.
+- **Whisper checks the reference transcript.** Generate grades the transcript against the
+  reference with the same scorer used for takes. A transcript of the right length with the
+  wrong words, which the length check misses, produces a warning showing what Whisper heard,
+  both in the status and in the checklist. It runs only when Whisper is loaded or best-of-N
+  is about to load it, and the result is cached per clip and transcript. The threshold
+  (`REF_TEXT_CONF_WARN = -2.0`) is provisional, so it warns and never blocks.
+
+### Tests
+
+- CPU tier 88/88 (four new tests: quick start, cache replay/invalidation/deletion, cache
+  safety and bounds, the reference check end to end).
+- GPU tier **not run**. `smoke_test.py` now checks that repeats replay faster in `speak_api`
+  and `chat_stream`, and prints right-vs-wrong transcript confidences in `media_pipeline` for
+  calibrating the threshold.
+
 ## [Unreleased] — UI reorganised; clone quality
 
 ### Changed

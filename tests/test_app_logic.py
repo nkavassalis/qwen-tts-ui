@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 import types
 
 import gradio as gr
@@ -2476,6 +2477,287 @@ def test_runtime_status_lives_in_the_sidebar() -> None:
     check("gr.Sidebar(" in source and "gr.Timer(" in source, "a sidebar panel that refreshes itself")
     check("theme=" not in source.split("gr.Blocks(")[1].split(")")[0],
           "the theme goes to launch() in Gradio 6, not Blocks()")
+
+
+def test_quick_start_cuts_only_the_first_piece_short() -> None:
+    """Chat's first piece is short so the first audio arrives sooner; nothing else moves."""
+    def words(t: str) -> int:
+        return len(t.split())
+
+    text = ("The build finished cleanly after the second attempt, which took a while. Three "
+            "tests failed in the database layer. I fixed two of them already and the third "
+            "needs a migration before it can pass. Want me to write it now?")
+    normal = webui.split_for_tts(text)
+    quick = webui.split_for_tts(text, quick_start=True)
+    low, _target, high = webui.FIRST_CHUNK_WORDS
+    check(low <= words(quick[0]) <= high, f"the first piece is short: {quick[0]!r}")
+    check("".join(quick).replace(" ", "") == text.replace(" ", ""), "quick start is lossless")
+    check(quick[2:] == normal[1:] and webui._join(quick[0], quick[1]) == normal[0],
+          f"only the first piece is split: {normal} vs {quick}")
+    check(quick[0].endswith(","), f"the cut is at punctuation: {quick[0]!r}")
+
+    one_sentence = "Done, the deploy went out and every health check came back green on the first try."
+    split = webui.split_for_tts(one_sentence, quick_start=True)
+    check(len(split) == 1, f"a 2-word first half is not worth it, the text stays whole: {split}")
+    two = "The deploy went out cleanly tonight. Every health check came back green on the first try."
+    split = webui.split_for_tts(two, quick_start=True)
+    check(split == ["The deploy went out cleanly tonight.",
+                    "Every health check came back green on the first try."],
+          f"a sentence boundary beats waiting for the whole reply: {split}")
+    no_marks = " ".join(["word"] * 22)
+    check(webui.split_for_tts(no_marks, quick_start=True) == [no_marks],
+          "no punctuation, no cut: never mid-phrase")
+    check(webui.split_for_tts("Short and sweet.", quick_start=True) == ["Short and sweet."],
+          "a short reply is untouched")
+    check(webui.split_for_tts(two) == [two], "without quick_start nothing changes")
+    cjk = "今天的构建在第二次尝试后顺利完成，花了一些时间。数据库层有三个测试失败了。"
+    split = webui.split_for_tts(cjk, quick_start=True)
+    check("".join(split) == cjk and len(split) >= 2, f"CJK is cut too, losslessly: {split}")
+
+
+def _cache_fixture(tmp: str):
+    """A fake hub that counts generations, with voices, media and the cache under tmp."""
+    import threading
+
+    sr = 24000
+    calls: list = []
+
+    def tone(text: str) -> np.ndarray:
+        words, _ = webui.speech_units(text)
+        t = np.arange(int(max(0.5, words / 2.6) * sr)) / sr
+        return (0.25 * np.sin(2 * np.pi * (150 + len(calls)) * t)).astype(np.float32)
+
+    class FakeTTS:
+        def create_voice_clone_prompt(self, **kwargs):
+            return {"prompt": kwargs.get("ref_text")}
+
+        def generate_voice_clone(self, **kwargs):
+            calls.append(("clone", kwargs["text"]))
+            return [tone(kwargs["text"])], sr
+
+        def generate_voice_design(self, **kwargs):
+            calls.append(("design", kwargs["text"]))
+            return [tone(kwargs["text"])], sr
+
+    class FakeHub:
+        def __init__(self):
+            self.lock = threading.RLock()
+
+        def acquire(self, capability):
+            return FakeTTS()
+
+        def _checkpoint(self, capability):
+            raise FileNotFoundError(capability)
+
+    saved = (webui.VOICES_DIR, webui.MEDIA_DIR, webui.HUB, webui.RENDER_CACHE_DIR,
+             webui.RENDER_CACHE_MB)
+    webui.VOICES_DIR = os.path.join(tmp, "voices")
+    webui.MEDIA_DIR = os.path.join(tmp, "media")
+    webui.RENDER_CACHE_DIR = os.path.join(tmp, "cache")
+    webui.RENDER_CACHE_MB = 64
+    webui.HUB = FakeHub()
+    os.makedirs(webui.VOICES_DIR)
+    ref = (0.3 * np.sin(2 * np.pi * 140 * np.arange(sr * 4) / sr)).astype(np.float32)
+    webui.save_voice(name="Booth", wav=ref, sr=sr, text="a line of reference text",
+                     instruct="", language="English")
+    webui.save_voice(name="Fox", wav=None, sr=0, text="", instruct="bright and wry",
+                     language="English", description="bright and wry", kind="design")
+
+    def restore():
+        (webui.VOICES_DIR, webui.MEDIA_DIR, webui.HUB, webui.RENDER_CACHE_DIR,
+         webui.RENDER_CACHE_MB) = saved
+    return calls, restore
+
+
+def test_render_cache_replays_a_line_already_said() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        calls, restore = _cache_fixture(tmp)
+        try:
+            line = "Tests passed."
+            audio, status = webui.speak("booth", line, "English", postproc="off")
+            check(audio is not None and len(calls) == 1, f"first time renders: {status} {calls}")
+            check("cache" not in status, f"a fresh render does not claim the cache: {status}")
+            first = audio[1]
+            calls.clear()
+            audio, status = webui.speak("booth", "  Tests   passed. ", "English", postproc="off")
+            check(calls == [], f"the second time is a replay, no generation: {calls}")
+            check("render cache" in status, f"the status says so: {status}")
+            check(audio[1].shape == first.shape and float(np.max(np.abs(audio[1] - first))) < 1e-3,
+                  "the replay is the same take (PCM_16 tolerance)")
+            audio, _ = webui.speak("booth", line, "English", postproc="Warm")
+            check(calls == [] and audio[0] == 48000,
+                  "post-processing runs after the cache: Warm replays the raw take too")
+
+            for variant, why in ((("booth", line, "French"), "another language"),
+                                 (("booth", line, "English", 0.7), "other sampling"),
+                                 (("fox", line, "English"), "another voice"),
+                                 (("booth", "Tests failed.", "English"), "other words")):
+                calls.clear()
+                webui.speak(*variant, postproc="off")
+                check(len(calls) == 1, f"{why} is a different render: {calls}")
+
+            # Chat shares the cache: a reply whose sentences were said before replays them.
+            calls.clear()
+            reply = ("The deploy went out cleanly tonight. Nobody noticed a thing, which is "
+                     "how it should be. Every health check came back green on the first try, "
+                     "and the error rate stayed flat for the whole hour afterwards.")
+            list(webui.chat_say(reply, [], "booth", "English", postproc="off"))
+            rendered = len(calls)
+            check(rendered >= 2, f"chat rendered its pieces: {calls}")
+            calls.clear()
+            turns = list(webui.chat_say(reply, [], "booth", "English", postproc="off"))
+            check(calls == [], f"the same reply again is all replay: {calls}")
+            check("from the render cache" in turns[-1][2] and "from cache" in turns[1][2],
+                  f"chat says which pieces were replayed: {turns[1][2]} / {turns[-1][2]}")
+
+            # Deleting the voice deletes its renders; other voices keep theirs.
+            fox_files = [f for f in os.listdir(webui.RENDER_CACHE_DIR) if f.startswith("fox__")]
+            _, msg = webui.delete_saved_voice("booth")
+            left = os.listdir(webui.RENDER_CACHE_DIR)
+            check(not any(f.startswith("booth__") for f in left) and "cached render" in msg,
+                  f"a deleted voice's renders go with it: {msg} {left}")
+            check(sorted(f for f in left if f.startswith("fox__")) == sorted(fox_files),
+                  "other voices' renders are untouched")
+
+            webui.RENDER_CACHE_MB = 0
+            calls.clear()
+            webui.speak("fox", line, "English", postproc="off")
+            webui.speak("fox", line, "English", postproc="off")
+            check(len(calls) == 2, "QWEN_TTS_RENDER_CACHE_MB=0 turns the cache off")
+        finally:
+            restore()
+
+
+def test_render_cache_never_stores_a_bad_take_and_stays_bounded() -> None:
+    sr = 24000
+    with tempfile.TemporaryDirectory() as tmp:
+        saved = webui.RENDER_CACHE_DIR, webui.RENDER_CACHE_MB, webui.RENDER_CACHE_TTL_SECONDS
+        webui.RENDER_CACHE_DIR, webui.RENDER_CACHE_MB = os.path.join(tmp, "cache"), 64
+        webui.RENDER_CACHE_TTL_SECONDS = 0      # put() prunes; keep the backdated files alive
+        try:
+            cache = webui.RenderCache("v", "identity")
+            calls: list = []
+
+            def rushed(chunk: str):
+                calls.append(chunk)
+                return np.full(int(0.2 * sr), 0.2, dtype=np.float32), sr   # 0.2s for 9 words
+
+            text = "This sentence has far too many words for its audio."
+            list(webui.iter_chunked(text, "English", rushed, cache=cache))
+            check(cache.get(text) is None,
+                  "a take that failed the rate check is not cached (it would replay forever)")
+
+            good = (0.25 * np.sin(2 * np.pi * 150 * np.arange(sr * 4) / sr)).astype(np.float32)
+            cache.put("hello there", good, sr)
+            check(cache.get("hello there") is not None, "a good take is cached")
+            check(webui.RenderCache("v", "other").get("hello there") is None,
+                  "another identity never sees it")
+
+            names = []
+            for i in range(6):
+                webui.RenderCache("v", f"id{i}").put("line", good, sr)
+                names.append(webui.RenderCache("v", f"id{i}")._path("line"))
+                os.utime(names[-1], (1000 + i, 1000 + i))
+            size_mb = os.path.getsize(names[0]) / (1024 * 1024)
+            # 7 files of one size: "hello there" (just used) plus id0..id5 (backdated).
+            webui.prune_render_cache(max_age_seconds=0, max_mb=size_mb * 4.5)
+            check([os.path.exists(n) for n in names] == [False] * 3 + [True] * 3,
+                  "over the cap, the least recently used go first")
+            os.utime(names[3], (time.time(), time.time()))
+            removed = webui.prune_render_cache(max_age_seconds=3600, max_mb=1000)
+            check(removed >= 2 and os.path.exists(names[3]) and not os.path.exists(names[4]),
+                  "entries unused for the TTL are dropped; recently used ones stay")
+            os.makedirs(webui.RENDER_CACHE_DIR, exist_ok=True)
+            with open(os.path.join(webui.RENDER_CACHE_DIR, "v__broken.wav"), "w") as fh:
+                fh.write("not a wav")
+            broken = webui.RenderCache("v", "x")
+            broken._path = lambda chunk: os.path.join(webui.RENDER_CACHE_DIR, "v__broken.wav")
+            check(broken.get("anything") is None, "a damaged entry is a miss, not a crash")
+        finally:
+            (webui.RENDER_CACHE_DIR, webui.RENDER_CACHE_MB,
+             webui.RENDER_CACHE_TTL_SECONDS) = saved
+
+
+def test_reference_transcript_check() -> None:
+    """Whisper grades the reference's transcript: the right length with the wrong words."""
+    import threading
+
+    sr = 24000
+    ref = (0.3 * np.sin(2 * np.pi * 140 * np.arange(sr * 4) / sr)).astype(np.float32)
+    asked: list = []
+
+    class FakeASR:
+        enabled = True
+        loaded = True
+
+        def assess(self, wav, sr, intended, language=None):
+            asked.append(intended)
+            if intended == "the right words here":
+                return "the right words here", -0.04
+            return "the right words here", -4.2
+
+    class FakeTTS:
+        model = None
+
+        def create_voice_clone_prompt(self, **kwargs):
+            return {}
+
+        def generate_voice_clone(self, **kwargs):
+            t = np.arange(int(1.2 * sr)) / sr
+            return [(0.25 * np.sin(2 * np.pi * 170 * t)).astype(np.float32)], sr
+
+    class FakeHub:
+        lock = threading.RLock()
+
+        def acquire(self, capability):
+            return FakeTTS()
+
+    saved = webui.ASR, webui.HUB, webui.MEDIA_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        webui.ASR, webui.HUB, webui.MEDIA_DIR = FakeASR(), FakeHub(), tmp
+        webui._REF_TEXT_CHECKS.clear()
+        try:
+            path = os.path.join(tmp, "ref.wav")
+            sf.write(path, ref, sr)
+            out = webui.generate_voice_clone(path, "wrong words over here", "Hello.", "English",
+                                             False, 0.9, 1.0, 50, 1.05, postproc="off")
+            status = out[1]
+            check(status.splitlines()[1].startswith("WARNING: Whisper does not hear"),
+                  f"a mismatched transcript is the first thing the status says: {status}")
+            check("the right words here" in status, "and it shows what Whisper heard")
+            check(out[0] is not None, "it warns, it does not block (the threshold is provisional)")
+
+            checklist = webui.reference_check(path, "wrong words over here")
+            check("⚠️ Whisper does not hear" in checklist,
+                  f"the checklist shows the verdict for this clip + transcript: {checklist}")
+            check("Whisper" not in webui.reference_check(path, "something else entirely"),
+                  "an edited transcript has no verdict yet: nothing stale is shown")
+
+            asked.clear()
+            webui.generate_voice_clone(path, "wrong words over here", "Hello again.", "English",
+                                       False, 0.9, 1.0, 50, 1.05, postproc="off")
+            check(asked == [], "a retake with the same reference does not re-run the check")
+
+            out = webui.generate_voice_clone(path, "the right words here", "Hello.", "English",
+                                             False, 0.9, 1.0, 50, 1.05, postproc="off")
+            check("WARNING: Whisper" not in out[1] and "Whisper hears this transcript" in out[1],
+                  f"a matching transcript passes, and says so: {out[1]}")
+            check("✅ Whisper hears" in webui.reference_check(path, "the right words here"),
+                  "and the checklist shows the pass")
+
+            asked.clear()
+            webui.generate_voice_clone(path, "", "Hello.", "English", True,
+                                       0.9, 1.0, 50, 1.05, postproc="off")
+            check(asked == [], "x-vector only ignores the transcript, so it is not checked")
+
+            webui._REF_TEXT_CHECKS.clear()
+            webui.ASR.loaded = False
+            webui.generate_voice_clone(path, "fresh words", "Hello.", "English", False,
+                                       0.9, 1.0, 50, 1.05, postproc="off", candidates=1)
+            check(asked == [], "one take with Whisper unloaded: no surprise 3GB load")
+        finally:
+            webui.ASR, webui.HUB, webui.MEDIA_DIR = saved
+            webui._REF_TEXT_CHECKS.clear()
 
 
 if __name__ == "__main__":
