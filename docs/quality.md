@@ -46,10 +46,26 @@ Here is what follows from that, and what the app does about each finding:
    your transcript is given the reference audio. This is the same teacher-forced scorer that
    grades takes, pointed at the reference instead. A matching transcript should read near 0.
    Below `REF_TEXT_CONF_WARN` (−2.0) the status and checklist warn and show what Whisper
-   heard. **The threshold is provisional:** a wrong transcript's score has not been
-   measured, so it warns rather than blocks. `smoke_test.py --only media_pipeline` prints
-   the right-vs-wrong pair to calibrate from. It runs only when Whisper is already loaded or
-   best-of-N is about to load it.
+   heard. **Measured on the GPU box** — four references against four degrees of wrongness:
+
+   | transcript vs the clip | confidence |
+   |---|---|
+   | exact | **−0.12 .. −0.51** (adding broadband noise to SNR 5 dB moves it <0.05) |
+   | one word wrong (~5% WER) | −1.11 .. −1.34 |
+   | half wrong (~50%) | −2.79 .. −3.18 |
+   | unrelated (>100%) | −4.59 .. −5.09 |
+
+   −2.0 is a good warn line: it clears a single wrong word by 0.66 and fires around 40–50%
+   wrong. It is **not** a safe block line — the half-wrong class straddles it. If this ever
+   blocks, block at **−3.5**: 3.0 below the worst correct transcript measured, 2.2 below the
+   worst one-word-wrong, and above every half-wrong case, so it fires only on "that is not
+   this clip at all". It warns, it never blocks.
+
+   One caveat: confidence survives CJK (the Japanese clip reads −0.51 exact), but the WER and
+   words-per-second guards count spaces, so for a reference with no spaces between words those
+   two numbers are meaningless — confidence is the only signal there that means anything.
+   `smoke_test.py --only media_pipeline` prints the right-vs-wrong pair. It runs only when
+   Whisper is already loaded or best-of-N is about to load it.
 2. **Noise is the biggest likeness loss** (−0.020). The checklist estimates the SNR from the
    level distribution, and warns below 20 dB.
 3. **Length matters, but only so much.** 1.8s → 9s bought +0.006 SIM, most of it in the
@@ -207,11 +223,37 @@ levels, but it is unmeasured; see AGENTS.md. Saved takes always bypass post-proc
 ## Chat: the first piece is the wait you notice
 
 Generation time tracks the length of the audio being generated, and Chat streams one piece at
-a time. So the wait before anything plays is the time to render the first piece: 11.7s
-measured, for a first piece of up to 18 words. Chat now cuts the first piece to 4–10 words, at
-a sentence end or a comma (never mid-phrase, never on "and"). The rest of the reply is
-chunked as before. **Not yet measured:** the new first-audio time, and whether a short first
-piece costs any prosody. Speak is unchanged.
+a time. So the wait before anything plays is the time to render the first piece. Chat now cuts
+that first piece to 4–10 words, at a sentence end or a comma (never mid-phrase, never on
+"and"). The rest of the reply is chunked as before. Speak is unchanged.
+
+Measured on the 5070 Ti, same reply, hub already on the GPU, render cache disabled — so the
+only difference is the first piece's length:
+
+| | first audio | first piece | whole reply |
+|---|---|---|---|
+| quick start off | **11.49s** | 26 words / 7.92s | 22.6s (3 pieces) |
+| quick start on | **5.30s** | 10 words / 3.20s | 24.5s (4 pieces) |
+
+Halves the wait. The whole reply gets ~2s **slower**, because a fourth piece means a fourth
+model call — that is the trade, and it is the right one when someone is waiting to hear
+anything.
+
+Two things that number hides, both measured:
+
+- **Where the rest of the wait is.** Cold hub (first chat after startup) the same piece lands
+  at 7.14s, and the tier — hub *and* clone-prompt cache already warm from earlier cases —
+  prints 2.2s. Promotion (~2–3s) and building the clone prompt (~2–3s) are part of "time to
+  first audio" the first time you ask, and invisible afterwards. Quote the context or the
+  number is meaningless.
+- **It only helps when there is punctuation early.** A reply whose first clause runs 15 words
+  to the first comma is left at 15 words: the cut is lossless and refuses to split
+  mid-clause. So "4–10 words" is a target, not a promise.
+
+Does the short first piece sound worse? On measurements, no: it ends in silence (RMS of the
+last 80ms is 0.000, so it is not cut mid-word) and carries as much top end as the later
+pieces (energy above 9kHz 0.051 against 0.052/0.033/0.042). **That is measurement, not
+listening** — the pieces are in `tests/output/first_piece_*.wav` for your ears.
 
 Repeated sentences skip generation entirely: see *render cache* in the README and
 [design.md](design.md#speak-and-chat-replay-what-they-have-already-said).

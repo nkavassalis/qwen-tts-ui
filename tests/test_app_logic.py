@@ -2673,6 +2673,21 @@ def test_render_cache_never_stores_a_bad_take_and_stays_bounded() -> None:
             broken = webui.RenderCache("v", "x")
             broken._path = lambda chunk: os.path.join(webui.RENDER_CACHE_DIR, "v__broken.wav")
             check(broken.get("anything") is None, "a damaged entry is a miss, not a crash")
+
+            # The slug names a file this class writes, and it arrives from a voice record —
+            # which `list_voices()` reads out of the sidecar JSON. So it is disk-supplied text
+            # on a write path: same reason `resolve_input_path` exists for reads.
+            hostile = webui.RenderCache("../../escape", "identity")
+            hostile.put("a line", good, sr)
+            written = hostile._path("a line")
+            check(os.path.dirname(written) == webui.RENDER_CACHE_DIR and os.path.isfile(written),
+                  f"a hostile slug still writes inside the cache dir: {written}")
+            check(not os.path.exists(os.path.join(tmp, "..", "escape__a"))
+                  and os.listdir(tmp) == ["cache"],
+                  f"nothing escaped the cache directory: {os.listdir(tmp)}")
+            webui.RenderCache("!!!", "identity").put("a line", good, sr)
+            check(any(name.startswith("voice__") for name in os.listdir(webui.RENDER_CACHE_DIR)),
+                  "a slug with nothing sluggable in it still gets a safe name")
         finally:
             (webui.RENDER_CACHE_DIR, webui.RENDER_CACHE_MB,
              webui.RENDER_CACHE_TTL_SECONDS) = saved

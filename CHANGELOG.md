@@ -22,15 +22,50 @@ All notable changes to this project are documented here. Newest first.
   wrong words, which the length check misses, produces a warning showing what Whisper heard,
   both in the status and in the checklist. It runs only when Whisper is loaded or best-of-N
   is about to load it, and the result is cached per clip and transcript. The threshold
-  (`REF_TEXT_CONF_WARN = -2.0`) is provisional, so it warns and never blocks.
+  (`REF_TEXT_CONF_WARN = -2.0`) warns and never blocks; it is calibrated below.
 
 ### Tests
 
 - CPU tier 88/88 (four new tests: quick start, cache replay/invalidation/deletion, cache
   safety and bounds, the reference check end to end).
-- GPU tier **not run**. `smoke_test.py` now checks that repeats replay faster in `speak_api`
-  and `chat_stream`, and prints right-vs-wrong transcript confidences in `media_pipeline` for
-  calibrating the threshold.
+- GPU tier **run on the 5070 Ti: 8/8** — see the next subsection. `smoke_test.py` now checks that repeats replay faster in `speak_api` and `chat_stream`, and prints right-vs-wrong transcript confidences in `media_pipeline` for calibrating the threshold.
+
+### Measured on the GPU box (RTX 5070 Ti), and one hardening fix
+
+The tier this was pushed without has been run: **8/8**, and the two new assertions hold —
+`speak_api` repeats a line in `0.01s` against 3.7s for the first call, `chat_stream` repeats a
+reply with `first audio 0.01s, all 0.04s` and `4 from the render cache`. The tier's private
+cold cache left the real `tmp/render_cache` untouched (0 files afterwards).
+
+- **`REF_TEXT_CONF_WARN` calibrated.** The tier prints one pair (-0.04 right, -7.02 wrong);
+  one pair cannot place a threshold, so four references were run against four degrees of
+  wrongness, plus noise: exact **−0.12..−0.51** (broadband noise to SNR 5 dB moves it <0.05),
+  one word wrong −1.11..−1.34, half wrong −2.79..−3.18, unrelated −4.59..−5.09. **−2.0 stays**
+  — it clears a single wrong word by 0.66 and fires around 40–50% wrong, which is what a warn
+  line should do. It is **not** a safe block line: the half-wrong class straddles it (-2.79 on
+  one clip, -3.18 on another), so blocking on it would be a coin flip at the boundary. If it
+  ever blocks, **−3.5** — 3.0 below the worst correct transcript measured, above every
+  half-wrong case, so it fires only on "that is not this clip at all". Left to warn-only, as
+  you asked. Bands recorded at the constant and in `docs/quality.md`.
+- **Quick start measured, and attributed.** Same reply, warm hub, cache off, only the first
+  piece's length differing: first audio **11.49s → 5.30s** (26 words → 10), whole reply ~2s
+  *slower* because a fourth piece is a fourth model call. The tier's 2.2s and a cold hub's
+  7.14s are the same render at different points in a session — promotion (~2–3s) and building
+  the clone prompt (~2–3s) are inside "time to first audio" the first time you ask.
+- **The short first piece, as far as measuring goes.** It ends in silence (last 80ms RMS
+  0.000 — not cut mid-word) and keeps its top end (energy above 9kHz 0.051 against
+  0.052/0.033/0.042 for the later pieces). **That is not listening** — the pieces are written
+  to `tests/output/first_piece_*.wav` for that. Also found by measuring: quick start leaves a
+  15-word first clause alone when the first comma is at 15 words, so "4–10 words" is a target,
+  not a promise.
+- **Hardening:** `RenderCache` now re-slugs the name it builds filenames from. The slug comes
+  from the voice record, and `list_voices()` reads that field from the sidecar JSON — disk-
+  supplied text on a **write** path, so a hand-edited `voices/<x>.json` with
+  `"slug": "../../escape"` could have written outside `tmp/render_cache/`. Now pinned by a test
+  alongside the damaged-entry and LRU checks.
+- One probe artifact worth knowing: the Japanese clip's "one word off" row read identical to
+  exact, because `word_error_rate` and the words-per-second guards count spaces. Confidence is
+  the only reference-check signal that survives a script without spaces — noted at the constant.
 
 ## [Unreleased] — UI reorganised; clone quality
 

@@ -81,8 +81,9 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 ```
 
 Current state (2026-11-04, render cache + quick start + reference transcript check):
-**CPU tier 88/88**; the GPU tier has **not** been run on these changes (see *Testing
-limitations*). Before them (2026-11-03): **CPU tier 84/84**, Python 3.12,
+**CPU tier 88/88 and GPU tier 8/8 on the 5070 Ti** — pushed unrun from a CPU-only box and
+executed here; see *Testing limitations* for what that run measured. Before them (2026-11-03):
+**CPU tier 84/84**, Python 3.12,
 torch 2.8.0 (CPU wheel), gradio 6.17.3, transformers 4.57.3, `qwen-tts` from PyPI. **GPU tier
 8/8 on the 5070 Ti** — it was pushed unrun from a CPU-only box and was executed here; see
 *Testing limitations* for what that run confirmed.
@@ -267,9 +268,14 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   reused on the reference (`ASR.assess`). It runs in `generate_voice_clone` only when Whisper
   is loaded or best-of-N will load it anyway, so there is never a surprise 3GB load. Results
   are cached per (clip, transcript), and the checklist shows the cached verdict for exactly
-  that pair. **`REF_TEXT_CONF_WARN = -2.0` is provisional and only warns:** what a wrong
-  transcript scores has not been measured. `smoke_test.py --only media_pipeline` prints
-  right-vs-wrong confidences; calibrate from those, and consider blocking once the gap is known.
+  that pair. **`REF_TEXT_CONF_WARN = -2.0` warns and never blocks**, and the scale is now
+  measured (`tmp/calibrate_and_first_piece.py`, `tmp/calibrate_2.py`): exact -0.12..-0.51
+  (noise to SNR 5 dB moves it <0.05), one word wrong -1.11..-1.34, half wrong -2.79..-3.18,
+  unrelated -4.59..-5.09. -2.0 clears a single wrong word by 0.66 and fires around 40-50%
+  wrong, so it is right as a warn line. It is **not** a safe block line: the half-wrong class
+  straddles it. If it ever blocks, block at **-3.5** — 3.0 below the worst correct transcript
+  measured, above every half-wrong case, so it fires only on "that is not this clip".
+  `smoke_test.py --only media_pipeline` prints the right-vs-wrong pair.
 - **Each voice can choose its Speak/Chat route** (`prefer`: auto/clip/description,
   `voice_route`). Auto keeps the measured default (description when present); a frozen clip
   is the steadier identity across a multi-sentence reply because a description is re-rolled
@@ -586,13 +592,26 @@ Run on 2026-11-03 (UI and clone-quality review) on a **CPU-only box, no GPU, no 
   *window choice* is not — it needs a long upload with several candidate stretches).
 
 Changed on 2026-11-04 on the CPU-only box (render cache, Chat quick start, reference
-transcript check). **CPU tier 88/88; GPU tier NOT run.** `smoke_test.py` was edited again:
-`speak_api` and `chat_stream` now repeat their line/reply and assert it replays from the
-cache, faster; `media_pipeline` prints the reference check's confidence for the right
-transcript and a wrong one (asserting only right > wrong); the run uses a private, cold
-`tests/output/render_cache`. Needs the GPU box: the whole tier; the right/wrong confidence
-numbers to set `REF_TEXT_CONF_WARN`; how much the quick start cuts Chat's first-audio time
-(11.7s before), and whether a 4–10 word first piece sounds worse.
+transcript check). **CPU tier 88/88.**
+
+Run on 2026-11-04 on the **RTX 5070 Ti** — the tier it was pushed without:
+
+- **GPU tier 8/8** (`voice_design`, `voice_clone`, `voice_library`, `speak_api`, `chat_stream`,
+  `long_text`, `best_of_n`, `media_pipeline`). The edited assertions hold: `speak_api` repeats
+  a line and gets `repeat from cache 0.01s` against 3.7s for the first call; `chat_stream`
+  repeats a reply with `first audio 0.01s, all 0.04s` and `4 from the render cache`. The tier
+  used its own cold `tests/output/render_cache` and left the real `tmp/render_cache` empty —
+  checked afterwards, 0 files.
+- **`REF_TEXT_CONF_WARN` calibrated** — see *Design decisions*. The tier's pair (-0.04 right,
+  -7.02 wrong) is a fair summary; the sweep behind it is four references x four degrees of
+  wrongness plus noise, and it is what says -2.0 is fine to warn with and unsafe to block with.
+- **Quick start measured**: first audio 11.49s → 5.30s for the same reply (warm hub, cache
+  off), at the cost of ~2s on the whole reply. Cold hub 7.14s; tier sequence with the
+  clone-prompt cache already warm 2.2s. First piece ends in silence and keeps its top end —
+  measured, not listened to.
+- **Still not verified, needs a browser**: the Voices tab row-click, mic recording, the
+  two-step delete, and whether a cached replay is indistinguishable from a fresh take when you
+  listen (the cache writes PCM_16, so a replay differs from the first play by ~3e-5).
 
 ## Do-not-touch list
 

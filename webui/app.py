@@ -1889,8 +1889,23 @@ ASR: Optional[Transcriber] = None
 # (`transcript_fit`) cannot catch a transcript of the right length with the wrong words, and
 # a mismatched transcript is the worst clone failure measured (17.4s of audio for a 5s line,
 # WER 1.0). The same teacher-forced scorer that grades takes grades the reference instead.
-# PROVISIONAL: clean speech reads -0.02..-0.06 and a real Japanese take -0.51 on this scale;
-# what a wrong transcript reads has not been measured. It warns, it never blocks, until it is.
+# Measured on the 5070 Ti (`tmp/calibrate_and_first_piece.py`, `tmp/calibrate_2.py`), four
+# references x four degrees of wrongness, plus noise:
+#   exact transcript          -0.12 .. -0.51   (stable: SNR 10 dB and 5 dB move it <0.05)
+#   one word wrong (~5% WER) -1.11 .. -1.34
+#   half wrong     (~50%)    -2.79 .. -3.18
+#   unrelated      (>100%)   -4.59 .. -5.09
+# So -2.0 is a good *warn* line: it clears a single wrong word by 0.66 and fires somewhere
+# around 40-50% wrong. It is not a safe *block* line — the half-wrong class straddles it
+# (-2.79 on one clip, -3.18 on another). If this ever blocks generation, block at -3.5: that
+# is 3.0 below the worst correct transcript ever measured here, 2.2 below the worst
+# one-word-wrong, and above every "half wrong" case, so it fires only on "that is not this
+# clip at all". It warns, it never blocks, until that is decided.
+
+# Caveat for CJK references: confidence is fine (the Japanese clip reads -0.51 exact), but
+# `word_error_rate` and the words-per-second fit guards count spaces, so their WER/rate
+# numbers are meaningless without spaces — the same gap `split_for_tts` already handles with
+# CHUNK_MIN_CJK and these do not. Confidence is the only signal here that survives CJK.
 REF_TEXT_CONF_WARN = -2.00
 _REF_TEXT_CHECKS: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 REF_TEXT_CHECK_CACHE = 32
@@ -2471,7 +2486,14 @@ class RenderCache:
     """
 
     def __init__(self, slug: str, identity: str):
-        self.slug = slug
+        # `slug` arrives from a voice record, and `list_voices()` takes that field from the
+        # sidecar JSON — so it is disk-supplied text that names a file this class writes.
+        # Re-slugging costs nothing and keeps a hand-edited voices/<x>.json from writing
+        # outside RENDER_CACHE_DIR, the same reason `resolve_input_path` exists for reads.
+        try:
+            self.slug = _slug(slug)
+        except ValueError:
+            self.slug = "voice"
         self.identity = identity
 
     def _path(self, chunk: str) -> str:
