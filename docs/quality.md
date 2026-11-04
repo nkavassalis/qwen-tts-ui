@@ -212,6 +212,7 @@ speaker embedding. More clips can only help by filling those two slots better.
 |---|---|---|
 | `other` | one build clip (not the most typical) | that clip |
 | `medoid` (baseline) | the most typical build clip | that clip |
+| `cleanest` | the build clip that scores best on the reference checks | that clip |
 | `medoid_mean` | the most typical build clip | average of all build clips |
 | `concat` | all build clips joined (≤20s) | the joined clip |
 | `xvec_mean` | nothing (x-vector mode) | average of all build clips |
@@ -225,6 +226,12 @@ question is whether averaging beats the *best* single clip, not a random one.
 
 **Caveat.** Clips cut from one long recording share a mic and room, so their held-out
 scores are kinder than clips from different days would give.
+
+`cleanest` ranks clips on the reference checks. A transcript that doesn't fit counts
+most, then noise (SNR, capped at 40dB), then clipping, speech coverage and edges, the order
+they were measured to cost. When it picks the same clip as `medoid`, the medoid's take is
+reused rather than re-rendered. The listener then hears the same take twice, which shows
+how consistent the ratings are.
 
 No numbers yet: record the results here once it has run on the GPU box.
 

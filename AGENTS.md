@@ -453,7 +453,7 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   common lines.
 - **Multi-clip clones: experiment built, never run on a GPU.** The model takes one
   reference (one clip's codes + one embedding), so `scripts/multi_clip_lab.py` compares the
-  ways several clips can fill those two slots — the most typical clip, its codes with the
+  ways several clips can fill those two slots — the most typical clip, the cleanest clip, its codes with the
   averaged embedding, all clips joined, averaged embedding alone — against one clip, scored
   on a held-out clip and by blind listener ratings. Nothing in the main UI or the saved-voice
   format changes unless an arm wins on *both* held-out SIM and ratings. SIM against the build

@@ -16,6 +16,8 @@ enter through those two slots, so the arms are the honest ways of filling them:
 
   other        one build clip that is *not* the most typical — "any one good clip"
   medoid       the most typical build clip (embedding closest to the build-set mean)
+  cleanest     the build clip that scores best on the reference checks (noise, speech
+               coverage, edges, clipping, transcript fit) — the other fair "best clip"
   medoid_mean  the medoid's codes and transcript + the *averaged* embedding of all build clips
   concat       all build clips joined into one longer reference, transcripts joined
   xvec_mean    the averaged embedding alone (x-vector mode, no codes, no transcript)
@@ -63,6 +65,7 @@ SR = webui.REF_SAMPLE_RATE
 ARMS: List[Tuple[str, str]] = [
     ("other", "One good clip (not the most typical)"),
     ("medoid", "Most typical clip"),
+    ("cleanest", "Cleanest clip (reference checks)"),
     ("medoid_mean", "Most typical clip + averaged embedding"),
     ("concat", "All build clips joined"),
     ("xvec_mean", "Averaged embedding only (x-vector)"),
@@ -129,6 +132,35 @@ def other_index(n: int, medoid: int) -> int:
     if n < 2:
         raise ValueError("need two build clips")
     return 1 if medoid == 0 else 0
+
+
+def reference_quality(wav: np.ndarray, sr: int) -> Dict[str, Any]:
+    """The Clone tab's reference checks as numbers: SNR, speech coverage, edges, clipping."""
+    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+    clipped = float(np.mean(np.abs(wav) >= 0.999)) if wav.size else 0.0
+    db, _ = webui._frame_levels(wav, sr)
+    active, floor, level = webui._activity(db)
+    if active is None:
+        return {"snr": 0.0, "coverage": 0.0, "edges_ok": False, "clipped": clipped}
+    edge = max(1, int(0.06 / webui.FRAME_SECONDS))
+    return {"snr": round(float(level - floor), 2), "coverage": round(float(np.mean(active)), 3),
+            "edges_ok": bool(not active[:edge].all() and not active[-edge:].all()),
+            "clipped": clipped}
+
+
+def clean_score(quality: Dict[str, Any], text_confidence: Optional[float] = None) -> float:
+    """Higher is cleaner. Weighted in the order the checks were measured to cost:
+    a transcript that does not fit, then noise, then clipping, coverage and edges.
+    SNR is capped at 40dB so a gated-to-digital-silence floor does not run away with it."""
+    score = min(float(quality.get("snr", 0.0)), 40.0)
+    score += 10.0 * min(float(quality.get("coverage", 0.0)), 0.8)
+    if not quality.get("edges_ok"):
+        score -= 3.0
+    if float(quality.get("clipped", 0.0)) > webui.CLIP_FRACTION:
+        score -= 10.0
+    if text_confidence is not None and text_confidence < webui.REF_TEXT_CONF_WARN:
+        score -= 15.0
+    return round(score, 3)
 
 
 def screen_clips(embs: Sequence[np.ndarray]) -> List[Dict[str, Any]]:
@@ -353,24 +385,42 @@ class Lab:
         self.out_root = out_root
 
     # -- screening -----------------------------------------------------------
-    def screen(self, clips: List[Dict[str, Any]], language: str) -> List[Dict[str, Any]]:
+    def screen(self, clips: List[Dict[str, Any]], language: str,
+               progress: Any = None) -> List[Dict[str, Any]]:
         """Fill missing transcripts, embed every clip, flag outliers and bad references."""
         if self.hub is None:
             raise RuntimeError("Started with --listen-only: no model to screen with.")
         code_language = None if language in (None, "", "Auto") else language
-        for clip in clips:
+
+        def say(fraction: float, what: str) -> None:
+            print(f"[lab] {what}", flush=True)
+            if progress is not None:
+                progress(fraction, desc=what)
+
+        for i, clip in enumerate(clips):
             if not clip["text"].strip():
+                say(0.6 * i / len(clips), f"Transcribing {clip['name']} ({i + 1}/{len(clips)})"
+                    + (" — first one loads Whisper, ~1 min" if i == 0 else ""))
                 if self.asr is None or not self.asr.enabled:
                     raise RuntimeError(f"{clip['name']} has no transcript and Whisper is off; "
                                        f"type one in the table.")
                 clip["text"] = self.asr.transcribe_detailed(clip["wav"], clip["sr"],
                                                             code_language)["text"]
+        say(0.65, "Loading the voice model and embedding clips (first time ~1 min)")
         with self.hub.lock:
             tts = self.hub.acquire("voice_clone")
             embs = [self._embed(tts, c["wav"], c["sr"]) for c in clips]
+        say(0.9, "Checking each reference")
         for clip, emb, verdict in zip(clips, embs, screen_clips(embs)):
             clip["embedding"] = emb
             clip.update(verdict)
+            check = None
+            if self.asr is not None and self.asr.enabled:
+                check = webui.check_reference_transcript(clip["wav"], clip["sr"], clip["text"],
+                                                         may_load=True)
+            clip["quality"] = reference_quality(clip["wav"], clip["sr"])
+            clip["clean_score"] = clean_score(clip["quality"],
+                                              None if not check else check.get("confidence"))
             clip["report"] = webui.reference_report(clip["wav"], clip["sr"], clip["text"])
             clip["warnings"] = [line[2:].strip() for line in clip["report"].split("\n\n")
                                 if line.startswith("⚠️")]
@@ -409,6 +459,9 @@ class Lab:
         done = 0
         started = time.time()
 
+        print(f"[lab] rendering {total} takes ({len(trials)} trials) into {run_dir}", flush=True)
+        if progress is not None:
+            progress(0.0, desc=f"Encoding {len(clips)} references, then {total} takes")
         refs = [webui.prepare_reference(c["wav"], c["sr"]) if clean else c["wav"] for c in clips]
         with self.hub.lock:
             tts = self.hub.acquire("voice_clone")
@@ -421,6 +474,7 @@ class Lab:
                 b_embs = [embs[i] for i in build]
                 m = build[medoid_index(b_embs)]
                 o = build[other_index(len(build), build.index(m))]
+                c = max(build, key=lambda i: (clips[i].get("clean_score", 0.0), -build.index(i)))
                 mean_np = mean_embedding(b_embs)
                 like = items[m].ref_spk_embedding
                 mean_t = torch.from_numpy(mean_np).reshape(like.shape).to(device=like.device,
@@ -431,6 +485,7 @@ class Lab:
                 prompts = {
                     "other": items[o],
                     "medoid": items[m],
+                    "cleanest": items[c],
                     "medoid_mean": VoiceClonePromptItem(
                         ref_code=items[m].ref_code, ref_spk_embedding=mean_t,
                         x_vector_only_mode=False, icl_mode=True, ref_text=clips[m]["text"]),
@@ -448,12 +503,24 @@ class Lab:
                 fold_meta.append({"fold": f, "heldout": clips[held]["name"],
                                   "build": [clips[i]["name"] for i in build],
                                   "medoid": clips[m]["name"], "other": clips[o]["name"],
+                                  "cleanest": clips[c]["name"],
                                   "concat_clips": used,
                                   "concat_seconds": round(len(joined) / clips[0]["sr"], 2),
                                   "heldout_wav": os.path.relpath(held_path, run_dir)})
                 for trial in [t for t in trials if t["fold"] == f]:
                     text = sentences[trial["sentence"]]
                     for arm in ARM_KEYS:
+                        if arm == "cleanest" and c == m:
+                            # Same clip, same seed: the take would be the medoid's again.
+                            # Reuse it (the listener then hears a duplicate — a free check
+                            # of how consistent the ratings are) and save the render time.
+                            twin = dict(takes[-1] if takes[-1]["arm"] == "medoid" else
+                                        next(t for t in takes if t["trial"] == trial["id"]
+                                             and t["arm"] == "medoid"))
+                            twin.update(arm=arm, same_as="medoid")
+                            takes.append(twin)
+                            done += 1
+                            continue
                         torch.manual_seed(trial["seed"])
                         wavs, rate = tts.generate_voice_clone(
                             text=text, language=language, voice_clone_prompt=[prompts[arm]],
@@ -469,7 +536,8 @@ class Lab:
                         print(f"[lab] {done}/{total} {trial['id']} {arm} "
                               f"sim={takes[-1]['sim_heldout']}", flush=True)
 
-        clip_meta = [{k: c.get(k) for k in ("name", "text", "typicality", "outlier", "warnings")}
+        clip_meta = [{k: c.get(k) for k in ("name", "text", "typicality", "outlier", "warnings",
+                                            "quality", "clean_score")}
                      | {"seconds": round(len(c["wav"]) / c["sr"], 2)} for c in clips]
         run = {"id": run_id, "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "language": language,
                "sentences": sentences, "seeds": seeds, "clean_reference": clean,
@@ -550,7 +618,9 @@ def results_markdown(run_id: str, out_root: str = OUT_ROOT) -> str:
     text = summary_markdown(summarise(run["takes"], ratings), len(ratings))
     flagged = [c for c in run["clips"] if c.get("outlier") or c.get("warnings")]
     folds = "\n".join(f"- fold {f['fold']}: held out *{f['heldout']}*, medoid *{f['medoid']}*, "
-                      f"other *{f['other']}*, concat {f['concat_clips']} clips / "
+                      f"cleanest *{f.get('cleanest', '—')}*"
+                      + (" (same clip as medoid)" if f.get("cleanest") == f["medoid"] else "")
+                      + f", other *{f['other']}*, concat {f['concat_clips']} clips / "
                       f"{f['concat_seconds']}s" for f in run["folds"])
     notes = ""
     if flagged:
@@ -570,7 +640,7 @@ def _clip_rows(clips: List[Dict[str, Any]]) -> List[List[Any]]:
         flag = ("outlier · " if c.get("outlier") else "") + " · ".join(
             w.split(".")[0] for w in c.get("warnings", []))
         rows.append([c["name"], round(len(c["wav"]) / c["sr"], 1), c["text"],
-                     c.get("typicality", ""), flag or "ok"])
+                     c.get("typicality", ""), c.get("clean_score", ""), flag or "ok"])
     return rows
 
 
@@ -602,8 +672,7 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
             return clips, [], "Load some clips first."
         clips = apply_table(clips, table)
         try:
-            progress(0.1, desc="transcribing and embedding")
-            clips = lab.screen(clips, language)
+            clips = lab.screen(clips, language, progress)
         except Exception as e:  # noqa: BLE001
             return clips, _clip_rows(clips), f"Error: {e}"
         bad = [c["name"] for c in clips if c.get("outlier")]
@@ -630,12 +699,16 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
                   progress=gr.Progress()):
         clips = apply_table(clips or [], table)
         try:
+            if len(clips) < MIN_CLIPS:
+                raise ValueError(f"Need at least {MIN_CLIPS} clips — add some and press Add clips.")
             if any("embedding" not in c for c in clips):
-                clips = lab.screen(clips, language)
+                clips = lab.screen(clips, language, progress)
             run_dir = lab.render(clips, sentences.splitlines(),
                                  list(range(1234, 1234 + int(seeds or 1))), int(folds or 1),
                                  language, bool(clean), progress)
         except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
             return f"Error: {e}", gr.update(), gr.update()
         run_id = os.path.basename(run_dir)
         runs = list_runs(lab.out_root)
@@ -719,9 +792,9 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
                                        value="English")
                 screen_btn = gr.Button("Screen", variant="secondary")
             table = gr.Dataframe(headers=["clip", "sec", "transcript (editable)", "typicality",
-                                          "flags"], value=_clip_rows(preloaded),
+                                          "clean", "flags"], value=_clip_rows(preloaded),
                                  interactive=True, wrap=True)
-            screen_md = gr.Markdown()
+            screen_md = gr.Markdown("Load clips, then **Screen**.")
             gr.Markdown("A long recording's clips share one mic and room, so held-out scores "
                         "from it are kinder than a clip from another day would be.")
             sentences = gr.Textbox(label="Target sentences (one per line)", lines=4,
@@ -732,7 +805,8 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
                 clean = gr.Checkbox(label="Clean references (as the Clone tab does)", value=True)
             estimate_md = gr.Markdown(estimate(preloaded, DEFAULT_SENTENCES, 1, 4))
             render_btn = gr.Button("Render all arms", variant="primary")
-            render_md = gr.Markdown()
+            render_md = gr.Markdown("Progress shows here, and per take in the terminal.",
+                                    min_height=80)
 
         with gr.Tab("2 · Listen"):
             with gr.Row():
@@ -764,12 +838,14 @@ def build_lab_ui(lab: Lab, preloaded: List[Dict[str, Any]]) -> Any:
                       [clips_state, table, screen_md])
         clear_btn.click(lambda: ([], [], "Cleared."), None, [clips_state, table, screen_md])
         screen_btn.click(do_screen, [clips_state, table, language],
-                         [clips_state, table, screen_md])
+                         [clips_state, table, screen_md], show_progress="full")
         for box in (sentences, seeds, folds):
             box.change(estimate, [clips_state, sentences, seeds, folds], estimate_md)
         table.change(estimate, [clips_state, sentences, seeds, folds], estimate_md)
-        render_btn.click(do_render, [clips_state, table, sentences, seeds, folds, language, clean],
-                         [render_md, run_dd, res_dd])
+        render_btn.click(lambda: gr.update(interactive=False), None, render_btn).then(
+            do_render, [clips_state, table, sentences, seeds, folds, language, clean],
+            [render_md, run_dd, res_dd], show_progress="full").then(
+            lambda: gr.update(interactive=True), None, render_btn)
         trial_outputs = [trial_state, trial_md, real, best, note] + slot_audio + slot_score
         start_btn.click(show_trial, run_dd, trial_outputs)
         run_dd.change(show_trial, run_dd, trial_outputs)

@@ -2854,6 +2854,15 @@ def test_multi_clip_helpers() -> None:
           "a tie on ears, a loss on SIM")
     check("listen_wtl" not in rows["medoid"], "the baseline is not compared with itself")
     check(rows["medoid_mean"]["best_share"] == 1.0, "picked best every time")
+    q_clean = lab.reference_quality(np.zeros(100, np.float32), 24000)
+    check(q_clean["coverage"] == 0.0, "silence has no speech")
+    good = {"snr": 35.0, "coverage": 0.7, "edges_ok": True, "clipped": 0.0}
+    check(lab.clean_score(good) > lab.clean_score(dict(good, snr=12.0)), "noise costs")
+    check(lab.clean_score(good) > lab.clean_score(dict(good, clipped=0.01)), "clipping costs")
+    check(lab.clean_score(good) > lab.clean_score(dict(good, edges_ok=False)), "mid-word edges cost")
+    check(lab.clean_score(good, -1.0) > lab.clean_score(good, -3.0), "a misfit transcript costs most")
+    check(lab.clean_score(dict(good, snr=90.0)) == lab.clean_score(dict(good, snr=40.0)),
+          "SNR is capped")
     md = lab.summary_markdown(list(rows.values()), 1)
     check("biased" in md and "medoid_mean" in md, "the table says which column is biased")
 
@@ -2926,6 +2935,17 @@ def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
               "x-vector arm carries no codes and no transcript")
         for f in run["folds"]:
             check(f["heldout"] not in f["build"] and f["medoid"] != f["other"], f"fold sane: {f}")
+            check(f["cleanest"] in f["build"], f"cleanest comes from the build set: {f}")
+        check(all(c.get("clean_score") is not None for c in run["clips"]), "every clip scored")
+        by_trial = {}
+        for t in run["takes"]:
+            by_trial.setdefault(t["trial"], {})[t["arm"]] = t
+        for f_i, f in enumerate(run["folds"]):
+            for tid, arms in by_trial.items():
+                if tid.startswith(f"f{f_i}_") and f["cleanest"] == f["medoid"]:
+                    check(arms["cleanest"].get("same_as") == "medoid"
+                          and arms["cleanest"]["file"] == arms["medoid"]["file"],
+                          "cleanest == medoid reuses the take instead of re-rendering")
 
         demo = lab.build_lab_ui(lab_obj, [])
         fns = {getattr(bf.fn, "__name__", ""): bf.fn for bf in demo.fns.values()}
@@ -2941,7 +2961,7 @@ def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
             check(bool(trial_id), f"trial {i} available")
             trial = next(t for t in run["trials"] if t["id"] == trial_id)
             scores = ["5" if arm == "medoid_mean" else "2" for arm in trial["order"]]
-            best = "ABCDE"[trial["order"].index("medoid_mean")]
+            best = lab.LETTERS[trial["order"].index("medoid_mean")]
             out = fns["save_and_next"](run_id, trial_id, best, "", *scores)
         check(out[0] is None and "All 8 trials rated" in out[1], "done after the last trial")
         ratings = lab.load_ratings(run_id, tmp)
