@@ -388,6 +388,23 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
   four** moved the audio beyond seed noise.
 
+- **`/say_aloud` plays on the server, and that is a different verb from `/speak`.** `/speak`
+  returns audio, so it plays on the caller's machine; `say.py --server-play` and the Speak tab's
+  "Speak aloud on this machine" make the box running the server talk. Two rules make that safe on a
+  LAN box: `play_on_server()` accepts **only** a path under `tmp/media/` (the endpoint never takes
+  a path at all, but a player handed an arbitrary filename is a file reader wearing a speaker
+  costume, so the guard is in the helper — `test_play_on_server_is_confined_to_the_media_dir`), and
+  the player is spawned **detached with every stdio stream on DEVNULL**, because
+  `default_concurrency_limit=1` means a synchronous player — or one whose pipe filled up — holds
+  every queued request, including a UI generation, for the full length of playback
+  (`test_play_on_server_never_blocks_the_queue`). `test_speak_aloud_accepts_no_path_from_the_caller`
+  fails if anyone ever adds a `path=`/`file=` parameter.
+- **Volume is applied to the samples, not to the player.** `afplay -v`, `paplay --volume=` (units
+  of 65536) and `ffplay -volume` (percent) are three dialects of the same knob, and none of them
+  can be asserted in the CPU tier; `apply_gain()` can. Gain that reaches full scale says so in the
+  status line rather than quietly squaring off the consonants. A bad `--volume` is refused before
+  the render, same as a bad `--language`.
+
 - **`scripts/say.py` re-execs into `./.venv/bin/python`.** It is executable with a
   `/usr/bin/env python3` shebang, so `scripts/say.py …` uses the *system* interpreter — and the
   system `gradio_client` here is 1.4.3, which cannot parse gradio 6.17's API schema and raises

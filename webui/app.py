@@ -2839,6 +2839,114 @@ def speak(voice: str, text: str, language: str = "Auto",
         return None, f"Error: {type(e).__name__}: {e}"
 
 
+# ---------------------------------------------------------------- assistant API: play on the server
+
+SERVER_PLAYERS = (
+    ("paplay", []),
+    ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+    ("aplay", []),
+    ("afplay", []),          # macOS
+)
+SERVER_PLAY_GAIN_MAX = 2.0    # 1.0 is the level the app already normalises to
+
+
+def apply_gain(wav: np.ndarray, volume: float) -> Tuple[np.ndarray, bool]:
+    """Scale a listening copy for a speaker in the next room; report whether it clipped.
+
+    The gain is applied to the samples rather than handed to the player because every player
+    spells volume differently — `afplay -v 0.5`, `paplay --volume=` in units of 65536, `ffplay
+    -volume` in percent — and one implementation the CPU tier can assert beats four that it
+    cannot. Clipping is reported rather than hidden: a caller who asked for 2x deserves to know
+    the tops of the consonants went away.
+    """
+    try:
+        gain = float(volume)
+    except (TypeError, ValueError):
+        raise MediaError(f"volume must be a number between 0 and {SERVER_PLAY_GAIN_MAX:g}.")
+    if not 0.0 <= gain <= SERVER_PLAY_GAIN_MAX:
+        raise MediaError(
+            f"volume must be between 0 and {SERVER_PLAY_GAIN_MAX:g} "
+            f"(1 is the level the app already normalises to).")
+    out = np.asarray(wav, dtype=np.float32) * np.float32(gain)
+    clipped = bool(np.any(np.abs(out) >= 1.0))
+    return np.clip(out, -1.0, 1.0), clipped
+
+
+def play_on_server(path: str) -> Tuple[bool, str]:
+    """Play a file *this* process just rendered, out of the server's own speaker.
+
+    Two rules, both load-bearing:
+
+    * **Only a file under tmp/media/.** The endpoint that reaches here never takes a path, but a
+      player that accepts an arbitrary filename is a file reader wearing a speaker costume — and
+      this one is reachable from the LAN. The check lives here so a future caller that forgets
+      cannot open /etc/passwd.
+    * **Detached.** `default_concurrency_limit=1` serialises the whole app, so a synchronous
+      player would hold every queued request — including a UI generation — for the full length of
+      playback. A ten-second line would freeze the UI for ten seconds to do something the GPU
+      has already finished.
+    """
+    root = os.path.realpath(media_dir())
+    real = os.path.realpath(path)
+    if not real.startswith(root + os.sep):
+        raise MediaError("Refusing to play a file that this server did not render.")
+    for name, extra in SERVER_PLAYERS:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            subprocess.Popen([exe, *extra, real], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            return True, f"playing on this machine via {name}"
+        except OSError:
+            continue
+    return False, "no player found (paplay/ffplay/aplay/afplay) — the audio is on disk"
+
+
+def speak_aloud(voice: str, text: str, language: str = "Auto",
+                temperature: float = SAMPLING_DEFAULTS["temperature"],
+                top_p: float = SAMPLING_DEFAULTS["top_p"],
+                top_k: int = SAMPLING_DEFAULTS["top_k"],
+                rep_penalty: float = SAMPLING_DEFAULTS["repetition_penalty"],
+                postproc: str = POSTPROCESS_DEFAULT,
+                volume: float = 1.0) -> str:
+    """Render `text` in a saved voice and play it out of **this machine's** speaker.
+
+    The difference from `/speak` is which machine the sound comes out of. `/speak` returns the
+    audio, so it plays wherever the request came from — `scripts/say.py` on a laptop is a laptop
+    speaker. This is for "make the box under the TV say something": the caller sends a line and
+    hears it on the server, and the only thing coming back is a status line.
+
+    Same voice resolution, chunking, render cache and post-processing as `/speak`, so a line the
+    house has already heard replays from the cache and arrives instantly.
+    """
+    # Rejected before the render, not after: a typo in --volume should not cost a GPU pass.
+    try:
+        gain = float(volume)
+    except (TypeError, ValueError):
+        return f"Error: volume must be a number between 0 and {SERVER_PLAY_GAIN_MAX:g}."
+    if not 0.0 <= gain <= SERVER_PLAY_GAIN_MAX:
+        return (f"Error: volume must be between 0 and {SERVER_PLAY_GAIN_MAX:g} "
+                f"(1 is the level the app already normalises to).")
+
+    audio, status = speak(voice, text, language, temperature, top_p, top_k, rep_penalty, postproc)
+    if audio is None:
+        return status
+    sr, wav = audio
+    try:
+        wav, clipped = apply_gain(wav, gain)
+        path = _write_take(wav, sr)
+        ok, note = play_on_server(path)
+    except MediaError as e:
+        return f"Error: {e}"
+    except Exception as e:  # noqa: BLE001 - the audio rendered; a player problem is not fatal
+        return f"{status} · could not play: {type(e).__name__}: {e}"
+    if clipped:
+        note += " (gain clipped — bring the volume down)"
+    return f"{status} · {note}"
+
+
 def _audio_html(wav: np.ndarray, sr: int) -> str:
     """A self-contained <audio> element for one streamed piece.
 
@@ -3737,6 +3845,12 @@ def build_ui() -> gr.Blocks:
                         sp_language = gr.Dropdown(label="Language", choices=LANGUAGE_CHOICES,
                                                   value="Auto")
                         sp_btn = gr.Button("Speak", variant="primary")
+                        with gr.Row(equal_height=True):
+                            sp_loud = gr.Button("Speak aloud on this machine",
+                                                variant="secondary", scale=3)
+                            sp_volume = gr.Slider(label="Server volume", minimum=0.0, maximum=2.0,
+                                                  step=0.05, value=1.0, scale=2,
+                                                  info="applied to the audio, not to the player")
                     with gr.Column(scale=1):
                         sp_audio = gr.Audio(label="Result", type="numpy")
                         sp_status = gr.Textbox(label="Status", lines=3, interactive=False)
@@ -3747,6 +3861,12 @@ def build_ui() -> gr.Blocks:
                 sp_btn.click(speak,
                              inputs=[sp_voice, sp_text, sp_language] + sampling + output_options,
                              outputs=[sp_audio, sp_status], api_name="speak")
+                # The sound comes out of the box running the server, not the browser's. That is
+                # the whole point of the button, and the only difference from Speak above.
+                sp_loud.click(speak_aloud,
+                              inputs=[sp_voice, sp_text, sp_language] + sampling
+                              + output_options + [sp_volume],
+                              outputs=[sp_status], api_name="say_aloud")
 
             # ---------------------------------------------------------------- Chat
             with gr.Tab("Chat", id="chat"):
