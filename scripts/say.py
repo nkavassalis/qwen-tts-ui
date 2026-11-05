@@ -66,6 +66,48 @@ def _client_too_old(module_version: str) -> bool:
 
 
 
+def _server_languages(client: object) -> tuple:
+    """The languages this server will accept, read from its own component config.
+
+    say.py deliberately does not carry a copy. The dropdown in webui/app.py is the single source
+    of truth — invariant 4 keeps it honest against the checkpoint — and a second list here would
+    drift the first time a language is added, after which `--language` would reject values the
+    server happily accepts. That is worse than not validating.
+    """
+    try:
+        for comp in (client.config or {}).get("components", []) or []:
+            # api_info / api_info_as_input are siblings of props on the component, not children
+            # of it — looking only under props finds nothing and silently disables the check.
+            for holder in (comp, (comp or {}).get("props") or {}):
+                for key in ("api_info_as_input", "api_info"):
+                    enum = (holder.get(key) or {}).get("enum")
+                    if isinstance(enum, (list, tuple)) and "Auto" in enum and "English" in enum:
+                        return tuple(str(x) for x in enum)
+    except Exception:  # noqa: BLE001 - a config we cannot read means no pre-flight check
+        pass
+    return ()
+
+
+def _normalise_language(requested: str, choices: tuple) -> str:
+    """Case-insensitive `--language`, with a message a human can act on.
+
+    `--language english` used to print
+    `speak failed: AppError: Value: english is not in the list of choices: ['Auto', ...]` —
+    the server's internals, in someone's terminal, for a capital letter. Catching it here also
+    keeps a typo from reaching the GPU and costing a render.
+    """
+    want = (requested or "Auto").strip()
+    if not choices:
+        return want or "Auto"          # no list from the server: pass through and let it judge
+    folded = {str(c).casefold(): c for c in choices}
+    if want.casefold() in folded:
+        return folded[want.casefold()]
+    raise ValueError(
+        f"unknown language {want!r}. This server speaks: "
+        f"{', '.join(str(c) for c in choices)}.\n"
+        f"case does not matter — 'english' and 'English' are the same language.")
+
+
 def resolve_credentials(args: argparse.Namespace) -> tuple:
     """Same precedence the server uses: file, then env, then flag (warned), then none."""
     if args.password_file:
@@ -120,7 +162,13 @@ def main(argv=None) -> int:
     parser.add_argument("--url", default=DEFAULT_URL, help=f"default {DEFAULT_URL}")
     parser.add_argument("--voice", help="saved voice name or slug (see --list)")
     parser.add_argument("--text", help="what to say; '-' or omitted reads stdin")
-    parser.add_argument("--language", default="Auto")
+    parser.add_argument("--language", default="Auto",
+                        help="pin the language (english, japanese, italian, …); case does not "
+                             "matter. Default Auto lets the model choose, which is how a line "
+                             "ends up spoken in the wrong language — pin it for anything but "
+                             "English prose. See --list-languages.")
+    parser.add_argument("--list-languages", action="store_true",
+                        help="print the languages this server accepts and exit")
     parser.add_argument("--postproc", default="warm", choices=("off", "clean", "warm"),
                         help="listening polish; 'off' keeps the raw 24kHz decode")
     parser.add_argument("--temperature", type=float, default=0.9)
@@ -188,6 +236,14 @@ def main(argv=None) -> int:
             return 3
         return 0
 
+    if args.list_languages:
+        langs = _server_languages(client)
+        if not langs:
+            print("the server did not advertise its language list", file=sys.stderr)
+            return 3
+        print("\n".join(langs))
+        return 0
+
     if not args.voice:
         print("error: --voice is required (scripts/say.py --list to see them)", file=sys.stderr)
         return 2
@@ -199,8 +255,14 @@ def main(argv=None) -> int:
         return 2
 
     try:
+        language = _normalise_language(args.language, _server_languages(client))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    try:
         result = client.predict(
-            args.voice, text.strip(), args.language, args.temperature, args.top_p,
+            args.voice, text.strip(), language, args.temperature, args.top_p,
             args.top_k, args.rep_penalty, args.postproc, api_name="/speak")
     except Exception as e:  # noqa: BLE001
         print(f"speak failed: {type(e).__name__}: {e}", file=sys.stderr)

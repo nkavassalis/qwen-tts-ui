@@ -3638,6 +3638,58 @@ def test_say_py_refuses_an_unusable_gradio_client() -> None:
           "the floor must be gradio 6-era, or the schema parse fails the same way")
 
 
+
+def test_say_py_normalises_the_language_flag() -> None:
+    """`--language english` must work, and a typo must not cost a GPU render."""
+    say = _load_say()
+    choices = ("Auto", "English", "Japanese", "Italian")
+    check(say._normalise_language("english", choices) == "English",
+          "case must not matter — it used to surface as a raw AppError from the server")
+    check(say._normalise_language("  ITALIAN ", choices) == "Italian",
+          "surrounding space and shouty caps are both user error we should absorb")
+    check(say._normalise_language("Auto", choices) == "Auto", "the default passes through")
+    check(say._normalise_language("", choices) == "Auto", "empty means Auto")
+    check(say._normalise_language("klingon", ()) == "klingon",
+          "with no list from the server, do not block — let the server judge")
+    try:
+        say._normalise_language("Klingon", choices)
+        check(False, "an unknown language must be refused before the request is sent")
+    except ValueError as e:
+        check("English" in str(e) and "Japanese" in str(e),
+              "the refusal must name what the server actually speaks")
+
+
+def test_say_py_reads_the_language_list_from_the_server() -> None:
+    """No second copy of the dropdown, or `--language` rejects values the server accepts.
+
+    The enum sits on the component as a *sibling* of props, not inside it. Reading only
+    props finds nothing and silently turns the check off — which looks like "the flag is
+    broken" from the shell, so the shape is pinned here.
+    """
+    say = _load_say()
+    langs = ["Auto", "English", "Japanese"]
+
+    class _Client:
+        def __init__(self, config):
+            self.config = config
+
+    sibling = _Client({"components": [{"type": "dropdown", "props": {"choices": []},
+                                       "api_info_as_input": {"enum": langs}}]})
+    check(say._server_languages(sibling) == tuple(langs),
+          "api_info_as_input is a sibling of props on the component")
+    nested = _Client({"components": [{"type": "dropdown",
+                                      "props": {"api_info": {"enum": langs}}}]})
+    check(say._server_languages(nested) == tuple(langs),
+          "accept it nested under props too; the config shape is gradio's to change")
+    check(say._server_languages(_Client({"components": []})) == (),
+          "no dropdown must yield () so the flag passes through rather than blocking")
+    check(say._server_languages(_Client(None)) == (),
+          "a malformed config must not raise out of a shell script")
+    check(say._server_languages(_Client({"components": [
+        {"api_info": {"enum": ["Auto", "Something"]}}]})) == (),
+          "the list must actually be the language dropdown, not any enum with Auto in it")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
