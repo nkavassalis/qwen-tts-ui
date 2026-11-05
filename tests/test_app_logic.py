@@ -3836,6 +3836,108 @@ def test_apply_gain_scales_and_reports_clipping() -> None:
             check(True, "")
 
 
+
+# --------------------------------------------------------------- run it as a service
+
+
+def _run_service_script(home: str, extra_path: str, *argv: str):
+    import subprocess
+
+    env = dict(os.environ, HOME=home, PATH=f"{extra_path}:{os.environ['PATH']}")
+    script = os.path.join(os.path.dirname(webui.__file__), "..", "scripts", "install_service.sh")
+    return subprocess.run(["bash", script, *argv], capture_output=True, text=True,
+                          env=env, timeout=120)
+
+
+def _stub_bin(tmp: str, system: str) -> str:
+    """Fake launchctl/systemctl/uname so the test writes unit files without touching services."""
+    bin_dir = os.path.join(tmp, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    for tool in ("launchctl", "systemctl", "loginctl"):
+        p = os.path.join(bin_dir, tool)
+        open(p, "w").write("#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    p = os.path.join(bin_dir, "uname")
+    open(p, "w").write(f"#!/bin/sh\necho {system}\n")
+    os.chmod(p, 0o755)
+    return bin_dir
+
+
+def test_the_mac_service_definition_survives_reboot_and_holds_no_secret() -> None:
+    """A house speaker that dies on the next restart is not a house speaker.
+
+    These are the four things that make the difference between "works when I started it by
+    hand from Terminal" and "works after the machine reboots and nobody logged in":
+    KeepAlive+RunAtLoad, the Homebrew PATH, and no secret in the unit file.
+    """
+    import plistlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        out = _run_service_script(home, _stub_bin(tmp, "Darwin"),
+                                  "install", "--ip", "0.0.0.0", "--username", "you",
+                                  "--password-file", os.path.join(home, "tts.pw"))
+        assert out.returncode == 0, out.stderr
+        plists = [f for _, _, fs in os.walk(home) for f in fs if f.endswith(".plist")]
+        check(len(plists) == 1, f"exactly one plist is written (got {plists})")
+        with open(os.path.join(home, "Library", "LaunchAgents", plists[0]), "rb") as fh:
+            d = plistlib.load(fh)          # also proves it is well-formed plist, not just text
+        check(d.get("KeepAlive") is True, "must restart after a crash, not just start once")
+        check(d.get("RunAtLoad") is True, "must start at login/boot on its own")
+        check(isinstance(d.get("ThrottleInterval"), int) and d["ThrottleInterval"] >= 10,
+              "launchd retries a failing job fast; without a throttle, a held lock spins the CPU")
+        path = d["EnvironmentVariables"]["PATH"]
+        check("/opt/homebrew/bin" in path,
+              "launchd does not read your shell profile, so ffmpeg is missing without this")
+        check(d["WorkingDirectory"] == os.path.realpath(os.path.join(
+            os.path.dirname(webui.__file__), "..")), "must run from the project root")
+        args = d["ProgramArguments"]
+        check(args[0].endswith("bash") and args[1] == "run.sh",
+              "it must run run.sh, so the venv and cert minting still happen")
+        joined = " ".join(args)
+        check("--password " not in joined + " " and "--password=" not in joined,
+              "a unit file is plain text on disk; only --password-file may appear")
+        check("--password-file" in joined, "the credential path we do require is passed through")
+
+
+def test_the_linux_service_definition_and_the_password_guard() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        out = _run_service_script(home, _stub_bin(tmp, "Linux"),
+                                  "install", "--ip", "0.0.0.0", "--username", "you",
+                                  "--password-file", os.path.join(home, "tts.pw"))
+        assert out.returncode == 0, out.stderr
+        units = [os.path.join(r, f) for r, _, fs in os.walk(home) for f in fs
+                 if f.endswith(".service")]
+        check(len(units) == 1, f"exactly one unit is written (got {units})")
+        unit = open(units[0]).read()
+        check("Restart=always" in unit, "must come back after a crash")
+        check("RestartSec=" in unit, "with a delay, so a held lock does not spin")
+        check("WantedBy=default.target" in unit, "must start at boot for the user")
+        check("WorkingDirectory=" in unit and "ExecStart=/bin/bash run.sh" in unit,
+              "runs the launcher from the project root")
+        check("/opt/homebrew/bin" in unit or "/usr/local/bin" in unit,
+              "a fixed PATH that still finds ffmpeg and sox")
+        check("--password " not in unit, "no secret in a plain-text unit file")
+
+        # The guard: a literal password on the command line is refused before anything is written.
+        out = _run_service_script(home, _stub_bin(tmp, "Linux"), "install",
+                                  "--password", "hunter2")
+        check(out.returncode != 0 and "password-file" in (out.stderr + out.stdout).lower(),
+              "--password must be refused outright, with the reason")
+        check("hunter2" not in "".join(open(u).read() for u in units),
+              "a refused install must not have written the secret anywhere")
+
+        out = _run_service_script(home, _stub_bin(tmp, "Linux"), "uninstall")
+        check(out.returncode == 0 and not os.path.exists(units[0]),
+              "uninstall removes the unit it wrote")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
