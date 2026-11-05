@@ -29,12 +29,41 @@ import sys
 import tempfile
 
 DEFAULT_URL = os.environ.get("QWEN_TTS_URL", "http://127.0.0.1:7860")
+# gradio_client 1.x cannot read the API schema gradio 6 emits: it dies inside its own schema
+# parser with "argument of type 'bool' is not iterable", which reads like a server fault and is
+# nothing of the kind. The venv ships 2.x; the system python on the dev box ships 1.4.3.
+MIN_CLIENT_VERSION = (2, 0)
 PLAYERS = (
     ("paplay", []),
     ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]),
     ("aplay", []),
     ("afplay", []),          # macOS
 )
+
+
+def _venv_python(root: str) -> str:
+    return os.path.join(root, ".venv", "bin", "python")
+
+
+def _should_reexec(current: str, venv: str) -> bool:
+    """True when we are running under some *other* interpreter and the project venv is there."""
+    if os.environ.get("QWEN_TTS_NO_REEXEC"):
+        return False
+    if not current or not os.path.isfile(venv):
+        return False
+    try:
+        return os.path.realpath(current) != os.path.realpath(venv)
+    except OSError:
+        return False
+
+
+def _client_too_old(module_version: str) -> bool:
+    try:
+        parts = tuple(int(p) for p in str(module_version).split(".")[:2] if p.isdigit())
+    except (TypeError, ValueError):
+        return False
+    return bool(parts) and parts < MIN_CLIENT_VERSION
+
 
 
 def resolve_credentials(args: argparse.Namespace) -> tuple:
@@ -108,11 +137,33 @@ def main(argv=None) -> int:
                         help="skip TLS verification (the server's --ssl-self-signed)")
     args = parser.parse_args(argv)
 
+    # Run under the project venv when there is one. `scripts/say.py` is executable and its
+    # shebang is /usr/bin/env python3, so typing it by name picks up whatever gradio_client the
+    # *system* python happens to have — on the box this was written on that is 1.4.3, which
+    # cannot parse gradio 6.17's API schema and fails with
+    # "TypeError: argument of type 'bool' is not iterable" from inside its own schema parser.
+    # The message blames the server; the server was fine. The whole point of this script is to
+    # be a one-liner from a shell, so it finds the right interpreter instead of making you
+    # remember a path (QWEN_TTS_NO_REEXEC=1 opts out).
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    venv_py = _venv_python(root)
+    if _should_reexec(sys.executable, venv_py):
+        os.execv(venv_py, [venv_py, os.path.abspath(__file__)] + list(sys.argv[1:]))
+
     try:
         from gradio_client import Client
+        import gradio_client
         import httpx
     except ImportError:
         print("gradio_client is required: .venv/bin/pip install gradio_client", file=sys.stderr)
+        return 2
+
+    if _client_too_old(getattr(gradio_client, "__version__", "")):
+        print(f"gradio_client {gradio_client.__version__} cannot talk to a gradio 6 server "
+              f"(needs >= {'.'.join(map(str, MIN_CLIENT_VERSION))}).\n"
+              f"run it with the project venv:  {os.path.join(root, '.venv', 'bin', 'python')} "
+              f"scripts/say.py ...\n"
+              f"or set QWEN_TTS_NO_REEXEC=1 to see this in detail.", file=sys.stderr)
         return 2
 
     username, password = resolve_credentials(args)

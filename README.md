@@ -332,6 +332,7 @@ Flags are listed by `./run.sh --help`. The environment variables are all optiona
 | `QWEN_TTS_PASSWORD` | — | Shared credential for `--username` (also `--password-file`) |
 | `QWEN_TTS_USERNAME` | — | Read by `scripts/say.py` for the server login |
 | `QWEN_TTS_URL` | `http://127.0.0.1:7860` | Read by `scripts/say.py` (also `--url`) |
+| `QWEN_TTS_NO_REEXEC` | — | Set to run `scripts/say.py` under the interpreter you invoked it with, instead of re-running itself under `./.venv` |
 
 **Output post-processing** (sidebar) is set to *Warm* by default. It resamples the 24kHz
 vocoder output to 48kHz properly, and trims the near-Nyquist imaging that sounds "digital".
