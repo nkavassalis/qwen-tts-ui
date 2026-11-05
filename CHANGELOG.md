@@ -512,7 +512,7 @@ three places: the status opens with `VoiceClone · kept take #2 of 3`, the takes
 **Auto-pick: take #2 of 3**, and the picker's label reads "the auto-pick was take #2; select
 another to overrule it". The per-player `(kept)` marker stays.
 
-**"Save selected take said it worked but nothing happened."** It had worked — `voices/myvoice.wav`
+**"Save selected take said it worked but nothing happened."** It had worked — the saved clip
 was on disk — but the confirmation went into a text box the user had already looked away from,
 and the voice appeared only in the Clone tab's dropdown. **Speak and Chat never learned the
 library had changed**, so a voice saved on one tab was invisible on the others until a reload.
