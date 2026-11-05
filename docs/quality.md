@@ -535,3 +535,55 @@ comes from the text, not from a direction.
 feature extractor **segfaults instead of raising** when handed an absurd-length input (a probe
 bug wrote a WAV at sr=3, i.e. 149,760 seconds) — which the app never hits because clip length is
 bounded upstream, but any new probe script should assert the length before transcribing.
+
+## Apple Silicon: does MLX leave anything on the table?
+
+The question was whether running the same checkpoints through
+[mlx-audio](https://github.com/Blaizzy/mlx-audio) on a Mac is a downgrade you can hear, or a
+downgrade you can only see in a config file. Quantised weights are exactly the kind of change
+that produces numbers that look fine and audio that isn't, so this was measured before it was
+adopted, and the ear test is Nick's.
+
+**Setup.** Same reference (`fox`), same three sentences, same sampling, same instruments as every
+other comparison here. MLX side: `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit` on an M4 Pro
+(64GB unified). GPU side: the local bf16 checkpoint on the 5070 Ti.
+
+| take | seconds | rate | level | >9 kHz | WER | conf |
+|---|---|---|---|---|---|---|
+| MLX en | 2.24 | 15.6 | −23.5 | 61.6 | **0.00** | −0.07 |
+| MLX en2 | 3.76 | 19.9 | −22.9 | 40.0 | **0.00** | −0.02 |
+| MLX ja | 4.24 | 5.4 | −22.4 | 70.1 | **0.00** | −0.50 |
+| GPU en (bf16) | 1.76 | 19.9 | −22.0 | 80.5 | 0.00 | −0.04 |
+| GPU en2 | 3.76 | 19.9 | −22.1 | 25.9 | 0.00 | −0.02 |
+| GPU ja | 4.40 | 5.2 | −23.5 | 71.2 | 0.00 | −0.47 |
+
+**Nothing was left on the table.** Word error rate 0 on both, confidence matching take for take,
+top-end energy in the same band (and the spread within each column is wider than the spread
+between them — this is the take-to-take variance measured elsewhere on this page, not a
+quantisation effect), and both at 24kHz so the bandwidth comparison is honest. **8-bit is not the
+artifact here.**
+
+**Speed** surprised in the good direction: 2.5–3.0s per take warm on the M4 Pro against ~5s on
+the 5070 Ti for the same sentence, and a full best-of-N (3 candidates, Whisper scoring, speaker
+similarity) requested over the LAN came back in **5.3s**. The decode is only a few dozen tokens
+for a sentence like these, so the 64GB unified pool is not the bottleneck this workload thinks it
+is. Do not generalise that to an 8GB machine.
+
+Two things worth recording about how this was measured, because both nearly produced a wrong
+answer:
+
+- **My first pass reported WER 1.00 for every MLX take.** That was the measurement script
+  keying results by filename after stripping a `_000` suffix; the transcripts had been
+  character-perfect all along. A metric that disagrees with what you can hear is a bug until
+  proven otherwise.
+- **Confidence is Whisper's, not the TTS model's.** It comes from a teacher-forced pass in
+  `Transcriber`, so best-of-N keeps WER, confidence, defect penalties and the SIM tie-break on
+  the Mac with no changes. The initial assumption that an MLX port would lose it — because
+  mlx-audio keeps only the last position's logits — was wrong, and would have shipped a
+  documented "limitation" that didn't exist.
+
+**Still open, and platform-independent.** Every take that goes through the app peaks at exactly
+**1.000** and sits ~6dB hotter (−15.5 to −17 dB) than the same model's raw decode (peak ~0.5,
+−22 dB). It does this identically on Linux and on the Mac, so it is not an MLX effect and was not
+introduced here — but "peak exactly 1.000" is also what clipping looks like, and nobody has
+established which it is. It is a question for the output path, not for this port.

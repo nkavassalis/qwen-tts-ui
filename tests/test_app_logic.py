@@ -3147,6 +3147,200 @@ def test_multi_clip_lab_end_to_end_with_a_fake_model() -> None:
             pass
 
 
+
+# --------------------------------------------------------------------------- MLX backend
+
+
+def test_mlx_engine_is_chosen_by_platform() -> None:
+    """The Mac gets MLX and everything else gets torch, from one rule in one place."""
+    import platform as platform_mod
+    import sys as sys_mod
+
+    real_platform, real_machine = sys_mod.platform, platform_mod.machine
+    try:
+        sys_mod.platform, platform_mod.machine = "darwin", lambda: "arm64"
+        check(webui.default_engine() == "mlx", "Apple Silicon must default to MLX")
+        sys_mod.platform, platform_mod.machine = "darwin", lambda: "x86_64"
+        check(webui.default_engine() == "torch",
+              "an Intel Mac has no MLX; it must not be sent down that path")
+        sys_mod.platform, platform_mod.machine = "linux", lambda: "arm64"
+        check(webui.default_engine() == "torch",
+              "Linux stays on torch even without CUDA (the tested --device cpu path)")
+    finally:
+        sys_mod.platform, platform_mod.machine = real_platform, real_machine
+
+
+def test_mlx_quantisation_is_a_validated_lever() -> None:
+    """--quant is a real lever, so a typo must fail at startup rather than at first request."""
+    for good in webui.MLX_QUANTS:
+        hub = webui.ModelHub("models", None, "sdpa", 1, engine="mlx", quant=good)
+        check(hub.quant == good, f"{good} must be an accepted quantisation")
+    for bad in ("fp8", "4bit", "BF16", ""):
+        try:
+            webui.ModelHub("models", None, "sdpa", 1, engine="mlx", quant=bad)
+            check(False, f"quantisation {bad!r} must be rejected, not silently accepted")
+        except ValueError:
+            pass
+    try:
+        webui.ModelHub("models", None, "sdpa", 1, engine="coreml")
+        check(False, "an unknown engine must be rejected")
+    except ValueError:
+        pass
+    check("fp8" not in webui.MLX_QUANTS,
+          "fp8 is measured unavailable here (torchao 0.9 no-ops on sm_120); do not offer it")
+
+
+def test_setup_sh_knows_every_mlx_repo() -> None:
+    """Same drift guard as the CUDA checkpoints: a lever pointing at nothing is a bug."""
+    with open(os.path.join(webui.ROOT, "setup.sh"), encoding="utf-8") as fh:
+        body = fh.read()
+    for capability, template in webui.MLX_REPOS.items():
+        for quant in webui.MLX_QUANTS:
+            repo = template.format(quant=quant)
+            check(repo in body,
+                  f"setup.sh does not download {capability} at {quant} ({repo}); --quant would "
+                  f"then trigger a surprise multi-GB fetch instead of a restart")
+    check('"$MODELS_DIR-mlx"' in body,
+          "setup.sh must install MLX weights into their own tree, not models/: the torch "
+          "checkpoint tests and the CPU tier read models/ and would see the wrong weights")
+
+
+def test_mlx_language_codes_cover_the_dropdown() -> None:
+    """The UI carries display names, mlx-audio wants codes. A gap silently becomes 'auto'."""
+    import mlx_engine
+
+    for name in webui.LANGUAGE_VALUES:
+        if name == "Auto":
+            continue
+        code = mlx_engine._LANG_CODES.get(name.lower())
+        check(code not in (None, "auto"),
+              f"{name} has no mlx lang_code; it would be sent as 'auto' and the model would "
+              f"pick a language itself — the exact drift invariant 4 exists to stop")
+
+
+def test_mlx_sampling_names_are_mapped() -> None:
+    """The name mismatches between our surface and mlx-audio's are where a port goes wrong.
+
+    `max_new_tokens` -> `max_tokens` is the load-bearing one: if it is dropped, the
+    runaway-EOS guard (_budget, cap 2048) silently never applies, which is the
+    163-seconds-for-one-sentence bug again, on the Mac, with no error.
+    """
+    import mlx_engine
+
+    fake = mlx_engine.MLXModel.__new__(mlx_engine.MLXModel)
+    mapped = fake._sampling({"temperature": 0.9, "top_p": 1.0, "top_k": 50,
+                             "repetition_penalty": 1.05, "max_new_tokens": 512,
+                             "something_unknown": object()})
+    check(mapped.get("max_tokens") == 512,
+          "max_new_tokens must arrive as max_tokens or the runaway guard is off")
+    check("max_new_tokens" not in mapped, "our name must not leak through to mlx-audio")
+    check("something_unknown" not in mapped,
+          "unknown kwargs must not be forwarded: mlx-audio would ignore them silently")
+    for key in ("temperature", "top_p", "top_k", "repetition_penalty"):
+        check(key in mapped, f"{key} must reach the sampler or the sliders are inert on Mac")
+
+
+def test_mlx_run_concatenates_every_segment() -> None:
+    """generate() is a generator; keeping only the last yield would truncate multi-segment text."""
+    import mlx_engine
+
+    class _Seg:
+        def __init__(self, n, sr):
+            self.audio = np.full(n, 0.25, dtype=np.float32)
+            self.sample_rate = sr
+
+    class _Fake:
+        sample_rate = 24000
+
+        def generate(self, **kwargs):
+            return iter([_Seg(100, 24000), _Seg(150, 24000)])
+
+    fake = mlx_engine.MLXModel.__new__(mlx_engine.MLXModel)
+    fake._model = _Fake()
+    wavs, rate = fake._run(text="x")
+    check(rate == 24000, "sample rate must come from the result")
+    check(len(wavs) == 2 and len(wavs[0]) == 100 and len(wavs[1]) == 150,
+          "every yielded segment must survive; dropping one silently shortens the speech")
+
+
+def test_move_is_skipped_only_for_the_mlx_backend() -> None:
+    """The 25x-slower-no-error bug is torch-only, so the skip must be keyed on a marker.
+
+    The counterweight matters as much as the skip: if _move() ever started returning early
+    for torch models, inference would crawl with the vocoder left on CPU and nothing would
+    say so.
+    """
+    import torch
+
+    class _Mlx:
+        _mlx_backend = True
+
+        def __init__(self):
+            raise AssertionError("must not be constructed")
+
+    class _Boom:
+        class _Model:
+            def to(self, device):
+                raise AssertionError("_move() must not touch an MLX model")
+        model = _Model()
+
+    boom = object.__new__(_Boom)
+    boom._mlx_backend = True
+    webui.ModelHub._move(boom, torch.device("cpu"))  # must return quietly
+
+    calls = []
+
+    class _Torchish:
+        class _Inner(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = torch.nn.Linear(2, 2)
+
+            def to(self, device):
+                calls.append("inner")
+                return super().to(device)
+
+        class _Wrapper:
+            def __init__(self):
+                self.model = _Torchish._Inner()
+                self.device = "cpu"
+
+        def __init__(self):
+            self.model = torch.nn.Module()
+            self.model.speech_tokenizer = self._Wrapper()
+            self.device = None
+
+    t = _Torchish()
+    webui.ModelHub._move(t, torch.device("cpu"))
+    check("inner" in calls,
+          "_move() must still reach the speech tokenizer for torch models; skipping it is the "
+          "25x-slower-with-no-error bug")
+
+
+def test_resolve_device_falls_back_without_cuda() -> None:
+    """--device cuda on a box with no CUDA must fail loudly at startup, not quietly mid-request."""
+    import io
+    import torch
+    import contextlib
+
+    real = torch.cuda.is_available
+    try:
+        torch.cuda.is_available = lambda: False
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            dev = webui.resolve_device("cuda")
+        check(dev.type == "cpu", "no CUDA must fall back to CPU, not stay on cuda")
+        check("no CUDA device" in buf.getvalue(),
+              "the fallback must be printed: Whisper scoring depends on it, and the best-of-N "
+              "scorer would otherwise just say 'transcription off'")
+        torch.cuda.is_available = lambda: True
+        check(webui.resolve_device("cuda").type == "cuda",
+              "with CUDA present the requested device must be honoured")
+        check(webui.resolve_device("cpu").type == "cpu", "an explicit cpu stays cpu")
+    finally:
+        torch.cuda.is_available = real
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
