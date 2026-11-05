@@ -353,6 +353,30 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
 - **`setup.sh` warns instead of asserting on `cap >= (12, 0)`** (2026-11-02). The old
   assert killed the install for every pre-Blackwell GPU while its own message claimed
   otherwise.
+- **Do not build a "which read?" clip picker.** Cloning transfers a reference's *pitch
+  variability* (about 2×, compressed) but **not its speaking rate** — a 3.2× difference in how
+  fast the reference was spoken moved the output by 7% (`docs/quality.md`,
+  `scripts/measurements/delivery_transfer.py`). A brisk/calm selector would be detectable,
+  rankable and inert. Pitch centre does not transfer either, which is why identity survives.
+  Fish Audio say the same about their own models: strong emotion is "no longer flattened by the
+  reference" — an admission that the reference flattens it.
+- **Fish Audio S2-Pro was evaluated on this box and rejected** (2026-11-04, full numbers in
+  `docs/quality.md`). Same references, same sentences, same seeds, eight takes each: ours
+  sounded more accurate to the ear without fail, even though every spectral metric that could
+  favour theirs did — 1.8× the energy above 9kHz, 4× above 11kHz. **A fuller top end is not a
+  more accurate voice**, so do not treat `high_band_milli` as a quality target; it is a codec
+  diagnostic. Two findings survived the rejection. (1) Their identity keeps improving with a
+  longer reference (SIM 0.961→0.980, 5.8s→18.7s) while ours is flat (0.981→0.982), which is
+  what makes `REF_TARGET_SECONDS = 6.0` a measured default — asking for a longer clip buys us
+  nothing. (2) Their API has **no language field**, and one cross-lingual take answered in the
+  reference's language instead of the requested one; our checkpoint-checked language dropdown
+  (invariant 4) is load-bearing, not decoration. Integration was never realistic regardless:
+  ~10× slower per take, `GPU Memory used: 20.33 GB` on a 15.9GB card with no VRAM check at all
+  (it pages to host RAM and runs at seconds-per-token, silently — the exact failure
+  `ModelHub`'s floors exist to catch), a `transformers 5.19` vs `4.57` split that forces a
+  second process past the single-owner lock, and a non-commercial licence requiring visible
+  "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
+  four** moved the audio beyond seed noise.
 
 ## Invariants (test-enforced unless noted)
 
