@@ -221,6 +221,20 @@ echo "The migration is done." | scripts/say.py --voice fox
 scripts/say.py --voice fox --text "Coffee." --out kitchen.wav --no-play
 ```
 
+**Pin the language** when the text is not plain English prose. The default is `Auto`, which lets
+the model decide — and a line it decides about can come out in the wrong language. Case does not
+matter, and a typo is refused before anything reaches the GPU:
+
+```bash
+scripts/say.py --voice fox --text "Konnichiwa" --language japanese   # or japanese / JAPANESE / Japanese
+scripts/say.py --list-languages      # what this server actually accepts
+scripts/say.py --voice fox --text "hello" --language Klingon         # refused, exit 2, no render
+```
+
+The list comes from the server's own dropdown rather than a copy in the script, so the two cannot
+drift apart.
+
+
 `--url` points it at another machine. `--username` / `--password-file` or `QWEN_TTS_PASSWORD`
 log in, and `--insecure` accepts a self-signed certificate.
 

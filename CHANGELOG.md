@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — `say.py --language` became usable
+
+### Added
+
+- **`--list-languages`**, read from the server's own dropdown rather than a second copy in the
+  script, so the two cannot drift from the list invariant 4 keeps honest against the checkpoint.
+
+### Fixed
+
+- **`--language` existed but was unusable.** It had no help text, was not in the README, and was
+  **case-sensitive**: `--language english` printed
+  `speak failed: AppError: Value: english is not in the list of choices: ['Auto', 'Chinese', ...]`
+  — the server's internals, in someone's terminal, for a capital letter. It is now
+  case-insensitive, documented in `--help` and the README, and an unknown value is refused
+  locally (exit 2) naming what the server speaks, **before** a render is paid for.
+  `test_say_py_normalises_the_language_flag`.
+- The language list is read from `api_info_as_input.enum`, which sits on the component as a
+  **sibling of `props`**, not inside it — looking only under `props` finds nothing and silently
+  turns the check off, which from the shell looks exactly like "the flag is broken".
+  `test_say_py_reads_the_language_list_from_the_server` pins both shapes.
+
 ## [Unreleased] — `scripts/say.py` now finds the right interpreter itself
 
 ### Fixed
