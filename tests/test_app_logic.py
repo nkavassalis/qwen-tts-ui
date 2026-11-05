@@ -3341,6 +3341,136 @@ def test_resolve_device_falls_back_without_cuda() -> None:
         torch.cuda.is_available = real
 
 
+
+def _fake_mlx_model():
+    """An MLXModel with no mlx installed: enough surface to test the reference plumbing."""
+    import mlx_engine
+
+    m = mlx_engine.MLXModel.__new__(mlx_engine.MLXModel)
+    m.capability = "voice_clone"
+    m.repo = "fake"
+    m._ref_cache = {}
+    m.sent = {}
+
+    class _Res:
+        audio = np.zeros(2400, dtype=np.float32)
+        sample_rate = 24000
+
+    class _Inner:
+        sample_rate = 24000
+
+        def generate(self, **kwargs):
+            m.sent = kwargs
+            return iter([_Res()])
+
+    m._model = _Inner()
+    return m
+
+
+def test_mlx_reference_cache_is_keyed_on_content() -> None:
+    """Two voices must not share one reference file.
+
+    The cache was a single slot keyed on the literal string "path", so the second voice cloned
+    from the first: measured SIM 1.000 to voice #1 and 0.924 to the voice actually requested,
+    with WER and confidence still perfect because both measure the words. A speaker swap that
+    passes every quality metric is the worst kind of bug this app can have.
+    """
+    import mlx_engine
+    import soundfile as sf
+
+    m = _fake_mlx_model()
+    a = np.sin(2 * np.pi * 180 * np.arange(24000 * 3) / 24000).astype(np.float32)
+    b = np.sin(2 * np.pi * 320 * np.arange(24000 * 3) / 24000).astype(np.float32)
+
+    pa = m.create_voice_clone_prompt(ref_audio=(a, 24000), ref_text="alpha")[0]
+    pb = m.create_voice_clone_prompt(ref_audio=(b, 24000), ref_text="beta")[0]
+    check(pa["ref_path"] != pb["ref_path"],
+          "two different references must not resolve to one temp file")
+    wa, _ = sf.read(pa["ref_path"], dtype="float32")
+    wb, _ = sf.read(pb["ref_path"], dtype="float32")
+    check(np.allclose(np.asarray(wa).reshape(-1), a, atol=1e-3),
+          "prompt A's file must hold A's audio")
+    check(np.allclose(np.asarray(wb).reshape(-1), b, atol=1e-3),
+          "prompt B's file must hold B's audio, not A's")
+    check(pa["ref_text"] == "alpha" and pb["ref_text"] == "beta",
+          "the transcript rides with the clip it belongs to")
+
+    # Same clip twice must reuse the file (that is what the cache is for) ...
+    again = m.create_voice_clone_prompt(ref_audio=(a, 24000), ref_text="alpha")[0]
+    check(again["ref_path"] == pa["ref_path"], "an identical reference should be reused")
+    # ... and a bounded cache must not leak unbounded temp files.
+    for i in range(20):
+        tone = np.full(2400, float(i) / 100.0, dtype=np.float32)
+        m.create_voice_clone_prompt(ref_audio=(tone, 24000), ref_text=f"t{i}")
+    check(len(m._ref_cache) <= mlx_engine.REF_CACHE_SIZE,
+          f"reference temp files must be evicted (have {len(m._ref_cache)}); these are people's "
+          f"voices sitting in the OS temp dir")
+    m.close()
+
+
+def test_mlx_clone_uses_the_prompt_the_app_actually_sends() -> None:
+    """The UI sends `voice_clone_prompt` and nothing else — honour it, or clone nobody.
+
+    A shim that only understands ref_audio/ref_text accepts the call happily, drops the prompt,
+    and mlx-audio takes its non-ICL branch: fluent, correctly worded, in the checkpoint's default
+    speaker. That is what "it sounded nothing like the original" and "a generic male voice" were.
+    """
+    import mlx_engine
+
+    m = _fake_mlx_model()
+    a = np.full(24000, 0.1, dtype=np.float32)
+    prompt = m.create_voice_clone_prompt(ref_audio=(a, 24000), ref_text="the words")
+    m.generate_voice_clone(text="hello", language="English", voice_clone_prompt=prompt,
+                           max_new_tokens=128)
+    sent = m.sent
+    check(sent.get("ref_audio"), "the reference must reach mlx-audio or this is not a clone")
+    check(sent.get("ref_text") == "the words",
+          "the transcript must travel with the prompt; without it mlx skips ICL entirely")
+    check(sent.get("max_tokens") == 128, "the runaway guard must still apply")
+
+    # No reference at all must be an error, never a stranger's voice.
+    try:
+        m.generate_voice_clone(text="hello", language="English", max_new_tokens=64)
+        check(False, "a referenceless clone must refuse; generating the default speaker is a "
+                     "silent wrong answer that every quality metric will bless")
+    except mlx_engine.MLXError:
+        pass
+
+    # x-vector-only must refuse rather than quietly become a normal clone.
+    xv = m.create_voice_clone_prompt(ref_audio=(a, 24000), ref_text="the words",
+                                     x_vector_only_mode=True)[0]
+    try:
+        m.generate_voice_clone(text="hello", language="English", voice_clone_prompt=xv,
+                               max_new_tokens=64)
+        check(False, "x-vector-only must be refused on MLX, not run as an ICL clone")
+    except mlx_engine.MLXError:
+        pass
+
+
+
+
+def test_mlx_engine_has_no_shadowed_methods() -> None:
+    """A second `def` of the same name silently replaces the first.
+
+    This happened for real: the rewritten `create_voice_clone_prompt` (which carries the audio
+    in the prompt item) was defined above the original one, so the original — which carries no
+    audio — won, and the "rewrite the temp file if macOS reaped it" fallback could never fire.
+    Nothing failed; the field was just quietly always None.
+    """
+    import ast
+    import collections
+
+    with open(os.path.join(webui.HERE, "mlx_engine.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            names = [n.name for n in node.body
+                     if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            dupes = sorted(k for k, v in collections.Counter(names).items() if v > 1)
+            check(not dupes, f"{node.name} defines {dupes} twice — the later one wins and the "
+                            f"earlier one is dead code that still reads like it runs")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
