@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — the server can now survive a reboot
+
+### Added
+
+- **`scripts/install_service.sh`** — `install | uninstall | status | restart | logs`. macOS gets a
+  LaunchAgent with `KeepAlive`; Linux gets a systemd user unit with `Restart=always`, enabled at
+  boot with lingering on. Per-user, no sudo, and `uninstall` removes exactly what `install` wrote.
+  Before this, a reboot (or simply closing the terminal you started it from) left the box silent
+  until someone noticed.
+- README section *Keep it running*, covering the three things that surprise people: the lock still
+  arbitrates against a manual `./run.sh`, `--password` is refused, and a service needs its own
+  `PATH` because it never reads your shell profile.
+
+### Fixed
+
+- **`install_service.sh install` failed on a Mac that had never had a LaunchAgent**, because
+  `cat >` does not create `~/Library/LaunchAgents`. Caught by the CPU tier, not by a user.
+
+### Notes
+
+- Both were installed here and proved by killing the process: launchd respawned the Mac's server
+  (pid 7329 → 7352) and systemd respawned this one, both serving 200 afterwards, with ffmpeg
+  visible to the service.
+- The service runs `run.sh` rather than `webui/app.py`, so the venv and cert minting stay in one
+  place. `--password` is refused outright; only `--password-file` reaches a unit file.
+
 ## [Unreleased] — the server can speak out loud (`/say_aloud`)
 
 ### Added

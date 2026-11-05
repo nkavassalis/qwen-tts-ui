@@ -42,6 +42,8 @@ setup.sh               reproducible env (uv, py3.12, torch cu128, upstream qwen-
 run.sh                 launcher; mints self-signed certs for --ssl-self-signed
 scripts/say.py             CLI over the assistant API: /speak + /voices_available, plays
                            through paplay/ffplay/aplay/afplay
+scripts/install_service.sh per-user service so the server survives logout/reboot/crash:
+                           LaunchAgent on macOS, systemd user unit on Linux. Runs run.sh.
 scripts/make_voice.py      create a described voice (takes the single-owner lock to render)
 scripts/multi_clip_lab.py  blind A/B UI (port 7861): your one clip vs several-clip clones
                            clips for a clone. Takes the lock; writes only tests/output/
@@ -404,6 +406,20 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   can be asserted in the CPU tier; `apply_gain()` can. Gain that reaches full scale says so in the
   status line rather than quietly squaring off the consonants. A bad `--volume` is refused before
   the render, same as a bad `--language`.
+
+- **The service runs `run.sh`, not `webui/app.py`, and never carries a secret.**
+  `scripts/install_service.sh` writes a LaunchAgent (`KeepAlive`, `ThrottleInterval`) or a systemd
+  user unit (`Restart=always`, `WantedBy=default.target`, lingering on) — going through the launcher
+  is what keeps the venv choice and the `--ssl-self-signed` cert minting in one place. It refuses
+  `--password` outright: a unit file is plain text on disk and argv is world-readable, so
+  `--password-file` is the only route a credential has. It also writes its own `PATH`, because a
+  service never reads your shell profile and a Mac service without `/opt/homebrew/bin` prints
+  "ffmpeg: NOT FOUND (video uploads disabled)" while the same command works in Terminal. The
+  single-owner lock still arbitrates against a manual `./run.sh`; `ThrottleInterval`/`RestartSec`
+  are what stop the service spinning against a lock you are holding.
+  `test_the_mac_service_definition_survives_reboot_and_holds_no_secret`,
+  `test_the_linux_service_definition_and_the_password_guard` (they stub `uname`/`launchctl`/
+  `systemctl` and parse the plist with `plistlib`, so a malformed unit fails here, not at boot).
 
 - **`scripts/say.py` re-execs into `./.venv/bin/python`.** It is executable with a
   `/usr/bin/env python3` shebang, so `scripts/say.py …` uses the *system* interpreter — and the

@@ -106,6 +106,36 @@ What differs from the NVIDIA box, honestly:
 The first request after switching between Clone and Design pays ~2s moving weights to the GPU;
 after that a 6s line takes ~8s.
 
+### Keep it running
+
+`./run.sh` is a foreground process: close the terminal and it stops, reboot and it never comes
+back. If the machine is meant to be an always-on speaker, or a server your assistant can reach,
+install it as a per-user service:
+
+```bash
+scripts/install_service.sh install --ip 0.0.0.0 --username you --password-file ~/tts.pw
+scripts/install_service.sh status      # or: logs | restart | uninstall
+```
+
+macOS gets a LaunchAgent (`launchd`, `KeepAlive`); Linux gets a systemd user unit
+(`Restart=always`, enabled at boot, lingering on so it starts without a terminal open). Both
+invoke `run.sh` rather than the app directly, so the venv and the certificate minting still
+happen.
+
+Three things worth knowing before you do:
+
+- **Your own `./run.sh` keeps working.** The single-owner lock decides which one gets the
+  weights, and the loser exits and names the holder. The service retries on a throttle instead of
+  spinning against a run you started by hand.
+- **`--password` is refused.** A unit file is plain text on disk and argv is world-readable
+  through `ps` and `/proc`. `--password-file` is the only way a credential reaches the service.
+- **A service never reads your shell profile**, which is why it sets its own `PATH` including
+  `/opt/homebrew/bin`. Without that, ffmpeg reports *not found* on a Mac and video uploads
+  silently switch off while the identical command works fine in Terminal.
+
+Logs go to `logs/service.log`. It is per-user, needs no sudo, and `uninstall` removes exactly
+what `install` wrote.
+
 ## Cloning a voice
 
 The Clone tab is three numbered steps. The left column is the reference, the right is what you
@@ -406,6 +436,7 @@ setup.sh, run.sh       environment setup and launcher
 requirements.txt       direct deps (torch and transformers are pinned in setup.sh on purpose)
 webui/app.py           the Gradio UI, model manager, scoring, media and voice library
 scripts/say.py         speak a line through the running server (the /speak API)
+scripts/install_service.sh  run ./run.sh as a per-user service (launchd on macOS, systemd on Linux)
 scripts/make_voice.py  create a described voice from the shell
 scripts/multi_clip_lab.py  experiment: A/B a several-clip clone against your one clip
 tests/test_app_logic.py  CPU tier: no GPU or weights needed
