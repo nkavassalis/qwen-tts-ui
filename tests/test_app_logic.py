@@ -3579,6 +3579,65 @@ def test_render_cache_identity_covers_what_changes_the_audio() -> None:
           "RENDER_IDENTITY must be a bumpable integer")
 
 
+
+# --------------------------------------------------------------------------- scripts/say.py
+
+
+def _load_say():
+    import importlib.util
+
+    path = os.path.join(webui.ROOT, "scripts", "say.py")
+    spec = importlib.util.spec_from_file_location("qwen_tts_say", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_say_py_finds_the_project_venv() -> None:
+    """`scripts/say.py` by itself must work, not only `.venv/bin/python scripts/say.py`.
+
+    The shebang is /usr/bin/env python3, so a bare invocation gets the *system* interpreter and
+    whatever gradio_client it happens to have. On the dev box that is 1.4.3, which cannot parse
+    gradio 6.17's API schema and dies with "TypeError: argument of type 'bool' is not iterable"
+    inside its own schema parser — a message that blames a perfectly healthy server.
+    """
+    import tempfile
+
+    say = _load_say()
+    real = os.environ.pop("QWEN_TTS_NO_REEXEC", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            venv = os.path.join(tmp, ".venv", "bin", "python")
+            os.makedirs(os.path.dirname(venv))
+            open(venv, "w").close()
+            check(say._should_reexec("/usr/bin/python3", venv),
+                  "a system python with a project venv available must re-exec into it")
+            check(not say._should_reexec(venv, venv),
+                  "already in the venv must NOT re-exec — that is an infinite loop")
+            check(not say._should_reexec("", venv), "an unknown interpreter must not re-exec")
+            check(not say._should_reexec("/usr/bin/python3", os.path.join(tmp, "nope")),
+                  "no venv on disk must not re-exec")
+            os.environ["QWEN_TTS_NO_REEXEC"] = "1"
+            check(not say._should_reexec("/usr/bin/python3", venv),
+                  "QWEN_TTS_NO_REEXEC must be an escape hatch")
+    finally:
+        if real is not None:
+            os.environ["QWEN_TTS_NO_REEXEC"] = real
+        else:
+            os.environ.pop("QWEN_TTS_NO_REEXEC", None)
+
+
+def test_say_py_refuses_an_unusable_gradio_client() -> None:
+    """When it cannot re-exec, say so in terms of the real problem."""
+    say = _load_say()
+    check(say._client_too_old("1.4.3"), "gradio_client 1.x cannot read a gradio 6 schema")
+    check(not say._client_too_old("2.5.0"), "the venv's client must be accepted")
+    check(not say._client_too_old(""), "an unknown version must not block a working setup")
+    check(not say._client_too_old(None), "a missing __version__ must not crash the check")
+    check(say.MIN_CLIENT_VERSION >= (2, 0),
+          "the floor must be gradio 6-era, or the schema parse fails the same way")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

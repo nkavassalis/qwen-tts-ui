@@ -388,6 +388,17 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
   four** moved the audio beyond seed noise.
 
+- **`scripts/say.py` re-execs into `./.venv/bin/python`.** It is executable with a
+  `/usr/bin/env python3` shebang, so `scripts/say.py …` uses the *system* interpreter — and the
+  system `gradio_client` here is 1.4.3, which cannot parse gradio 6.17's API schema and raises
+  `TypeError: argument of type 'bool' is not iterable` from inside its own schema parser. That
+  surfaces as "cannot talk to <url>", which reads like a server fault. If you change the shebang,
+  the packaging, or the venv layout, keep the re-exec working or the README's one-liner breaks;
+  `QWEN_TTS_NO_REEXEC=1` is the escape hatch and the realpath comparison is what stops it looping.
+- **`gradio_client` is version-coupled to the server's gradio.** 1.x ↔ 6.x is not a compatible
+  pair. The venv pins 2.5.0; a system-wide install of anything older is invisible to `run.sh`
+  (which uses `$VENV`) but fatal to a script invoked by name.
+
 - **`trim_edges()` trims on a *relative* threshold and keeps 150ms, because an absolute one ate
   words.** The old code called anything under 20ms-RMS 0.005 silence and kept 60ms — shorter than
   one 12Hz codec frame. A real take's last window was RMS 0.0034 (audible vs a 0.002 floor) and

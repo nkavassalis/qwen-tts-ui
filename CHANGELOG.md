@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — `scripts/say.py` now finds the right interpreter itself
+
+### Fixed
+
+- **`scripts/say.py --voice … --text …` failed with a message that blamed the server.** Running
+  it by name gave
+  `cannot talk to http://127.0.0.1:7860: TypeError: argument of type 'bool' is not iterable`.
+  The server was healthy. The script is executable and its shebang is `/usr/bin/env python3`,
+  so a bare invocation used the **system** interpreter, which on this box carries
+  **gradio_client 1.4.3** — and 1.x cannot parse the API schema gradio 6.17 emits, dying inside
+  its own `get_type(schema)`. The venv's 2.5.0 works. The script now re-execs itself under
+  `./.venv/bin/python` when one exists, so the documented one-liner works as documented;
+  `QWEN_TTS_NO_REEXEC=1` opts out, and if the client is still unusable the error names the
+  version and the fix instead of mimicking a server fault.
+  `test_say_py_finds_the_project_venv`, `test_say_py_refuses_an_unusable_gradio_client`.
+
+### Notes
+
+- The guard compares realpaths before exec'ing: already-in-the-venv must not re-exec, or the
+  script loops forever.
+
 ## [Unreleased] — the first and last word were being trimmed away
 
 ### Fixed
