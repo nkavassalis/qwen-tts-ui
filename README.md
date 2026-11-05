@@ -86,8 +86,16 @@ What differs from the NVIDIA box, honestly:
 
 - **Speed is comparable, not slower.** A ~3.8s line took 2.5–3.0s on an M4 Pro versus ~5s on the
   5070 Ti. Do not generalise that to an 8GB M-series machine.
-- **The VRAM guardrails do not apply**, because there is no separate VRAM — MLX works on the
-  unified pool. The RAM floor still does, and so does the single-owner lock.
+- **Only two of the three memory guardrails exist there.** There is no separate VRAM to check —
+  MLX works on the unified pool — and `MemAvailable` comes from `/proc/meminfo`, which macOS does
+  not have, so the RAM floor reads *unknown* and lets the load through rather than refusing it.
+  What does hold is the single-owner lock (two servers, one GPU) and the cap on how many models
+  stay resident in RAM. On a 64GB machine that is comfortable; do not expect a guard to stop you
+  on a small one.
+- **`--device mps` exists and is unmeasured.** It moves Whisper onto the GPU. The confidence
+  thresholds in [docs/quality.md](docs/quality.md) were calibrated on Whisper's CPU output, so
+  moving it is a measurement change, not a device detail — try it, then re-check that best-of-N
+  still ranks two clearly-different takes the way your ears do.
 - **x-vector-only cloning is refused**, not silently downgraded: mlx-audio's Qwen3-TTS entry
   point does not expose it, and quietly running it as a normal clone would mean something
   different from what you asked for.
