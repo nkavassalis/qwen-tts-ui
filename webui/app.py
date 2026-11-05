@@ -36,10 +36,12 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -56,7 +58,14 @@ import torch
 
 from PIL import Image, ImageDraw
 
-from qwen_tts import Qwen3TTSModel
+try:
+    from qwen_tts import Qwen3TTSModel
+except ImportError:  # pragma: no cover - platform-dependent
+    # The MLX-only install on Apple Silicon has no upstream qwen-tts, and must not need one.
+    # Every other use of this name is either an annotation (this file has
+    # `from __future__ import annotations`) or behind ModelHub._load()'s torch branch, which
+    # refuses with a real message instead of an AttributeError deep in a callback.
+    Qwen3TTSModel = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -73,6 +82,26 @@ CAPABILITIES = OrderedDict(
         ("voice_clone", ("Qwen3-TTS-12Hz-1.7B-Base", "base")),
     ]
 )
+
+# The same two checkpoints under MLX, for Apple Silicon. Both quantisations ship as levers:
+# bf16 is the faithful one — every number in docs/quality.md was measured on bf16 — and 8-bit
+# is the fast one. mlx-community publishes both, for Base and VoiceDesign, which is the whole
+# set this app uses.
+MLX_REPOS = {
+    "voice_design": "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-{quant}",
+    "voice_clone": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-{quant}",
+}
+MLX_QUANTS = ("bf16", "8bit")
+
+
+def default_engine() -> str:
+    """Apple Silicon gets MLX; everything else keeps the CUDA/CPU torch path.
+
+    Deliberately conservative: it only picks MLX where that is actually the fast, supported
+    route, and a Linux box with no CUDA still lands on the tested `--device cpu` path rather
+    than an MLX build that was never meant for it.
+    """
+    return "mlx" if (sys.platform == "darwin" and platform.machine() == "arm64") else "torch"
 
 # (UI label, value passed to the model). Values must match `talker_config.codec_language_id`
 # keys *and* upstream's supported-language filter, which excludes dialect values: dialects
@@ -459,6 +488,20 @@ def choose_best_candidate(metrics: List[Dict[str, Optional[float]]]) -> int:
                 -(float("inf") if sim is None else float(sim)), index)
 
     return min(enumerate(metrics), key=key)[0]
+
+
+def speaker_embedding(tts: Any, wav: np.ndarray, sr: int) -> np.ndarray:
+    """1-D float embedding for the best-of-N similarity tie-break, on either backend.
+
+    The torch path reaches `tts.model.extract_speaker_embedding` and calls
+    `.float().cpu().numpy()` on the result; MLX's array type has no `.cpu()`, so the two
+    backends cannot share that idiom. Funnelling both through here keeps one call site and
+    keeps the invariant-3 path (the one that must move the speech tokenizer) untouched.
+    """
+    if getattr(tts, "_mlx_backend", False):
+        return tts.speaker_embedding(wav, sr)
+    emb = tts.model.extract_speaker_embedding(audio=_to_24k(wav, sr), sr=24000)
+    return emb.float().cpu().numpy()
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -915,6 +958,31 @@ def generate_chunked(text: str, language: Optional[str], generate_one: Any,
 # ============================================================================
 # Model loading + VRAM management
 # ============================================================================
+def resolve_device(requested: str) -> torch.device:
+    """Pick a device that actually exists on this box.
+
+    `--device` defaults to cuda because that is the normal machine, and `torch.device("cuda")`
+    is constructible even where there is no CUDA — the failure comes later, when
+    `Transcriber.load()` does `.to("cuda")` inside Whisper's own module walk. That exception
+    lands in the best-of-N scorer's broad `except`, which is written to treat a missing
+    transcript as a bonus that did not materialise: the UI then says "scored by waveform
+    defects (transcription off)" and keeps working. Which is exactly the silent degradation
+    this project keeps meeting, so the fallback is explicit, printed, and happens at startup
+    rather than mid-request.
+
+    MPS is deliberately *not* the automatic pick. Whisper's confidence numbers are what the
+    best-of-N thresholds in docs/quality.md were calibrated against, and moving it to a second
+    backend is a measurement change, not a device detail. Ask for it with `--device mps`.
+    """
+    dev = torch.device(requested)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        print(f"[webui] --device {requested} but no CUDA device here; Whisper and the audio "
+              "helpers will run on CPU. Pass --device mps on Apple Silicon to try the GPU, "
+              "or --device cpu to say so explicitly.", flush=True)
+        return torch.device("cpu")
+    return dev
+
+
 class ModelHub:
     """Keeps loaded models in CPU RAM; only a couple sit on the GPU at once.
 
@@ -932,10 +1000,17 @@ class ModelHub:
 
     def __init__(self, models_dir: str, dtype: torch.dtype, attn_impl: str, max_resident: int,
                  max_cpu_resident: int = 2, ram_floor_mb: int = RAM_FLOOR_MB,
-                 vram_margin_mb: int = VRAM_MARGIN_MB):
+                 vram_margin_mb: int = VRAM_MARGIN_MB, engine: str = "torch",
+                 quant: str = "bf16"):
+        if engine not in ("torch", "mlx"):
+            raise ValueError(f"unknown engine {engine!r} (expected 'torch' or 'mlx')")
+        if quant not in MLX_QUANTS:
+            raise ValueError(f"unknown quantisation {quant!r} (expected one of {MLX_QUANTS})")
         self.models_dir = models_dir
         self.dtype = dtype
         self.attn_impl = attn_impl
+        self.engine = engine
+        self.quant = quant
         self.max_resident = max(1, max_resident)
         self.max_cpu_resident = max(1, max_cpu_resident)
         self.ram_floor_mb = ram_floor_mb
@@ -977,7 +1052,19 @@ class ModelHub:
             gc.collect()
 
     def _load(self, capability: str) -> Qwen3TTSModel:
+        if self.engine == "mlx":
+            # Imported here, not at module scope: the CPU test tier imports app.py on boxes
+            # with no MLX installed, and a top-level import would make that impossible.
+            import mlx_engine
+
+            repo = MLX_REPOS[capability].format(quant=self.quant)
+            return mlx_engine.MLXModel.load(repo, capability, self.models_dir)
         path = self._checkpoint(capability)
+        if Qwen3TTSModel is None:
+            raise RuntimeError(
+                "the torch engine needs the upstream qwen-tts package (setup.sh installs it "
+                "into .venv from the pinned upstream ref). On Apple Silicon, --engine mlx "
+                "instead.")
         need = self.weight_mb(capability)
         self._free_cpu(need, protect=capability)
         if mem_available_mb() - need < self.ram_floor_mb:
@@ -1026,6 +1113,13 @@ class ModelHub:
         ~50x slower generation (aten::slow_conv_dilated2d dominates the profile). Both
         the wrapper's inner module and its cached `.device` must be updated.
         """
+        if getattr(tts, "_mlx_backend", False):
+            # MLX has no device to move to and no torch modules to walk. The reason this is an
+            # explicit no-op rather than a fall-through: the bug this function exists to
+            # prevent (the 12Hz vocoder left behind, 25x slower, no error) is a torch-only
+            # failure, and silently skipping it for a torch model would be the worst possible
+            # outcome. So the guard tests a marker the MLX class sets, not duck-typing.
+            return
         tts.model.to(device)
         for attr in vars(tts.model).values():
             inner = getattr(attr, "model", None)
@@ -1037,6 +1131,12 @@ class ModelHub:
     def acquire(self, capability: str) -> Qwen3TTSModel:
         """Return `capability` resident on the GPU, evicting LRU models if needed."""
         with self.lock:
+            if self.engine == "mlx":
+                # MLX runs on the unified memory pool: there is no device to promote to, no
+                # VRAM to budget, and no `_move()` to get wrong. The RAM floor still applies
+                # through _get_cpu(), so the single guardrail that means something here is
+                # the one that stays.
+                return self._get_cpu(capability)
             tts = self._get_cpu(capability)
             if capability in self.on_gpu:
                 self.on_gpu.move_to_end(capability)
@@ -2908,9 +3008,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
 
             ref_embedding = None
             try:
-                ref_embedding = tts.model.extract_speaker_embedding(
-                    audio=_to_24k(ref_wav, ref_sr), sr=24000)
-                ref_embedding = ref_embedding.float().cpu().numpy()
+                ref_embedding = speaker_embedding(tts, ref_wav, ref_sr)
             except Exception:  # noqa: BLE001 - similarity is a bonus, never a blocker
                 ref_embedding = None
 
@@ -2936,8 +3034,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text, language, use_xvector
                 defects = defect_report(wav, sr, target_text)
                 if ref_embedding is not None:
                     try:
-                        cand = tts.model.extract_speaker_embedding(
-                            audio=_to_24k(wav, sr), sr=24000).float().cpu().numpy()
+                        cand = speaker_embedding(tts, wav, sr)
                         sim = _cosine(ref_embedding, cand)
                     except Exception:  # noqa: BLE001
                         sim = None
@@ -3771,6 +3868,12 @@ def main() -> int:
                         help="Refuse to load another checkpoint if it would leave less than "
                              "this much MemAvailable.")
     parser.add_argument("--device", default="cuda", help="cuda / cuda:0 / cpu")
+    parser.add_argument("--engine", default="auto", choices=("auto", "torch", "mlx"),
+                        help="model runtime. 'auto' picks MLX on Apple Silicon and torch "
+                             "everywhere else. MLX needs mlx-audio (setup.sh installs it).")
+    parser.add_argument("--quant", default="bf16", choices=MLX_QUANTS,
+                        help="MLX weight format. bf16 is what every measurement in "
+                             "docs/quality.md was taken on; 8bit is smaller and faster.")
     parser.add_argument("--preload", action="store_true",
                         help="Load checkpoints into CPU RAM at startup instead of lazily "
                              "(bounded by --max-cpu-resident).")
@@ -3804,7 +3907,7 @@ def main() -> int:
 
     globals()["FFMPEG_BIN"] = args.ffmpeg_bin
 
-    DEVICE = torch.device(args.device)
+    DEVICE = resolve_device(args.device)
     globals()["ASR"] = Transcriber(model_id="none" if args.no_asr else args.asr_model, device=DEVICE)
     print(f"[webui] transcription: {'disabled' if not ASR.enabled else ASR.model_id} | "
           f"ffmpeg: {args.ffmpeg_bin if shutil.which(args.ffmpeg_bin) else 'NOT FOUND (video uploads disabled)'}",
@@ -3817,8 +3920,10 @@ def main() -> int:
               f"~{args.max_cpu_resident * 4.3:.1f}GB but only {mem_available_mb() / 1024:.1f}GB "
               f"is free; the hub will drop models instead of over-committing.", flush=True)
 
+    engine = default_engine() if args.engine == "auto" else args.engine
     HUB = ModelHub(args.models_dir, dtype, args.attn_implementation, args.max_resident,
-                   max_cpu_resident=args.max_cpu_resident, ram_floor_mb=args.ram_floor_mb)
+                   max_cpu_resident=args.max_cpu_resident, ram_floor_mb=args.ram_floor_mb,
+                   engine=engine, quant=args.quant)
 
     def serve() -> int:
         removed = prune_media()

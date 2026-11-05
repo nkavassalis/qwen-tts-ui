@@ -9,8 +9,15 @@ Built on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (Alibaba Qwen), **1.7B
 — the best quality tier released; voice design is 1.7B-only. Ten languages: Auto, Chinese,
 English, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Italian.
 
-**Hardware:** one 16GB NVIDIA card (developed on an RTX 5070 Ti under WSL2). The two
-checkpoints are ~9.3GB on disk, Whisper large-v3 another ~2.9GB.
+**Hardware:** either of two machines, both first-party —
+
+| | Runs on | Runtime | Notes |
+|---|---|---|---|
+| **Linux + NVIDIA** | one 16GB card (developed on an RTX 5070 Ti under WSL2) | PyTorch 2.8 `cu128`, `sdpa` | the reference path; every measurement in [docs/quality.md](docs/quality.md) was taken here |
+| **Apple Silicon** | any M-series Mac with 16GB+ unified memory (measured on an M4 Pro, 64GB) | [mlx-audio](https://github.com/Blaizzy/mlx-audio) | same two checkpoints from `mlx-community`, in bf16 or 8-bit |
+
+The two checkpoints are ~9.3GB on disk (PyTorch) or ~3.4GB each (MLX bf16) / ~1.8GB (8-bit),
+Whisper large-v3 another ~2.9GB. `setup.sh` picks the path from `uname`; you do not choose.
 
 | Tab | What it is for |
 |---|---|
@@ -45,11 +52,48 @@ Common variations:
 ./run.sh --no-asr                # no Whisper (frees ~3GB VRAM; you type transcripts)
 ```
 
-`setup.sh` needs [uv](https://docs.astral.sh/uv/). It creates `.venv` on Python 3.12, installs
-`torch==2.8.0` from the **cu128** index (the wheels that cover sm_120 / RTX 50xx), installs
-upstream `qwen-tts` from a pinned checkout in `./repo`, downloads the checkpoints into
-`./models/`, fetches Whisper into the Hugging Face cache and creates the shipped `fox` voice.
+`setup.sh` needs [uv](https://docs.astral.sh/uv/). It creates `.venv` on Python 3.12 and then
+branches:
+
+- **Linux + CUDA** — installs `torch==2.8.0` from the **cu128** index (the wheels that cover
+  sm_120 / RTX 50xx), installs upstream `qwen-tts` from a pinned checkout in `./repo`, and
+  downloads the checkpoints into `./models/`.
+- **Apple Silicon** — installs CPU torch (Whisper and the audio helpers only), `mlx-audio`, and
+  the four `mlx-community` repos into `./models-mlx/`. It does **not** clone upstream `qwen-tts`;
+  the MLX port carries the talker, the 12Hz codec and the speaker encoder.
+
+Both paths then fetch Whisper into the Hugging Face cache and create the shipped `fox` voice.
 `--models`, `--asr` and `--voices` redo one part. **ffmpeg** must be on PATH for video uploads.
+
+### Running it on a Mac
+
+```bash
+./setup.sh                                   # mlx-audio + both checkpoints, both quantisations
+./run.sh --ip 0.0.0.0 --username you --password-file ~/tts.pw    # reachable from your PC
+./run.sh --quant 8bit                        # the faster lever; bf16 is the default
+./run.sh --engine torch --device cpu         # the PyTorch path, for comparison
+```
+
+`--quant` is a real lever, not a download trigger: `setup.sh` fetches bf16 **and** 8-bit for
+both checkpoints, so switching costs a restart (~2s) rather than a 2GB fetch.
+
+**bf16 is the default** because every quality number in this repo was measured on bf16; 8-bit is
+the one that is smaller and quicker. Both were checked against the GPU on the same reference and
+sentences — word error rate 0 on both, teacher-forced confidence matching take for take, and
+top-end energy in the same band.
+
+What differs from the NVIDIA box, honestly:
+
+- **Speed is comparable, not slower.** A ~3.8s line took 2.5–3.0s on an M4 Pro versus ~5s on the
+  5070 Ti. Do not generalise that to an 8GB M-series machine.
+- **The VRAM guardrails do not apply**, because there is no separate VRAM — MLX works on the
+  unified pool. The RAM floor still does, and so does the single-owner lock.
+- **x-vector-only cloning is refused**, not silently downgraded: mlx-audio's Qwen3-TTS entry
+  point does not expose it, and quietly running it as a normal clone would mean something
+  different from what you asked for.
+- **Take confidence still works.** It comes from Whisper's teacher-forced pass, not the TTS
+  model's logits, so best-of-N keeps word error rate, confidence, defect penalties and the
+  speaker-similarity tie-break on both platforms.
 
 The first request after switching between Clone and Design pays ~2s moving weights to the GPU;
 after that a 6s line takes ~8s.
@@ -274,7 +318,7 @@ Flags are listed by `./run.sh --help`. The environment variables are all optiona
 
 | Variable | Default | What it does |
 |---|---|---|
-| `QWEN_TTS_MODELS_DIR` | `./models` | Where the `Qwen3-TTS-12Hz-1.7B-*` checkpoints live (`--models-dir` wins) |
+| `QWEN_TTS_MODELS_DIR` | `./models` | Where the `Qwen3-TTS-12Hz-1.7B-*` checkpoints live (`--models-dir` wins). MLX looks for its own copies in `./models-mlx/` |
 | `QWEN_TTS_ASR_MODEL` | `openai/whisper-large-v3` | Whisper model for Transcribe |
 | `QWEN_TTS_MEDIA_TTL_SECONDS` | 6 hours | Age after which clips in `tmp/media/` are pruned |
 | `QWEN_TTS_RENDER_CACHE_MB` | 256 | Size cap of the Speak/Chat render cache in `tmp/render_cache/`; `0` turns it off |
@@ -284,6 +328,7 @@ Flags are listed by `./run.sh --help`. The environment variables are all optiona
 | `QWEN_TTS_VRAM_MARGIN_MB` | 1024 | VRAM kept free for activations and the vocoder |
 | `QWEN_TTS_LOCK` | `./.qwen-tts.lock` | The single-owner lock file |
 | `QWEN_TTS_UPSTREAM_REF` | a pinned SHA | Which upstream commit `setup.sh` installs — move it deliberately |
+| `QWEN_TTS_ENGINE` | `auto` | Force the runtime: `torch` or `mlx`. `auto` picks MLX on Apple Silicon, torch elsewhere (same rule as `--engine`) |
 | `QWEN_TTS_PASSWORD` | — | Shared credential for `--username` (also `--password-file`) |
 | `QWEN_TTS_USERNAME` | — | Read by `scripts/say.py` for the server login |
 | `QWEN_TTS_URL` | `http://127.0.0.1:7860` | Read by `scripts/say.py` (also `--url`) |

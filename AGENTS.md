@@ -70,7 +70,17 @@ certs/  logs/  tests/output/  .qwen-tts.lock  .gradio/
 ./run.sh --ip 0.0.0.0 --username u --password-file ~/tts.pw   # LAN, authenticated
 ./run.sh --ssl-self-signed --ip 0.0.0.0 --username u --password-file ~/tts.pw   # browser mic needs HTTPS
 ./run.sh --device cpu            # CPU inference (slow; works, no CUDA needed)
+
+# Apple Silicon — setup.sh picks this branch from `uname`; QWEN_TTS_ENGINE=torch overrides
+./setup.sh                       # mlx-audio + both checkpoints, both quantisations (~12GB)
+./run.sh --ip 0.0.0.0 --username u --password-file ~/tts.pw   # serve it to the LAN
+./run.sh --quant 8bit            # the fast lever; bf16 is the default
+./run.sh --engine torch --device cpu   # the PyTorch path, for comparison
 ```
+
+On a Mac, Homebrew's `ffmpeg` lives in `/opt/homebrew/bin`, which is **not on a non-interactive
+SSH session's PATH** — if the server prints `ffmpeg: NOT FOUND (video uploads disabled)` after you
+installed it, that is why. Same for `uv` and `brew` in scripts.
 
 You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RAM: …` line, then
 `* Running on local URL`. If the second one never appears, check `nvidia-smi` (VRAM) and
@@ -79,7 +89,7 @@ You should see `[webui] transcription: … | ffmpeg: …`, then a `GPU: … | RA
 ## How to run the tests
 
 ```bash
-.venv/bin/python tests/test_app_logic.py   # CPU tier — 91 checks, ~10s
+.venv/bin/python tests/test_app_logic.py   # CPU tier — 101 checks, ~10s
 .venv/bin/python tests/smoke_test.py       # GPU tier — 8 flows, ~2 min, needs weights
 .venv/bin/python tests/smoke_test.py --only media_pipeline
 ```
@@ -378,6 +388,38 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
   four** moved the audio beyond seed noise.
 
+- **MLX is a shim behind `ModelHub`, not a fork of the app** (`webui/mlx_engine.py`). All model
+  loading already goes through `ModelHub._load()`/`acquire()` (invariant 2), so Apple Silicon is
+  one more implementation of that surface and the CUDA path is untouched. The shim exists because
+  mlx-audio's API differs in four ways that each fail *silently*: `generate()` is a generator
+  (keep only the last yield and multi-segment text truncates), it wants `lang_code` not the
+  display name, it wants `max_tokens` not `max_new_tokens` (drop that and the runaway-EOS guard
+  is off with no error), and reference audio is a path rather than `(numpy, sr)`.
+- **Both quantisations ship, and bf16 is the default.** `--quant` is a restart, not a download,
+  because `setup.sh` fetches all four `mlx-community` repos up front. bf16 is default because
+  every quality number here was measured on bf16; 8-bit was then measured against it and came out
+  equal (WER 0 both, confidence matched, same top-end band). **Do not add `fp8` to `MLX_QUANTS`
+  or offer CUDA fp8**: torchao 0.9.0 — the only version matching our torch pin — **silently
+  no-ops on sm_120**, leaving every `nn.Linear` in bf16 and printing nothing, and current torchao
+  will not import against torch 2.8 at all (`ScalingType` does not exist there).
+- **`from qwen_tts import Qwen3TTSModel` is optional.** The Mac path never installs upstream
+  `qwen-tts`. Every other use of the name is an annotation (the file has
+  `from __future__ import annotations`) or sits behind `ModelHub._load()`'s torch branch, which
+  refuses with a real message. A hard top-level import would make the Mac install need a package
+  it cannot use.
+- **`resolve_device()` exists because Whisper was silently dead on the Mac.** `--device` defaults
+  to `cuda`, and `torch.device("cuda")` is constructible with no CUDA; the failure surfaced as
+  `.to("cuda")` blowing up inside Whisper's module walk, which the best-of-N scorer's broad
+  `except` reported as *"scored by waveform defects (transcription off)"* while the UI kept
+  working. Same silent-degradation family as the `instruct` field and the tag vocabulary. MPS is
+  deliberately **not** automatic: the confidence thresholds in `docs/quality.md` were calibrated
+  on Whisper's output, so moving it to a second backend is a measurement change, not a device
+  detail — ask for it with `--device mps`. `test_resolve_device_falls_back_without_cuda`.
+- **Confidence is Whisper's, not the TTS model's.** `_mean_token_logprob` runs inside
+  `Transcriber` on a teacher-forced Whisper pass, so best-of-N keeps WER + confidence + defects +
+  SIM on both backends. Worth knowing before anyone "ports" the confidence scorer and finds there
+  is nothing to port.
+
 ## Invariants (test-enforced unless noted)
 
 1. One model-owning process at a time (`flock`); `--force` is the only override and must
@@ -406,6 +448,19 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
     `--allow-skip`. `test_smoke_test_skips_are_not_passes`.
 14. Extracted clips are pruned (`MEDIA_TTL_SECONDS`, default 6h) so `tmp/media/` cannot
     grow forever and hold people's voices. `test_prune_media`.
+15. `MLX_REPOS` and `setup.sh`'s MLX download list agree for **both** quantisations — a lever
+    pointing at nothing becomes a surprise multi-GB fetch mid-session.
+    `test_setup_sh_knows_every_mlx_repo`.
+16. `--engine` and `--quant` are validated at construction, and `fp8` is not offered.
+    `test_mlx_quantisation_is_a_validated_lever`.
+17. Every `LANGUAGE_VALUES` entry maps to a real mlx `lang_code` (never `"auto"`), so the Mac
+    cannot let the model pick a language by itself. `test_mlx_language_codes_cover_the_dropdown`.
+18. `max_new_tokens` reaches mlx-audio as `max_tokens`, unknown kwargs are not forwarded, and
+    every yielded segment survives. `test_mlx_sampling_names_are_mapped`,
+    `test_mlx_run_concatenates_every_segment`.
+19. `ModelHub._move()` skips **only** on the `_mlx_backend` marker and still reaches the speech
+    tokenizer for torch models. `test_move_is_skipped_only_for_the_mlx_backend` — the
+    counterweight half is the point: an over-broad skip *is* the 25x-slower-no-error bug.
 15. `/speak` keeps its 8 positional inputs and `/voices_available` stays public — that is
     the `scripts/say.py` contract. `test_build_ui_constructs`.
 16. One Status box per tab; no generation status carries the runtime line.
@@ -445,6 +500,26 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
 - Commit style: imperative subject, bullet body explaining the *why* (see `git log`).
 
 ## Known issues / TODOs
+
+- **Mac: the RAM floor is inert there.** `mem_available_mb()` returns `+inf` off Linux (no
+  `/proc/meminfo`), so on macOS only the `flock` single-owner lock and the `max_cpu_resident` LRU
+  cap actually do anything. That is survivable on 64GB of unified memory and would not be on a
+  small machine; do not describe the Mac path as "guarded by all three railguards".
+- **Mac: Whisper runs on CPU.** `--device` falls back from `cuda` (see `resolve_device`), so the
+  first scored request pays the large-v3 load; warm best-of-N is 5.3s for 3 candidates. MPS is
+  available via `--device mps` but unmeasured — and the confidence thresholds were calibrated on
+  CPU output, so it is an experiment, not a default.
+- **`hf download --exclude` is ignored by recent `hf` CLI versions** ("Ignoring `--exclude` since
+  filenames have been explicitly set"), so the Whisper fetch pulls its fp32/flax duplicates too
+  (~4.9GB into the cache instead of ~2.9GB). It still completes and the app works; the exclude
+  line is currently decorative on a fresh Mac. Worth fixing against a pinned `hf` version.
+- **Every take that goes through the app peaks at exactly 1.000** and sits ~6dB hotter than the
+  same model's raw decode. Identical on Linux and Mac, so it predates the MLX port and is not
+  platform-specific — but "peak exactly 1.000" is also what clipping looks like, and nobody has
+  established which it is. Open question for the output path; `docs/quality.md` records the
+  numbers.
+- **MLX has no x-vector-only cloning.** mlx-audio's Qwen3-TTS entry point does not expose it, so
+  the shim *refuses* rather than quietly running a normal clone under a different name.
 
 - No CI. The CPU tier needs torch+gradio (~2GB of wheels) but no GPU; a GitHub Actions
   job would catch the Gradio-drift class of failure that pinning only partly covers.

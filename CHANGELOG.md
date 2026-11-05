@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — Apple Silicon is a first-party platform (MLX)
+
+### Added
+
+- **`webui/mlx_engine.py`**: the same app on an M-series Mac, running on
+  [mlx-audio](https://github.com/Blaizzy/mlx-audio) instead of CUDA. It is a shim over the four
+  places the app touches a model (`generate_voice_clone`, `generate_voice_design`,
+  `create_voice_clone_prompt`, the speaker embedding), selected inside `ModelHub` — which is
+  already the only place a model is loaded (invariant 2). The CUDA path is untouched.
+- **`--engine {auto,torch,mlx}`** and **`--quant {bf16,8bit}`**. `auto` picks MLX on Apple
+  Silicon, torch elsewhere (`default_engine()`, mirrored in `setup.sh`). Both quantisations of
+  both checkpoints are downloaded by `setup.sh` so `--quant` is a restart, not a surprise 2GB
+  fetch. **bf16 is the default** because every number in `docs/quality.md` was measured on it.
+- **`setup.sh` branches on `uname`**: Linux gets torch 2.8.0+cu128 and the pinned upstream
+  checkout; macOS gets CPU torch (Whisper and the audio helpers), `mlx-audio`, and the four
+  `mlx-community` repos into `models-mlx/`. The Mac path never clones upstream `qwen-tts`, and
+  `from qwen_tts import Qwen3TTSModel` is now optional so it does not have to.
+- **`resolve_device()`**: `--device cuda` on a box with no CUDA now prints a fallback at startup
+  instead of failing later inside Whisper's `.to("cuda")`.
+
+### Measured
+
+- MLX 8-bit on an M4 Pro against bf16 on the 5070 Ti, same reference and sentences:
+  **WER 0.00 on both**, teacher-forced confidence matching take for take (−0.02…−0.50 vs
+  −0.04…−0.47), top-end energy in the same band, both 24kHz. **2.5–3.0s** per take on the Mac.
+  Warm best-of-N (3 candidates + scoring) over the LAN: **5.3s**. See
+  [docs/quality.md](docs/quality.md#apple-silicon-does-mlx-leave-anything-on-the-table).
+
+### Fixed
+
+- **Whisper silently did nothing on the Mac.** `Transcriber` inherited `--device`'s default of
+  `cuda`; on a Mac that raises inside Whisper's module walk, which the best-of-N scorer's broad
+  `except` reported as "scored by waveform defects (transcription off)" while everything kept
+  working. Now `resolve_device()` falls back to CPU and says so at startup. `test_resolve_device_falls_back_without_cuda`.
+- **`hf download --exclude` was being ignored** by recent `hf` CLI versions ("Ignoring
+  `--exclude` since filenames have been explicitly set"), so Whisper dragged its fp32/flax
+  duplicates down too. Left as-is (it still completes) but noted in AGENTS.md as a known drift.
+
+### Tests
+
+- CPU tier 93 → **101 checks**: engine-by-platform, quantisation/engine validation, MLX repo
+  list ↔ `setup.sh` sync, `LANGUAGE_VALUES` ↔ mlx `lang_code` coverage, `max_new_tokens` →
+  `max_tokens` mapping, every generated segment surviving the generator, `_move()` skipping only
+  the MLX marker (and still reaching the speech tokenizer for torch), and the device fallback.
+
 ## [Unreleased] — a mismatched reference transcript is now refused, not warned about
 
 ### Changed
