@@ -370,6 +370,8 @@ CONF_WEIGHT = 0.4          # a full log-prob below the line costs less than 20% 
 DEFECT_CAP = 0.3           # defects alone cannot outrank a take that says the words wrong
 RATE_RATIO_LOW, RATE_RATIO_HIGH = 0.6, 1.8   # plausible band around WORDS_PER_SECOND
 SILENCE_RMS = 0.005        # 20ms window RMS below this counts as silence
+TRIM_RELATIVE = 0.06       # for *deleting* padding, quieter than 6% of the take's own loud level
+TRIM_FLOOR_RMS = 0.0015    # ...but never quieter than this, or a noise floor becomes speech
 SILENCE_BUDGET = 0.5       # seconds of lead+tail silence tolerated before a penalty
 CLIP_FRACTION = 0.001      # share of samples at full scale before it counts as clipping
 
@@ -605,7 +607,9 @@ FIRST_CHUNK_WORDS = (4, 7, 10)      # min, target, max
 FIRST_CHUNK_CJK = (6, 10, 16)
 MAX_CHUNKS = 40           # one GPU, one request — ask for a shorter script instead
 CROSSFADE_MS = 15         # equal-power join; a hard splice clicks
-SILENCE_KEEP_MS = 60      # trim the decode's edge padding, keep consonant air
+SILENCE_KEEP_MS = 150     # trim the decode's edge padding, keep consonant air.
+                          # Was 60, which is less than one 12Hz codec frame (83ms): a measured
+                          # take lost 180ms of tail that was audible but under the absolute bar.
 
 # Dots that do not end a sentence. Replacing them with placeholders before scanning is what
 # stops "Mr. Smith drove 3.5 miles to St. John's at 1. Main St." from becoming four chunks
@@ -831,6 +835,25 @@ def split_for_tts(text: str, language: Optional[str] = None,
     return chunks
 
 
+def _trim_threshold(rms: np.ndarray) -> float:
+    """What counts as padding, relative to the take's own level.
+
+    The absolute `SILENCE_RMS` bar is right for *reporting* a defect and wrong for *deleting*
+    audio: a voiceless fricative (the `f` in "roof", the `s` in "Six") is genuinely quiet. One
+    measured take had a last 20ms window at RMS 0.0034 — clearly audible against a 0.002 floor,
+    silently below 0.005 — and `trim_edges` deleted 180ms of it, which is what "it cuts off the
+    last word" sounds like.
+
+    So the cut point scales with how loud the take actually is, and is clamped to never exceed
+    the old bar: this can only ever keep *more* audio than before, never less. A quiet speaker
+    keeps their consonants; a loud one is trimmed exactly as before.
+    """
+    loud = rms[rms >= SILENCE_RMS]
+    if not loud.size:
+        return SILENCE_RMS
+    return max(TRIM_FLOOR_RMS, min(SILENCE_RMS, TRIM_RELATIVE * float(np.median(loud))))
+
+
 def trim_edges(wav: np.ndarray, sr: int, keep_ms: int = SILENCE_KEEP_MS) -> np.ndarray:
     """Drop a decode's leading/trailing padding, keeping a little air either side."""
     wav = np.asarray(wav, dtype=np.float32).reshape(-1)
@@ -838,12 +861,16 @@ def trim_edges(wav: np.ndarray, sr: int, keep_ms: int = SILENCE_KEEP_MS) -> np.n
     rms = _rms_windows(wav, sr, window)
     if not rms.size:
         return wav
-    loud = np.flatnonzero(rms >= SILENCE_RMS)
+    loud = np.flatnonzero(rms >= _trim_threshold(rms))
     if not loud.size:
         return wav
     keep = int(keep_ms / 1000.0 * sr)
     start = max(0, int(loud[0]) * window - keep)
     end = min(wav.size, (int(loud[-1]) + 1) * window + keep)
+    # Never let the two ends meet: a take shorter than the margins comes back untouched rather
+    # than as a sliver from the middle.
+    if end - start < int(0.2 * sr):
+        return wav
     return wav[start:end]
 
 
@@ -2570,10 +2597,26 @@ RENDER_CACHE_TTL_SECONDS = int(os.environ.get("QWEN_TTS_RENDER_CACHE_TTL_SECONDS
 RENDER_CACHE_VERSION = 1      # bump when anything that shapes a raw decode changes
 
 
+RENDER_IDENTITY = 2
+# Bump this whenever the *model-input* path changes — what gets handed the checkpoint, not how
+# the result is post-processed. The Speak/Chat render cache is keyed on the caller's inputs
+# (voice identity + transcript + settings + weights), so a fix to what the model actually
+# receives does not change the key, and the old — wrong — render keeps replaying. That is
+# precisely how a fixed clone kept sounding generic after the fix had shipped and been verified.
+# Post-processing and edge trimming run *after* the cache, so they do not need a bump.
+
+
 def _model_tag(capability: str) -> str:
     """Which weights produced a take: the checkpoint folder plus its config's mtime, so
-    swapping the weights under the same name does not replay the old model's audio."""
+    swapping the weights under the same name does not replay the old model's audio.
+
+    On the MLX path the tag also carries the engine and the quantisation. bf16 and 8-bit are
+    different audio, and the two backends are different code; without this, flipping --quant
+    would replay the other one's renders from the cache and look like the lever did nothing.
+    """
     try:
+        if HUB is not None and getattr(HUB, "engine", "torch") == "mlx":
+            return f"mlx-{HUB.quant}-{MLX_REPOS[capability].format(quant=HUB.quant)}"
         path = HUB._checkpoint(capability) if HUB is not None else ""
         stamp = os.stat(os.path.join(path, "config.json")).st_mtime_ns if path else 0
         return f"{os.path.basename(path) or capability}@{stamp}"
@@ -2736,7 +2779,8 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
                 )
             return wavs[0], int(rate)
         one.render_cache = RenderCache(  # type: ignore[attr-defined]
-            record["slug"], f"design|{description}|{settings}|{_model_tag('voice_design')}")
+            record["slug"],
+            f"v{RENDER_IDENTITY}|design|{description}|{settings}|{_model_tag('voice_design')}")
         return one, "described"
 
     resolved, error = _resolve_voice(voice)
@@ -2762,7 +2806,7 @@ def _voice_synth(voice: str, language: str, temperature: float, top_p: float,
         return wavs[0], int(rate)
 
     one.render_cache = RenderCache(  # type: ignore[attr-defined]
-        record["slug"], f"clone|{_clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)}|"
+        record["slug"], f"v{RENDER_IDENTITY}|clone|{_clone_cache_key((ref_wav, ref_sr), ref_text, use_xvector)}|"
                         f"{settings}|{_model_tag('voice_clone')}")
     return one, ("x-vector" if use_xvector else "ICL")
 

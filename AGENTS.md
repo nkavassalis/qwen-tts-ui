@@ -388,6 +388,22 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
   four** moved the audio beyond seed noise.
 
+- **`trim_edges()` trims on a *relative* threshold and keeps 150ms, because an absolute one ate
+  words.** The old code called anything under 20ms-RMS 0.005 silence and kept 60ms — shorter than
+  one 12Hz codec frame. A real take's last window was RMS 0.0034 (audible vs a 0.002 floor) and
+  180ms went away. `_trim_threshold()` scales with the take's own loud level and is clamped by
+  `min(SILENCE_RMS, ...)`, so it can only ever keep more than before. `SILENCE_RMS` stays absolute
+  for the *defect report* — reporting and deleting are different jobs with different costs.
+- **`RENDER_IDENTITY` must be bumped when the model-input path changes.** The Speak/Chat render
+  cache keys on the caller's inputs (voice identity, transcript, settings, weights), so a change
+  to what the model actually *receives* does not invalidate it and the old render replays — that
+  is how a fixed clone kept sounding generic after the fix was merged and verified. Post-processing
+  and edge trimming run *after* the cache and need no bump. `_model_tag()` also carries engine and
+  quantisation, or `--quant` would appear to do nothing.
+- **A single-chunk Speak is returned "the model's own decode, untouched"** — `trim_edges` runs in
+  `stitch_clips`, i.e. only on the chunked path. When an edge symptom shows on one sentence but
+  not another, that is the difference.
+
 - **The MLX reference cache is keyed on a SHA-256 of the PCM bytes, not on a slot name.** It used
   to be one dict entry keyed `"path"`, so the second voice cloned from the first (SIM 1.000 to
   voice #1, 0.924 to the one requested) while WER and confidence stayed perfect — both measure the

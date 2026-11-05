@@ -2,6 +2,34 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — the first and last word were being trimmed away
+
+### Fixed
+
+- **`trim_edges()` deleted audible speech.** It called anything under an absolute 20 ms RMS of
+  **0.005** silence and kept only **60 ms** of air — less than one 12Hz codec frame (83 ms). One
+  measured take had a last window at RMS **0.0034**: clearly audible against a 0.002 floor,
+  invisible to the bar, and **180 ms of it was deleted**. That is "it cuts off the last word".
+  The cut point is now relative to the take's own level (`TRIM_RELATIVE`, floored by
+  `TRIM_FLOOR_RMS`) and **clamped to never exceed the old bar**, so this can only keep more audio
+  than before, never less; the kept margin went 60 → 150 ms. The five measured takes that lost
+  160/0/80/180/180 ms now lose **0/0/0/0/30 ms**. `test_trim_edges_*` (4 new checks).
+- **The render cache could replay audio the current code would not produce.** `_model_tag()`
+  ignored the engine and the quantisation, so `--quant 8bit` and `bf16` shared cached renders —
+  which makes a working lever look dead — and nothing at all invalidated when the *model-input*
+  path changed. Keys now carry `v{RENDER_IDENTITY}`, bumped on such changes. This is the
+  mechanism that made the fixed clone still sound generic: the cache is keyed on the caller's
+  inputs, so a bug in what the model *received* left the wrong audio cached under the right key.
+  `test_render_cache_identity_covers_what_changes_the_audio`.
+
+### Notes
+
+- Ruled out by measurement, not assumption: the decode is clean (`start_jump`/`end_jump` 0.000
+  on every take, first/last 20 ms at zero), and post-processing is innocent — `off`/`clean`/`warm`
+  all change the length by **0.0 ms**, and `warm` actually *lifts* the fricative tail
+  (0.0034 → 0.0055). A single-chunk Speak returns "the model's own decode, untouched", so this
+  bit the chunked path — Speak and Chat on multi-sentence text, at every seam.
+
 ## [Unreleased] — fix: the Mac cloned the wrong person
 
 ### Fixed
