@@ -388,6 +388,21 @@ while the web server holds `.qwen-tts.lock`; stop the server rather than using `
   "Built with Fish Audio" attribution. Its advertised inline tags were also tested: **one of
   four** moved the audio beyond seed noise.
 
+- **The MLX reference cache is keyed on a SHA-256 of the PCM bytes, not on a slot name.** It used
+  to be one dict entry keyed `"path"`, so the second voice cloned from the first (SIM 1.000 to
+  voice #1, 0.924 to the one requested) while WER and confidence stayed perfect — both measure the
+  words. Same lesson as the app's own clone-prompt cache, which moved to a PCM hash for the same
+  reason after `(length, float sum)` collided. `test_mlx_reference_cache_is_keyed_on_content`.
+- **`voice_clone_prompt` is the payload, not a hint.** The UI's clone path sends *only* that object
+  — no `ref_audio`, no `ref_text`. A shim that understands only the explicit form accepts the call,
+  drops the prompt, and mlx-audio silently takes its non-ICL branch: perfect words, default
+  speaker. So a clone with no reachable reference raises instead of rendering. If you touch
+  `mlx_engine`'s clone surface, the tests call it the way the UI does — an earlier probe passed
+  `ref_audio` by hand, scored SIM 0.996, and proved nothing.
+- **`test_mlx_engine_has_no_shadowed_methods` exists because a duplicate `def` shipped a dead
+  fallback.** Two `create_voice_clone_prompt` definitions meant the older, poorer one won, and its
+  prompt item carried no audio.
+
 - **MLX is a shim behind `ModelHub`, not a fork of the app** (`webui/mlx_engine.py`). All model
   loading already goes through `ModelHub._load()`/`acquire()` (invariant 2), so Apple Silicon is
   one more implementation of that surface and the CUDA path is untouched. The shim exists because

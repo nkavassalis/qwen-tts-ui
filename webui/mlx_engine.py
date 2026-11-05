@@ -33,6 +33,7 @@ confidence, defect penalties and the speaker-similarity tie-break on the Mac too
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import threading
@@ -48,6 +49,14 @@ _LANG_CODES: Dict[str, str] = {
 }
 
 
+REF_SAMPLE_RATE = 24000
+# One temp WAV per distinct reference, evicted oldest-first. Bounded because these are people's
+# voices sitting in the OS temp dir, and macOS reaps that directory on its own schedule — which
+# is also why the prompt item keeps the array: a reaped file can be rewritten rather than
+# silently turning into whatever the model does with a missing reference.
+REF_CACHE_SIZE = 8
+
+
 class MLXError(RuntimeError):
     """Raised when the MLX backend cannot do something; surfaced as a status line."""
 
@@ -61,16 +70,41 @@ def _to_numpy(audio: Any) -> np.ndarray:
     return np.asarray(audio, dtype=np.float32).reshape(-1)
 
 
+def _ref_key(wav: np.ndarray, sr: int) -> str:
+    """Content hash for a reference clip.
+
+    The cache used to be one slot keyed on the literal string "path", so the second voice you
+    cloned from reused the *first* voice's temp file — measured: prompt #2's file was byte-
+    identical to fox's and scored SIM 1.000 against fox, 0.924 against the voice actually being
+    cloned. Every metric stayed green because the words were still perfect; only the speaker was
+    wrong. Same lesson the app's own clone-prompt cache already learned, including why `(length,
+    sum)` is not enough — it collided.
+    """
+    pcm = np.ascontiguousarray(wav, dtype=np.float32).tobytes()
+    return hashlib.sha256(f"{int(sr)}|".encode() + pcm).hexdigest()[:32]
+
+
 def _write_reference(wav: np.ndarray, sr: int, keep: Dict[str, str]) -> str:
     """The model takes reference audio by path; the app has it as (numpy, sr)."""
     import soundfile as sf
 
-    if keep and os.path.exists(keep["path"]):
-        return keep["path"]
+    key = _ref_key(wav, sr)
+    path = keep.get(key)
+    if path and os.path.exists(path):
+        return path
     fd, path = tempfile.mkstemp(prefix="qwen-tts-mlx-ref-", suffix=".wav")
     os.close(fd)
     sf.write(path, np.asarray(wav, dtype=np.float32).reshape(-1), int(sr))
-    keep["path"] = path
+    while len(keep) >= REF_CACHE_SIZE:
+        for oldest in list(keep):
+            stale = keep.pop(oldest)
+            if os.path.exists(stale):
+                try:
+                    os.unlink(stale)
+                except OSError:
+                    pass
+            break
+    keep[key] = path
     return path
 
 
@@ -158,13 +192,88 @@ class MLXModel:
         return wavs, rate
 
     def _reference(self, ref_audio: Any) -> Tuple[Optional[str], Optional[str]]:
-        """Accept (wav, sr), a path, or None; return (path, transcript)."""
+        """Kept for the measurement scripts; `_reference_from` is what the app path uses."""
+        wav, sr = self._as_wave(ref_audio)
+        return (_write_reference(wav, sr, self._ref_cache) if wav is not None else None), None
+
+    def create_voice_clone_prompt(self, ref_audio: Any = None, ref_text: Optional[str] = None,
+                                  x_vector_only_mode: bool = False) -> List[Any]:
+        """The app caches whatever this returns and hands it straight back as
+        `voice_clone_prompt` — which is the *only* reference the clone path ever sends. So this
+        is not a hint, it is the payload: it has to carry the audio, the transcript and the mode.
+        """
+        wav, sr = self._as_wave(ref_audio)
+        path = _write_reference(wav, sr, self._ref_cache) if wav is not None else None
+        # The array rides along deliberately: macOS reaps /var/folders on its own schedule, and a
+        # prompt whose file has vanished must be able to rewrite it instead of sending mlx-audio a
+        # path that no longer exists.
+        return [{"mlx": True, "ref_path": path, "ref_text": ref_text,
+                 "x_vector_only": bool(x_vector_only_mode),
+                 "wav": None if wav is None else np.ascontiguousarray(wav, dtype=np.float32),
+                 "sr": sr}]
+
+    @staticmethod
+    def _as_wave(ref_audio: Any) -> Tuple[Optional[np.ndarray], int]:
+        """Accept (wav, sr), a path, or None; return (1-D float32, sample_rate)."""
         if ref_audio is None:
-            return None, None
+            return None, REF_SAMPLE_RATE
         if isinstance(ref_audio, (tuple, list)) and len(ref_audio) == 2:
             wav, sr = ref_audio
-            return _write_reference(np.asarray(wav, dtype=np.float32), int(sr), self._ref_cache), None
-        return str(ref_audio), None
+            return np.asarray(wav, dtype=np.float32).reshape(-1), int(sr)
+        import soundfile as sf
+
+        data, sr = sf.read(str(ref_audio), dtype="float32")
+        return np.asarray(data, dtype=np.float32).reshape(-1), int(sr)
+
+    @staticmethod
+    def _prompt_item(prompt: Any) -> Optional[Dict[str, Any]]:
+        """Unwrap what `create_voice_clone_prompt` produced, in whatever shape it came back."""
+        if prompt is None:
+            return None
+        item = prompt[0] if isinstance(prompt, (list, tuple)) and len(prompt) else prompt
+        if isinstance(item, dict) and item.get("mlx"):
+            return item
+        return None
+
+    def _reference_from(self, ref_audio: Any, ref_text: Optional[str],
+                        kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve the reference from either argument style.
+
+        The app calls `generate_voice_clone(text=, language=, voice_clone_prompt=)` and nothing
+        else — no `ref_audio`, no `ref_text`. A shim that only understands the explicit form
+        accepts the call, drops the prompt, and mlx-audio then takes its *non-ICL* branch:
+        a fluent, correctly-worded rendering in the checkpoint's default speaker. That is how a
+        clone of a woman's voice came out as "a generic male voice" while every quality metric
+        stayed green — WER and confidence measure the words, and the words were perfect.
+
+        So a clone with no reachable reference is refused here rather than generated. A wrong
+        voice that passes every check is worse than an error nobody can miss.
+        """
+        item = self._prompt_item(kwargs.pop("voice_clone_prompt", None))
+        if item is not None:
+            if item.get("x_vector_only"):
+                raise MLXError(
+                    "x-vector-only cloning is not available on the MLX backend. Untick it, or "
+                    "run the PyTorch path (--device cpu).")
+            if ref_audio is None:
+                wav, sr = item.get("wav"), int(item.get("sr") or REF_SAMPLE_RATE)
+                path = item.get("ref_path")
+                if wav is None:
+                    raise MLXError(
+                        "the cached clone prompt reached the MLX backend without its reference "
+                        "audio. Clear the voice's cached take and generate again.")
+                wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+                # Re-keyed by content, never by slot: this is what makes a second voice's take
+                # actually use the second voice.
+                path = _write_reference(wav, sr, self._ref_cache)
+                return path, (ref_text if ref_text is not None else item.get("ref_text"))
+        if ref_audio is None:
+            raise MLXError(
+                "the clone request reached the MLX backend with no reference audio, which would "
+                "render the checkpoint's default speaker instead of the cloned voice. Send "
+                "voice_clone_prompt from create_voice_clone_prompt, or ref_audio + ref_text.")
+        wav, sr = self._as_wave(ref_audio)
+        return _write_reference(wav, sr, self._ref_cache), ref_text
 
     # -- the surface the app calls ------------------------------------------
 
@@ -178,11 +287,11 @@ class MLXModel:
             raise MLXError(
                 "x-vector-only cloning is not available on the MLX backend. Untick it, or run "
                 "the PyTorch path (--device cpu).")
-        path, _ = self._reference(ref_audio)
+        path, text_ref = self._reference_from(ref_audio, ref_text, kwargs)
         return self._run(
             text=text,
             lang_code=_LANG_CODES.get((language or "").strip().lower(), "auto"),
-            ref_audio=path, ref_text=ref_text, stream=False,
+            ref_audio=path, ref_text=text_ref, stream=False,
             **self._sampling(kwargs))
 
     def generate_voice_design(self, text: str, instruct: Optional[str] = None,
@@ -193,33 +302,41 @@ class MLXModel:
             lang_code=_LANG_CODES.get((language or "").strip().lower(), "auto"),
             stream=False, **self._sampling(kwargs))
 
-    def create_voice_clone_prompt(self, ref_audio: Any = None, ref_text: Optional[str] = None,
-                                  x_vector_only_mode: bool = False) -> List[Any]:
-        """The app keeps a prompt item so retakes skip the encode. MLX has no separate prompt
-        object, so this returns a marker carrying the same inputs; the generate call re-derives
-        what it needs. Returning [] here would make every clone look like a first-time encode."""
-        path, _ = self._reference(ref_audio)
-        return [{"mlx": True, "ref_path": path, "ref_text": ref_text,
-                 "x_vector_only": bool(x_vector_only_mode)}]
-
     def speaker_embedding(self, wav: Any, sr: int = 24000) -> np.ndarray:
         """Cosine-similarity embedding for best-of-N. mlx-audio exposes it; the array type is
-        not torch, so it is normalised to numpy here rather than at the call site."""
+        not torch, so it is normalised to numpy here rather than at the call site.
+
+        mlx's `extract_speaker_embedding` is annotated `audio: mx.array` and its first act is
+        `mx.concatenate([left_pad, sample, right_pad])` — hand it a numpy array and that raises
+        a TypeError about incompatible function arguments. The app calls this inside best-of-N
+        under `except Exception`, so the failure was silent: candidates were ranked on penalties
+        alone and nothing said the speaker tie-break had stopped existing.
+        """
+        import mlx.core as mx
+
         fn = getattr(self._model, "extract_speaker_embedding", None)
         if fn is None:
             raise MLXError("this mlx-audio build has no speaker encoder; SIM tie-break off")
         if isinstance(wav, (tuple, list)) and len(wav) == 2:
             wav, sr = wav
         arr = np.asarray(wav, dtype=np.float32).reshape(-1)
-        emb = fn(audio=arr, sr=int(sr))
+        if int(sr) != 24000:
+            # mlx refuses anything but 24kHz for this encoder, and the app hands us whatever the
+            # candidate came back at. Resampling here keeps the tie-break alive instead of
+            # letting a 16kHz candidate silently opt out of it.
+            import librosa
+
+            arr = librosa.resample(arr, orig_sr=int(sr), target_sr=24000)
+        emb = fn(audio=mx.array(arr), sr=24000)
         return _to_numpy(emb)
 
     # -- housekeeping --------------------------------------------------------
 
     def close(self) -> None:
-        path = self._ref_cache.pop("path", None)
-        if path and os.path.exists(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        for path in list(self._ref_cache.values()):
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        self._ref_cache.clear()

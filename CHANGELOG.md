@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — fix: the Mac cloned the wrong person
+
+### Fixed
+
+- **A second voice was cloned from the first voice's clip.** `mlx_engine` kept its reference
+  temp file in one slot keyed on the literal string `"path"`, so every reference after the first
+  reused the first file. Measured: prompt #2's file was byte-identical to fox's and scored
+  **SIM 1.000 against fox, 0.924 against the voice actually requested**. WER and confidence were
+  perfect throughout, because both measure the words — which is why this reached a real listening
+  session instead of a test failure. The cache is now keyed on a SHA-256 of the PCM bytes plus the
+  sample rate, bounded at `REF_CACHE_SIZE`, and evicted oldest-first.
+  `test_mlx_reference_cache_is_keyed_on_content`.
+- **The clone path ignored the reference the UI actually sends.** The app calls
+  `generate_voice_clone(text=, language=, voice_clone_prompt=)` and nothing else; the shim read
+  `ref_audio`/`ref_text`, found neither, dropped the prompt, and mlx-audio took its **non-ICL**
+  branch — a fluent, correctly-worded rendering in the checkpoint's default speaker. That is both
+  of Nick's complaints ("sounded very little like the original", "a generic male voice") from one
+  cause. `voice_clone_prompt` is now the payload it always was: it carries the audio, the
+  transcript and the mode. A clone that reaches the backend with no reference **refuses** rather
+  than generating a stranger. `test_mlx_clone_uses_the_prompt_the_app_actually_sends`.
+- **The speaker-similarity tie-break was dead on the Mac.** mlx's `extract_speaker_embedding`
+  wants an `mx.array`; handing it numpy raises inside `mx.concatenate`, and best-of-N calls it
+  under `except Exception` — so candidates ranked on penalties alone and nothing said so. Now
+  converted, and resampled to the 24kHz that encoder demands.
+- **A shadowed method made one fix inert.** The rewritten `create_voice_clone_prompt` sat above
+  the original, so the original won and its prompt item never carried the audio — the "rewrite the
+  temp file if macOS reaped it" fallback could not fire. `test_mlx_engine_has_no_shadowed_methods`
+  now fails on any duplicate `def` in a class in that file.
+
+### Notes
+
+- The first probe passed ref_audio/ref_text by hand and reported SIM 0.996, which is why this
+  survived the earlier verification: **the probe tested a call shape the app does not use.** The
+  regression tests now call it the way the UI does.
+
 ## [Unreleased] — Apple Silicon is a first-party platform (MLX)
 
 ### Added
