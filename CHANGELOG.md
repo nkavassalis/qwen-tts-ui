@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here. Newest first.
 
+## [Unreleased] — the server can speak out loud (`/say_aloud`)
+
+### Added
+
+- **`/say_aloud`, `say.py --server-play`, and a "Speak aloud on this machine" button on the Speak
+  tab.** `/speak` returns audio, so it plays on the machine that asked. This plays on the machine
+  that *answered* — the box under the TV, the Mac on the desk — and sends back only a status line:
+  `Speak (described) OK — 2.1s of audio · playing on this machine via ffplay`. Same voice
+  resolution, chunking, render cache and post-processing as `/speak`, so a line the house already
+  heard replays instantly. `--volume` (0–2) for a speaker in the next room.
+- Documented the plain-`curl` route, which is three requests because Gradio 6 has no GET endpoints
+  and the call API needs the session cookie from `/login` (verified: `GET /speak?…` is 404, and
+  `-u user:pass` on `/gradio_api/call/…` is 401 — basic auth is not what that endpoint wants).
+
+### Notes
+
+- The player is spawned **detached**, with stdin/stdout/stderr on `DEVNULL`.
+  `default_concurrency_limit=1` serialises the app, so a synchronous player would freeze the UI for
+  the length of playback, and a player whose pipe filled up blocks the writer — which is us.
+- `play_on_server()` refuses anything outside `tmp/media/`. The endpoint takes no path parameter at
+  all, and a test fails if one is ever added: a player that accepts an arbitrary filename is a file
+  reader wearing a speaker costume, on a box reachable from the LAN.
+- Gain is applied to the samples rather than delegated to the player, because `afplay`/`paplay`/
+  `ffplay` spell volume three different ways and only the sample version is testable here.
+
 ## [Unreleased] — `say.py --language` became usable
 
 ### Added

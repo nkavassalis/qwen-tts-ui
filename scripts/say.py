@@ -177,6 +177,12 @@ def main(argv=None) -> int:
     parser.add_argument("--repetition-penalty", dest="rep_penalty", type=float, default=1.05)
     parser.add_argument("--out", help="keep the wav here instead of a temp file")
     parser.add_argument("--no-play", action="store_true", help="render only, do not play")
+    parser.add_argument("--server-play", dest="server_play", action="store_true",
+                        help="play out of the SERVER's speaker instead of this machine's — "
+                             "the one-liner for making the box under the TV say something")
+    parser.add_argument("--volume", type=float, default=1.0,
+                        help="gain for --server-play; 1 is the level the app normalises to, "
+                             "2 is the ceiling (applied to the audio, not to the player)")
     parser.add_argument("--list", action="store_true", help="print the voices on the server")
     parser.add_argument("--username", default=os.environ.get("QWEN_TTS_USERNAME"))
     parser.add_argument("--password-file", dest="password_file")
@@ -259,6 +265,30 @@ def main(argv=None) -> int:
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
+
+    if args.server_play and args.no_play:
+        print("error: --server-play and --no-play contradict each other", file=sys.stderr)
+        return 2
+
+    if args.server_play and not 0.0 <= args.volume <= 2.0:
+        # The server's slider bound refuses it too, but as an AppError; same reasoning as
+        # --language — a typo should read like a typo, and should cost nothing.
+        print("error: --volume must be between 0 and 2 (1 is the level the app normalises to)",
+              file=sys.stderr)
+        return 2
+
+    if args.server_play:
+        # The status line is the whole response: the audio stays on the server, which is the
+        # point. Predicting /speak here and playing it locally would be the other command.
+        try:
+            print(client.predict(
+                args.voice, text.strip(), language, args.temperature, args.top_p,
+                args.top_k, args.rep_penalty, args.postproc, args.volume,
+                api_name="/say_aloud"))
+        except Exception as e:  # noqa: BLE001
+            print(f"speak failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return 3
+        return 0
 
     try:
         result = client.predict(

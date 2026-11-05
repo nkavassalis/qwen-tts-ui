@@ -234,6 +234,44 @@ scripts/say.py --voice fox --text "hello" --language Klingon         # refused, 
 The list comes from the server's own dropdown rather than a copy in the script, so the two cannot
 drift apart.
 
+### Make the machine it runs on speak
+
+`/speak` hands the audio back, so it plays wherever the request came from — a laptop running
+`say.py` is a laptop speaker. To have sound come out of **the box running the server** (the mini
+under the TV, the Mac on the desk), use `--server-play`. The line goes up, the voice comes back
+out of that machine's speaker, and only a status line comes down:
+
+```bash
+scripts/say.py --voice fox --text "Dinner is ready" --server-play
+scripts/say.py --voice fox --text "Dinner is ready" --server-play --volume 1.4
+```
+
+The Speak tab has the same thing as a button — **Speak aloud on this machine** — with a volume
+slider. Volume is applied to the samples rather than handed to the player, because `afplay`,
+`paplay` and `ffplay` each spell it differently and one implementation is one that gets tested.
+
+From a device without the venv, it is plain `curl`. Gradio 6 has no GET endpoints and the call API
+needs the session cookie from `/login`, so it is three requests, not one:
+
+```bash
+HOST=tts-box.lan:7860        # the address the server prints at startup
+curl -s -c jar -X POST -d "username=YOURUSER&password=YOURPASSWORD" http://$HOST/login > /dev/null
+EV=$(curl -s -b jar -X POST -H 'Content-Type: application/json' \
+     -d '{"data":["fox","Dinner is ready","Auto",0.9,1.0,50,1.05,"warm",1.0]}' \
+     http://$HOST/gradio_api/call/say_aloud | sed 's/.*"event_id":"\([^"]*\)".*/\1/')
+curl -s -b jar http://$HOST/gradio_api/call/say_aloud/$EV
+```
+
+The last line prints what the machine did:
+
+```
+Speak (described) OK — 2.1s of audio · playing on this machine via ffplay
+```
+
+`/say_aloud` resolves the voice, chunks long lines and uses the render cache exactly like `/speak`,
+so a line the house has already heard replays instantly. It takes a voice **name**, never a path:
+the only files it will play are ones it rendered itself, into `tmp/media/`.
+
 
 `--url` points it at another machine. `--username` / `--password-file` or `QWEN_TTS_PASSWORD`
 log in, and `--insecure` accepts a self-signed certificate.

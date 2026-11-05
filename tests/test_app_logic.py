@@ -1257,9 +1257,13 @@ def test_output_options_are_wired() -> None:
 
     source = inspect.getsource(webui.build_ui)
     check("s_postproc" in source and "output_options" in source, "the dropdown exists")
-    check(source.count("+ output_options") == 4,
-          "every generation surface (Design a voice, Clone a voice, Speak, Chat) receives "
-          "the choice")
+    check(source.count("+ output_options") >= 4,
+          "every generation surface (Design a voice, Clone a voice, Speak, Chat, and the "
+          "speak-aloud endpoint) receives the choice")
+    check('api_name="say_aloud"' in source,
+          "the play-on-the-server endpoint is in the public API, or curl cannot reach it")
+    check("+ output_options + [sp_volume]" in source,
+          "speak-aloud must take the post-processing choice and then its own volume")
 
 
 def test_clone_tab_reads_top_to_bottom() -> None:
@@ -1874,6 +1878,10 @@ def test_say_py_is_a_thin_client() -> None:
           "credentials follow the server's precedence")
     check("--ref-audio" not in source and "--voice-path" not in source,
           "the CLI must never be able to name a server path")
+    check('api_name="/say_aloud"' in source,
+          "--server-play must use the play-on-the-server endpoint, not fetch and play locally")
+    check("--server-play" in source and "--volume" in source,
+          "the server-speaker one-liner is documented in --help")
 
 
 def test_chat_say_streams_one_piece_at_a_time() -> None:
@@ -3688,6 +3696,144 @@ def test_say_py_reads_the_language_list_from_the_server() -> None:
     check(say._server_languages(_Client({"components": [
         {"api_info": {"enum": ["Auto", "Something"]}}]})) == (),
           "the list must actually be the language dropdown, not any enum with Auto in it")
+
+
+
+# ------------------------------------------------------------- play on the server (/say_aloud)
+
+
+class _FakePopen:
+    """Records what would have been exec'd; a real player would make the CPU tier noisy."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append((list(cmd), kwargs))
+        return self
+
+    def poll(self):
+        return None
+
+
+def _stub_players(which_map, popen=None):
+    """Return a restore() for the two module attributes play_on_server touches."""
+    real_which, real_popen = webui.shutil.which, webui.subprocess.Popen
+    webui.shutil.which = lambda name: which_map.get(name)
+    webui.subprocess.Popen = popen or (lambda *a, **k: None)
+
+    def restore():
+        webui.shutil.which, webui.subprocess.Popen = real_which, real_popen
+    return restore
+
+
+def test_play_on_server_is_confined_to_the_media_dir() -> None:
+    """A player that takes an arbitrary filename is a file reader wearing a speaker costume.
+
+    The endpoint never accepts a path, but the guard lives in the helper so a future caller that
+    forgets cannot hand the LAN a way to open /etc/passwd — same reasoning as
+    resolve_input_path, on the other side of the request.
+    """
+    restore = _stub_players({"paplay": "/usr/bin/paplay"})
+    try:
+        for bad in ("/etc/passwd", "/etc/passwd.wav", webui.media_dir(),
+                    os.path.join(webui.media_dir(), "..", "media", "..", "..", "etc", "passwd")):
+            try:
+                webui.play_on_server(bad)
+                check(False, f"{bad!r} must be refused, not played")
+            except webui.MediaError:
+                check(True, "")
+        path = webui._write_take(np.zeros(1200, dtype=np.float32), 24000)
+        fake = _FakePopen()
+        restore()
+        restore = _stub_players({"paplay": "/usr/bin/paplay"}, fake)
+        ok, note = webui.play_on_server(path)
+        check(ok, "a file this server rendered must play")
+        check(fake.calls and fake.calls[0][0] == ["/usr/bin/paplay", os.path.realpath(path)],
+              "the player gets the server's own path and nothing else")
+    finally:
+        restore()
+
+
+def test_play_on_server_never_blocks_the_queue() -> None:
+    """Detached, with its pipes gone: default_concurrency_limit=1 means a blocked player
+    blocks every other request, including a queued generation, for the whole playback."""
+    fake = _FakePopen()
+    restore = _stub_players({"afplay": "/usr/bin/afplay"}, fake)
+    try:
+        path = webui._write_take(np.zeros(1200, dtype=np.float32), 24000)
+        ok, note = webui.play_on_server(path)
+        check(ok and "afplay" in note, "falls through to whatever player this box has")
+        _cmd, kwargs = fake.calls[0]
+        check(kwargs.get("start_new_session") is True,
+              "must start a new session — a child in our process group is a shutdown hazard")
+        for stream in ("stdout", "stderr", "stdin"):
+            check(kwargs.get(stream) is webui.subprocess.DEVNULL,
+                  f"{stream} must be DEVNULL: a full pipe blocks the writer, and the writer is us")
+    finally:
+        restore()
+
+    restore = _stub_players({})
+    try:
+        path = webui._write_take(np.zeros(1200, dtype=np.float32), 24000)
+        ok, note = webui.play_on_server(path)
+        check(not ok and "no player" in note,
+              "no player is a status line, not an exception — the audio still rendered")
+    finally:
+        restore()
+
+
+def test_speak_aloud_accepts_no_path_from_the_caller() -> None:
+    """The endpoint renders and plays; it must never be handed a file to play.
+
+    This is the invariant that keeps /say_aloud off the list of things to worry about when the
+    box is bound to the LAN. If anyone adds a `path=` or `file=` parameter, this fails, and it
+    should.
+    """
+    import inspect
+
+    params = list(inspect.signature(webui.speak_aloud).parameters)
+    for forbidden in ("path", "file", "audio", "ref", "wav", "filename"):
+        check(not any(forbidden in p.lower() for p in params),
+              f"speak_aloud must not take a {forbidden!r} argument — it plays what it rendered")
+    check(params[0] == "voice" and params[1] == "text",
+          "a voice name and a line, resolved server-side like /speak does")
+
+
+def test_speak_aloud_refuses_a_bad_volume_before_rendering() -> None:
+    """A typo in a volume knob must not cost a GPU pass, and must not reach the player."""
+    rendered = []
+    real_speak = webui.speak
+    webui.speak = lambda *a, **k: (rendered.append(a) or ((24000, np.zeros(100)), "Speak OK"))
+    try:
+        for bad in (-1, 3, "loud", None):
+            out = webui.speak_aloud("fox", "hello", volume=bad)
+            check(out.startswith("Error:") and "volume" in out,
+                  f"volume={bad!r} must be refused with a clear message")
+        check(not rendered, "a rejected volume must never reach the model")
+        ok_out = webui.speak_aloud("fox", "hello", volume=1.0)
+        check(rendered and "Speak OK" in ok_out, "a sane volume renders and reports the play line")
+    finally:
+        webui.speak = real_speak
+
+
+def test_apply_gain_scales_and_reports_clipping() -> None:
+    """Volume is applied to the samples, not to the player: four players spell it four ways."""
+    quiet = np.array([0.2, -0.2, 0.1], dtype=np.float32)
+    out, clipped = webui.apply_gain(quiet, 2.0)
+    check(abs(float(out[0]) - 0.4) < 1e-6 and not clipped, "2x on a quiet take is clean gain")
+    loud = np.array([0.8, -0.9], dtype=np.float32)
+    out, clipped = webui.apply_gain(loud, 2.0)
+    check(clipped and float(out[0]) == 1.0,
+          "gain that hits full scale must say so rather than silently square off the consonants")
+    out, _ = webui.apply_gain(loud, 0.0)
+    check(float(np.max(np.abs(out))) == 0.0, "volume 0 is silence, not an error")
+    for bad in (-0.5, 2.5, "loud"):
+        try:
+            webui.apply_gain(quiet, bad)
+            check(False, f"volume={bad!r} must raise MediaError")
+        except webui.MediaError:
+            check(True, "")
 
 
 if __name__ == "__main__":
