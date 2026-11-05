@@ -217,6 +217,10 @@ Same three lines, raw 24kHz decode, energy above 9kHz:
 The practical advice is to clone from a **real recording** where you can. If you save a
 generated take, keep it for Speak and Chat, not as the next clone's reference.
 
+And a warning about the metric itself: **energy above 9kHz is a diagnostic of the codec, not a
+measure of accuracy.** A competing model measured 1.8× ours in that band and sounded *worse* —
+see *Fish Audio S2-Pro* at the end of this file. Do not chase that number.
+
 ## Several clips: an experiment, and its first result
 
 Qwen3-TTS conditions on one reference: one clip's codec codes plus transcript, and one
@@ -388,3 +392,146 @@ an implausible rate is re-rolled once.
 The same 300 words after chunking came out as 92.6s of audio at 2.48 words/s, WER 0.42. It
 took 131s instead of 101s, which is still ~1.4× realtime. Requests over ~40 chunks are
 refused.
+
+## A style instruction on the clone path: accepted, obeyed by nothing
+
+The hybrid someone will ask for next: clone the identity from a clip and *direct the reading*
+per line — "read it skeptically", "warm and unhurried". Mechanically it is about ten lines.
+`generate_voice_clone` forwards `**kwargs` straight into `model.generate()`, which handles
+`voice_clone_prompt` (speaker embeddings) and `instruct_ids` (style embeddings) as independent
+additions to the same talker input, on different code paths. Nothing stops it.
+
+Measured 2026-11-04 with `scripts/measurements/instruct_probe.py`: one reference, one sentence,
+one seed, one sampling configuration, four conditions × three seeds — including a **style-free
+control** ("Read the sentence."), without which any difference could be the mere presence of
+extra embeddings rather than their meaning.
+
+**The instruction is not ignored, and that is the bad outcome.** At the same seed the takes are
+not identical — lengths and waveforms differ — so the embeddings reach the model and perturb
+generation. But they do not do what the words say:
+
+- *"warm, gentle, unhurried"* produced the **fastest** speech of any condition (20.4 chars/s
+  against 19.0 for no instruction).
+- *"skeptical, impatient"* was indistinguishable from saying nothing (18.9 chars/s, F0 233.5
+  against 240.3).
+- MFCC distance from no-instruction: control 0.0003, skeptical 0.0001, warm 0.0007. **The seed
+  noise floor is 0.0009.** Every instruction effect sits underneath the noise from merely
+  changing the seed, including between the two conditions that should differ most (0.0003).
+
+An input that is silently dropped is inert and obvious. This one changes the audio while
+carrying no meaning — a control that looks alive. It is the same failure family as the tokenizer
+left on CPU and the sampling sliders that turned out to be live only because
+`generation_config.json` says `do_sample: true`, and the reason the Clone tab has no
+style-instruction box. If it is ever revisited, it should be with a model that was *trained* on
+instructions, and it should be measured the same way before any UI exists.
+
+## Does a clip's *delivery* transfer through cloning? Mostly no
+
+The idea being tested: keep several clips per voice, ranked by how they were delivered (brisk,
+calm, animated, flat), and let the user pick which read to condition on per line. Measured
+2026-11-04 with `scripts/measurements/delivery_transfer.py`, because building it untested would
+have meant a clip-suggestion UI that changes nothing.
+
+24 clips cut from one recording of one speaker, ranked by measured delivery, then the same
+Japanese sentence cloned from the four extremes across five seeds (20 takes).
+
+**Speaking rate does not transfer at all.** A reference spoken at 2.40 characters/s and one
+spoken at 7.63 — a **3.2× difference** — produced outputs at 6.30 and 6.76, a **7% difference**.
+The target sentence sets the pacing; the clip's pace is discarded. A "brisk read vs calm read"
+picker would therefore be pure decoration: detectable, rankable, inert.
+
+**Pitch variability does transfer**, in two tiers about 2× apart, and it survived re-running on
+IQR and MAD rather than standard deviation — which matters, because `voiced_frac` differed
+between the groups and unvoiced frames are exactly where F0 estimation produces octave errors
+that inflate a σ.
+
+| reference | its F0 σ | output F0 σ | output IQR | output MAD |
+|---|---|---|---|---|
+| flattest | 15.6 | 19.0 ± 3.6 | 28.3 | 14.8 |
+| fastest | 22.5 | 27.5 ± 12.5 | 30.9 | 14.5 |
+| most animated | 91.0 | 46.3 ± 11.7 | 52.6 | 25.3 |
+| slowest | 77.7 | 46.5 ± 13.6 | 62.1 | 31.3 |
+
+Three honest limits. The transfer is **compressed** — references spanning 15.6→91.0 (5.8×) come
+out spanning 28→62 (2.2×), so you get *more* animated, never *as* animated. Voiced fraction
+covaries with the tiers (0.80/0.67 low, 0.57/0.53 high), so "varies in pitch more" is not fully
+separable from "breathier" — fine when you are picking a clip, wrong when you are labelling one.
+And pitch **centre** does not transfer (166–291 Hz in, 197–223 Hz out), which is the point: that
+is identity, and it holds.
+
+Fish Audio reached the same conclusion about their own products from the other side: the drama-3
+README advertises that laughter, crying and whispers are "**no longer flattened by the
+reference**". In these models the reference flattens delivery. That is what the row above says,
+independently, in the vendor's own words.
+
+## Fish Audio S2-Pro: evaluated on this box, and not better
+
+Evaluated 2026-11-04 and **rejected**. Recorded so nobody spends an afternoon and 18GB of disk
+rediscovering this. The scripts that produced these numbers are in `scripts/measurements/`
+(`fish_clone_ab_refs.py`, `fish_clone_s2pro.py`, `fish_clone_measure.py`, `fish_tag_probe.py`,
+`fish_transcribe_check.py`); they need an 11GB download and a second venv, and there is no good
+reason to run them again.
+
+**What it is.** `fishaudio/s2-pro`: a 4B dual-autoregressive TTS (slow AR 4B on the time axis,
+fast AR 400M for 9 residual codebooks) on a Qwen3-Omni backbone, RVQ codec at ~21Hz, decoding at
+44.1kHz. 11GB (9.1 weights + 1.87 codec). Fish Audio Research License — non-commercial only, and
+redistribution must display "Built with Fish Audio".
+
+**The test.** Identical conditioning into both models: two references cut from one recording of
+one speaker (5.76s and 18.72s), two target sentences (Japanese and English), two seeds — eight
+takes each. Same instruments on both sides.
+
+| model | reference | >9kHz | >11kHz | SIM→reference | WER | SNR | seconds/take |
+|---|---|---|---|---|---|---|---|
+| S2-Pro | 5.8s | **104.2** | **21.1** | 0.961 | 0.458 | 24.1 | 10–19s |
+| S2-Pro | 18.7s | **97.4** | **19.7** | 0.980 | 0.000 | 24.1 | 33–176s |
+| Qwen3-TTS | 5.8s | 60.2 | 5.4 | 0.981 | 0.000 | 21.2 | ~2–4s |
+| Qwen3-TTS | 18.7s | 53.4 | 4.5 | 0.982 | 0.000 | 24.7 | ~2–4s |
+
+**Verdict: ours sounds more accurate, without fail.** That was a listening judgement, and it is
+the one that decided it — but the interesting part is *which* metric disagreed with it. Every
+number that could favour S2-Pro favoured it: 1.8× the energy above 9kHz, 4× above 11kHz, where
+the separation was clean (worst Fish take 14.2, best ours 6.3). None of that survived the ear.
+Above 11kHz the comparison is partly our own 24kHz Nyquist talking — there is nothing above 12kHz
+to measure — and at 9kHz the ranges overlap slightly (Fish min 67.4, ours max 72.1). A fuller
+top end is not a more accurate voice. This is the second time this session a spectral proxy
+pointed away from what listening said; the first was best-of-N scoring.
+
+**The one thing worth keeping: reference length.** S2-Pro's identity keeps improving with more
+reference (SIM 0.961 → 0.980 from 5.8s to 18.7s). Ours is flat (0.981 → 0.982) — it saturates
+well before 6s. So `REF_TARGET_SECONDS = 6.0` is now a measured default rather than a guess, and
+asking the user for a longer clip would buy us nothing. Their 10–30s claim is true *of their
+model*, which is the honest way to read a vendor number.
+
+**A structural gap, not a bug.** One of their eight takes was asked for English over a Japanese
+reference and **produced Japanese** ("The results came back this morning" → 結果は午前に戻りました,
+WER 1.83, confidence −1.26). Their request schema has **no language field at all** — 18 fields,
+none of them language — so the language is inferred from text with the reference in context, and
+nothing pins it. Our explicit language dropdown, with its checkpoint-checked values
+(invariant 4), is load-bearing in a way this experiment only just demonstrated. 1/8 vs 0/8 is not
+significant on its own (Fisher p ≈ 1.0); the claim is that the failure mode exists and is
+architectural.
+
+**Why integration was never realistic anyway:** ~10× slower per take, and worse with the long
+reference their model prefers (33–176s for two seconds of audio). It reports `GPU Memory used:
+20.33 GB` on a 15.9GB card and has **no VRAM check anywhere** — the WSL2 driver pages the overflow
+to host RAM and the first run crawled at 1.7–2.5 *seconds per token*, silently, with no error.
+That is our tokenizer-left-on-CPU bug arriving from the other direction, and it is exactly what
+`ModelHub`'s floors exist to prevent. `transformers==5.19.0` cannot share a venv with our 4.57.3,
+so it needs a second process, which is what the `flock` single-owner lock exists to stop.
+
+**Also measured, same model, same session: its advertised inline tags.** S2-Pro claims 15,000+
+`[tag]` controls. Four were tested against baseline with two seeds each, and **one of four
+worked**. `[whisper]` is real and physically correct — −9.3dB, −62Hz pitch centre, −23 pitch σ,
+and *brighter* (+1654Hz centroid), which is what breathy turbulent airflow does. `[screaming]`,
+`[sad]` and `[excited]` were inside the seed-to-seed noise floor; `[screaming]` never rose above
+baseline at all. The whisper take was then transcribed to make sure "brighter" had not meant
+"noise over garbled words": WER 0.00, confidence −0.03, so it is genuinely whispered speech.
+No tag moved the speaking rate — the third independent confirmation in this project that pacing
+comes from the text, not from a direction.
+
+**Two incidental facts worth recording.** Their stack runs on Blackwell consumer: `torch
+2.8.0+cu128` sees sm_120 fine, so the flash-attn class of problem did not recur. And Whisper's
+feature extractor **segfaults instead of raising** when handed an absurd-length input (a probe
+bug wrote a WAV at sr=3, i.e. 149,760 seconds) — which the app never hits because clip length is
+bounded upstream, but any new probe script should assert the length before transcribing.
