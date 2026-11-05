@@ -3471,6 +3471,114 @@ def test_mlx_engine_has_no_shadowed_methods() -> None:
                             f"earlier one is dead code that still reads like it runs")
 
 
+
+# --------------------------------------------------------------------------- edge trimming
+
+
+def _edge_tone(seconds, sr, level, freq=180.0):
+    t = np.arange(int(seconds * sr)) / sr
+    return (level * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def test_trim_edges_keeps_an_audible_consonant_tail() -> None:
+    """A quiet fricative at the end is speech, not padding.
+
+    Measured on a real take: the last 20ms sat at RMS 0.0034 — audible against a 0.002 floor,
+    invisible to the absolute 0.005 bar — and trim_edges deleted 180ms of it. That is the
+    "cuts off the last word" complaint.
+    """
+    sr = 24000
+    body = _edge_tone(0.6, sr, 0.3)
+    tail = _edge_tone(0.18, sr, 0.0048, freq=4200.0)      # RMS ~0.0034: audible, under 0.005
+    out = webui.trim_edges(np.concatenate([np.zeros(sr // 5, np.float32), body, tail,
+                                           np.zeros(sr // 5, np.float32)]), sr)
+    tail_rms = float(np.sqrt(np.mean(np.asarray(out)[-len(tail):] ** 2)))
+    check(tail_rms > 0.002,
+          f"the audible tail was trimmed away (tail RMS {tail_rms:.4f}); the last word goes "
+          f"with it")
+
+
+def test_trim_edges_never_cuts_more_than_the_old_bar() -> None:
+    """The relative threshold may keep more, never less — a loud take trims exactly as before."""
+    sr = 24000
+    rng = np.random.default_rng(11)
+    for level in (0.05, 0.2, 0.6):
+        sig = np.concatenate([np.zeros(sr // 4, np.float32),
+                              (rng.standard_normal(int(1.2 * sr)) * level).astype(np.float32),
+                              np.zeros(sr // 4, np.float32)])
+        window = max(1, int(0.02 * sr))
+        rms = webui._rms_windows(sig, sr, window)
+        old_loud = np.flatnonzero(rms >= webui.SILENCE_RMS)
+        old = sig[max(0, int(old_loud[0]) * window - int(0.06 * sr)):
+                  min(sig.size, (int(old_loud[-1]) + 1) * window + int(0.06 * sr))]
+        new = webui.trim_edges(sig, sr)
+        check(len(new) >= len(old),
+              f"at level {level} the new trim removed MORE audio than the old one "
+              f"({len(new)} < {len(old)}) — the clamp to SILENCE_RMS is load-bearing")
+
+
+def test_trim_edges_keeps_a_codec_frame_of_air() -> None:
+    """60ms was shorter than one 12Hz frame (83ms), so the kept air could not cover a syllable."""
+    sr = 24000
+    sig = np.concatenate([np.zeros(sr // 2, np.float32), _edge_tone(0.8, sr, 0.3),
+                          np.zeros(sr // 2, np.float32)])
+    out = webui.trim_edges(sig, sr)
+    lead = out[:len(out) // 2]
+    head = np.zeros(int(0.10 * sr), np.float32)
+    check(float(np.sqrt(np.mean(head ** 2))) == 0.0, "sanity: the head we inspect is silent")
+    kept_lead = 0
+    for i in range(0, len(lead), int(0.01 * sr)):
+        if float(np.sqrt(np.mean(lead[i:i + int(0.01 * sr)] ** 2))) > 0.002:
+            break
+        kept_lead += 10
+    check(kept_lead >= 83,
+          f"only {kept_lead}ms of air kept before speech — one 12Hz codec frame is 83ms, and "
+          f"less than that is what made onsets sound clipped")
+
+
+def test_trim_edges_leaves_a_short_take_alone() -> None:
+    """The two margins must not meet in the middle and hand back a sliver."""
+    sr = 24000
+    sig = _edge_tone(0.15, sr, 0.3)
+    check(webui.trim_edges(sig, sr).size == sig.size,
+          "a take shorter than the margins must come back whole, not trimmed from both ends")
+
+
+
+def test_render_cache_identity_covers_what_changes_the_audio() -> None:
+    """A cached render must not replay after the thing that produced it changed.
+
+    This is how a fixed clone kept sounding generic: the Speak/Chat cache is keyed on the
+    caller's inputs, so when the bug was in what the model *received*, the wrong audio stayed
+    cached under the right key and shipped-looking code kept serving stale takes.
+    """
+    real_hub = webui.HUB
+    try:
+        webui.HUB = webui.ModelHub("models", None, "sdpa", 1, engine="mlx", quant="bf16")
+        bf16_tag = webui._model_tag("voice_clone")
+        webui.HUB = webui.ModelHub("models", None, "sdpa", 1, engine="mlx", quant="8bit")
+        q8_tag = webui._model_tag("voice_clone")
+        check(bf16_tag != q8_tag,
+              "bf16 and 8-bit produce different audio; sharing a cache key makes --quant look "
+              "like a dead lever")
+        check("mlx" in bf16_tag and "8bit" in q8_tag,
+              "the tag must name the backend, or torch and MLX renders replay each other")
+        webui.HUB = webui.ModelHub("models", None, "sdpa", 1, engine="torch")
+        check("mlx" not in webui._model_tag("voice_clone"),
+              "the torch tag must not borrow the MLX one")
+    finally:
+        webui.HUB = real_hub
+
+    with open(os.path.join(webui.HERE, "app.py"), encoding="utf-8") as fh:
+        body = fh.read()
+    for prefix in (f'f"v{{RENDER_IDENTITY}}|design|', f'f"v{{RENDER_IDENTITY}}|clone|'):
+        check(prefix in body,
+              f"the render cache key {prefix!r} lost its version prefix; bump RENDER_IDENTITY "
+              f"when the model-input path changes so stale renders cannot replay")
+    check(isinstance(webui.RENDER_IDENTITY, int) and webui.RENDER_IDENTITY >= 1,
+          "RENDER_IDENTITY must be a bumpable integer")
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
